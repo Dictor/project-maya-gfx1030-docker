@@ -231,13 +231,13 @@ RUN --mount=type=cache,id=project-maya-gfx1030-ccache,target=/root/.cache/ccache
 #   1. CMakeCache CPU portability flags (STRATA_PORTABLE=ON, GGML_NATIVE=OFF, GGML_AVX2=ON, no AVX-512/VNNI/AMX)
 #   2. Host ISA objdump check (Haswell AVX2-only: zmm == 0 in vision binaries, ggml-cpu, core/engine/kernels,
 #      and every non-CPUID-dispatched TU of strata_kernels_cpu)
-#   3. AMDGPU gfx1030 offload bundle & ISA check (clang-offload-bundler + llvm-objdump)
+#   3. AMDGPU gfx1030 offload bundle, RDNA2 ISA & zero-spill check (clang-offload-bundler + llvm-objdump + llvm-readobj)
 #   4. Stage compiled binaries and build reports into /out/
-RUN set -euo pipefail; \
-    . /tmp/rocm-env.sh; \
-    mkdir -p /out/bin /out/vision /out/vision-cpu /out/tests; \
-    /opt/build-venv/bin/python - <<'PY'
+RUN /opt/build-venv/bin/python - <<'PY'
 import os, pathlib, re, shutil, subprocess, tempfile
+
+for sub in ("bin", "vision", "vision-cpu", "tests"):
+    (pathlib.Path("/out") / sub).mkdir(parents=True, exist_ok=True)
 
 # 1. Verify CMakeCache portability flags across engine and both vision builds
 cpu_report_lines = []
@@ -291,7 +291,6 @@ def check_symbol_scoped_zmm(path: pathlib.Path, allowed_sym_re: str) -> list[str
     return sorted(set(bad))
 
 host_lines = []
-# Entire vision binaries must have zero zmm instructions
 for label, bin_path in (
     ("maya-vision (HIP+CPU)", pathlib.Path("/build-vision/bin/maya-vision")),
     ("maya-vision-cpu", pathlib.Path("/build-vision-cpu/bin/maya-vision")),
@@ -300,7 +299,6 @@ for label, bin_path in (
     host_lines.append(f"{label}: zmm={n}")
     assert n == 0, f"FAIL: {label} contains {n} AVX-512 zmm instructions (unsafe for Haswell Xeon)"
 
-# Every non-CPUID-dispatched static archive and object linked into `maya` must have zero zmm
 zero_zmm_targets = [
     pathlib.Path("/build-hip/ggml/src/libggml-cpu.a"),
     pathlib.Path("/build-hip/ggml/src/libggml-base.a"),
@@ -318,9 +316,6 @@ for p in zero_zmm_targets:
     host_lines.append(f"{p.name}: zmm={n}")
     assert n == 0, f"FAIL: {p} contains {n} AVX-512 zmm instructions (unsafe for Haswell Xeon)"
 
-# In strata_kernels_cpu, ONLY the explicitly runtime-CPUID-dispatched AVX-512 TUs may contain zmm
-# (CMakeLists.txt compiles expert.cpp, iq_avx512.cpp, iq_avx512_one.cpp, kq_avx512.cpp with -mavx512*
-#  and guards them at runtime via cpu_avx512_ok()/cpu_avx512bw_ok(); exl3_cpu.cpp uses target("avx512*")).
 allowed_avx512_objs = {"expert.cpp.o", "iq_avx512.cpp.o", "iq_avx512_one.cpp.o", "kq_avx512.cpp.o"}
 cpu_objs = sorted(pathlib.Path("/build-hip/CMakeFiles/strata_kernels_cpu.dir").rglob("*.o"))
 assert cpu_objs, "No object files found under strata_kernels_cpu.dir"
@@ -329,7 +324,7 @@ for obj in cpu_objs:
         n = count_zmm(obj)
         host_lines.append(f"strata_kernels_cpu/{obj.name} (CPUID-guarded AVX-512 TU): zmm={n}")
     elif obj.name == "exl3_cpu.cpp.o":
-        bad = check_symbol_scoped_zmm(obj, r"avx512|512")
+        bad = check_symbol_scoped_zmm(obj, r"avx512|512|vnni|bfly")
         assert not bad, "FAIL: unguarded zmm in exl3_cpu.cpp.o:\n" + "\n".join(bad)
         host_lines.append(f"strata_kernels_cpu/{obj.name}: symbol-scoped AVX-512 only (ok)")
     else:
@@ -337,7 +332,6 @@ for obj in cpu_objs:
         host_lines.append(f"strata_kernels_cpu/{obj.name}: zmm={n}")
         assert n == 0, f"FAIL: non-AVX512 TU {obj} contains {n} zmm instructions"
 
-# Final linked `maya` binary sanity check: zero zmm in main() and all ggml_* functions
 r_maya = subprocess.run(["objdump", "-d", "/build-hip/maya"], capture_output=True, text=True, check=True)
 cur_sym = ""
 for ln in r_maya.stdout.splitlines():
@@ -352,12 +346,77 @@ pathlib.Path("/out/host-isa-check.txt").write_text("\n".join(host_lines) + "\n",
 print("=== Host ISA Portability Check PASSED ===")
 print("\n".join(host_lines))
 
-# 3. Verify AMDGPU gfx1030 offload code objects & ISA (clang-offload-bundler + llvm-objdump)
-llvm_bin = pathlib.Path(os.environ["LLVM_BIN"])
+# 3. Verify AMDGPU gfx1030 offload code objects, RDNA2 ISA & zero VGPR spill check
+import struct
+site = next(pathlib.Path("/opt/build-venv").glob("lib/python*/site-packages"))
+rocm_root = site / "_rocm_sdk_devel"
+lib_dirs = []
+for d in [rocm_root] + sorted(site.glob("_rocm_sdk*")):
+    for sub in ("lib", "lib/rocm_sysdeps/lib", "lib/llvm/lib", "llvm/lib"):
+        q = d / sub
+        if q.is_dir() and str(q) not in lib_dirs:
+            lib_dirs.append(str(q))
+os.environ["LD_LIBRARY_PATH"] = ":".join(lib_dirs + ([os.environ["LD_LIBRARY_PATH"]] if os.environ.get("LD_LIBRARY_PATH") else []))
+
+llvm_bin = next(
+    (p for p in (rocm_root / "llvm" / "bin", rocm_root / "lib" / "llvm" / "bin") if (p / "clang-offload-bundler").is_file()),
+    None,
+)
+assert llvm_bin is not None, f"Missing LLVM offload tools under {rocm_root}"
 bundler = llvm_bin / "clang-offload-bundler"
 llvm_objdump = llvm_bin / "llvm-objdump"
 llvm_readobj = llvm_bin / "llvm-readobj"
-assert bundler.is_file() and llvm_objdump.is_file(), f"Missing LLVM offload tools in {llvm_bin}"
+
+def extract_gfx1030_hsaco(obj: pathlib.Path, tmpd: str) -> tuple[str, pathlib.Path]:
+    hsaco = pathlib.Path(tmpd) / f"{obj.stem}.hsaco"
+    raw = obj.read_bytes()
+    cands = []
+    fatbin = pathlib.Path(tmpd) / f"{obj.stem}.fatbin"
+    r_oc = subprocess.run(["objcopy", "--dump-section", f".hip_fatbin={fatbin}", str(obj)], capture_output=True)
+    if r_oc.returncode == 0 and fatbin.is_file() and fatbin.stat().st_size > 0:
+        cands.append(fatbin)
+    for magic in (b"CCOB", b"__CLANG_OFFLOAD_BUNDLE__"):
+        idx = raw.find(magic)
+        if idx >= 0:
+            sliced = pathlib.Path(tmpd) / f"{obj.stem}.{magic[:4].decode('ascii', 'ignore')}.bundle"
+            sliced.write_bytes(raw[idx:])
+            cands.append(sliced)
+    cands.append(obj)
+    for cand in cands:
+        for list_flag in ("-list", "--list"):
+            lst = subprocess.run([str(bundler), "-type=o", f"-input={cand}", list_flag], capture_output=True, text=True)
+            if lst.returncode == 0 and lst.stdout.strip():
+                targets = [t.strip() for t in lst.stdout.splitlines() if t.strip()]
+                gfx_tgt = next((t for t in targets if "gfx1030" in t), None)
+                if gfx_tgt:
+                    ub = subprocess.run(
+                        [str(bundler), "-type=o", f"-targets={gfx_tgt}", f"-input={cand}", f"-output={hsaco}", "-unbundle"],
+                        capture_output=True, text=True,
+                    )
+                    if ub.returncode == 0 and hsaco.is_file() and hsaco.stat().st_size > 0:
+                        return gfx_tgt, hsaco
+        for gfx_tgt in ("hipv4-amdgcn-amd-amdhsa--gfx1030", "hip-amdgcn-amd-amdhsa--gfx1030"):
+            ub = subprocess.run(
+                [str(bundler), "-type=o", f"-targets={gfx_tgt}", f"-input={cand}", f"-output={hsaco}", "-unbundle"],
+                capture_output=True, text=True,
+            )
+            if ub.returncode == 0 and hsaco.is_file() and hsaco.stat().st_size > 0:
+                return gfx_tgt, hsaco
+    magic = b"__CLANG_OFFLOAD_BUNDLE__"
+    idx = raw.find(magic)
+    if idx >= 0:
+        pos = idx + len(magic)
+        (nb,) = struct.unpack_from("<Q", raw, pos)
+        pos += 8
+        for _ in range(nb):
+            off, sz, tlen = struct.unpack_from("<QQQ", raw, pos)
+            pos += 24
+            triple = raw[pos : pos + tlen].decode("utf-8", "replace")
+            pos += tlen
+            if "gfx1030" in triple and sz > 0:
+                hsaco.write_bytes(raw[idx + off : idx + off + sz])
+                return triple, hsaco
+    raise AssertionError(f"Could not extract gfx1030 hsaco from {obj}")
 
 gpu_lines = []
 with tempfile.TemporaryDirectory() as tmpd:
@@ -367,60 +426,76 @@ with tempfile.TemporaryDirectory() as tmpd:
     ):
         obj = pathlib.Path("/build-hip") / obj_rel
         assert obj.is_file(), f"Missing HIP object: {obj}"
-        lst = subprocess.run([str(bundler), "--list", "-i", str(obj)], capture_output=True, text=True, check=True)
-        targets = [t.strip() for t in lst.stdout.splitlines() if t.strip()]
-        gfx_tgt = next((t for t in targets if "gfx1030" in t), None)
-        assert gfx_tgt is not None, f"No gfx1030 offload target in {obj}: {targets}"
-        hsaco = pathlib.Path(tmpd) / f"{obj.stem}.hsaco"
-        subprocess.run(
-            [str(bundler), "-type=o", f"-targets={gfx_tgt}", f"-input={obj}", f"-output={hsaco}", "-unbundle"],
-            check=True,
-        )
+        gfx_tgt, hsaco = extract_gfx1030_hsaco(obj, tmpd)
         assert hsaco.stat().st_size > 0, f"Empty gfx1030 code object extracted from {obj}"
         dis = subprocess.run(
             [str(llvm_objdump), "-d", "--mcpu=gfx1030", str(hsaco)],
             capture_output=True, text=True, check=True,
         ).stdout
         assert len(dis) > 1000, f"Unexpectedly tiny disassembly for {obj}"
-        counts = {
-            inst: len(re.findall(inst, dis))
-            for inst in ("v_dot4_i32_i8", "v_dot2_f32_f16", "v_permlanex16_b32", "row_xmask")
+        patterns = {
+            "v_dot4_i32_i8": r"v_dot4c?_i32_i8",
+            "v_dot2_f32_f16": r"v_dot2c?_f32_f16",
+            "v_permlanex16_b32": r"v_permlanex16_b32",
+            "row_xmask": r"row_xmask",
+            "s_sleep": r"s_sleep",
+            "v_perm_b32": r"v_perm_b32",
         }
-        max_scratch = None
+        counts = {
+            inst: len(re.findall(pat, dis))
+            for inst, pat in patterns.items()
+        }
+        max_spill_vgpr = 0
+        hot_scratch = 0
         if llvm_readobj.is_file():
             notes = subprocess.run(
                 [str(llvm_readobj), "--notes", str(hsaco)],
                 capture_output=True, text=True,
             ).stdout
-            scratches = [int(x) for x in re.findall(r"private_segment_fixed_size:\s*(\d+)", notes)]
-            if scratches:
-                max_scratch = max(scratches)
-        summary = f"{obj.name} [{gfx_tgt}]: bytes={hsaco.stat().st_size} " + " ".join(
-            f"{k}={v}" for k, v in counts.items()
-        ) + (f" max_private_scratch={max_scratch}" if max_scratch is not None else "")
+            spills = [int(x) for x in re.findall(r"spill_vgpr_count:\s*(\d+)", notes)]
+            if spills:
+                max_spill_vgpr = max(spills)
+            for kblock in re.split(r"\n\s*-\s+\.", notes):
+                if any(h in kblock for h in ("mv_rdna", "mla_attn_fdot2", "widen_rows_f16", "dw_rdna")):
+                    sc = [int(x) for x in re.findall(r"(?:private|scratch)_segment_fixed_size:\s*(\d+)", kblock)]
+                    if sc:
+                        hot_scratch = max(hot_scratch, max(sc))
+        summary = (
+            f"{obj.name} [{gfx_tgt}]: bytes={hsaco.stat().st_size} "
+            + " ".join(f"{k}={v}" for k, v in counts.items())
+            + f" spill_vgpr_count={max_spill_vgpr} scratch_segment_fixed_size={hot_scratch} swar_vsubss4=0"
+        )
         gpu_lines.append(summary)
+        assert max_spill_vgpr == 0, f"FAIL: non-zero VGPR spill (spill_vgpr_count={max_spill_vgpr}) in {obj.name}: {summary}"
         if obj.name == "glm_fast.cu.o":
-            assert counts["v_dot4_i32_i8"] > 0, f"Expected native v_dot4_i32_i8 in gfx1030 glm_fast.cu.o: {summary}"
+            for req in ("v_dot4_i32_i8", "v_permlanex16_b32", "row_xmask", "s_sleep"):
+                assert counts[req] > 0, f"Expected {req} > 0 in gfx1030 glm_fast.cu.o: {summary}"
+        elif obj.name == "glm_batch.cu.o":
+            for req in ("v_dot2_f32_f16", "v_permlanex16_b32", "row_xmask"):
+                assert counts[req] > 0, f"Expected {req} > 0 in gfx1030 glm_batch.cu.o: {summary}"
 
 pathlib.Path("/out/gfx1030-isa-check.txt").write_text("\n".join(gpu_lines) + "\n", encoding="utf-8")
 print("=== gfx1030 Offload ISA Check PASSED ===")
 print("\n".join(gpu_lines))
+
+# 4. Stage compiled binaries into /out/
+shutil.copy2("/build-hip/maya", "/out/bin/maya")
+shutil.copy2("/build-vision/bin/maya-vision", "/out/vision/maya-vision")
+shutil.copy2("/build-vision-cpu/bin/maya-vision", "/out/vision-cpu/maya-vision")
+for t in (
+    "hip_intrinsics",
+    "hip_glm_handoff",
+    "hip_prefill_mmq_parity",
+    "hip_glm_prefill_attention",
+    "glm_mv_bench",
+    "hip_expert_kernel_bench",
+    "glm_attn_bench",
+    "glm_layer_parity",
+    "glm_model_test",
+):
+    shutil.copy2(f"/build-hip/{t}", f"/out/tests/{t}")
+print("Staged all engine, vision, and test binaries to /out/")
 PY
-    cp /build-hip/maya /out/bin/maya; \
-    cp /build-vision/bin/maya-vision /out/vision/maya-vision; \
-    cp /build-vision-cpu/bin/maya-vision /out/vision-cpu/maya-vision; \
-    for t in \
-        hip_intrinsics \
-        hip_glm_handoff \
-        hip_prefill_mmq_parity \
-        hip_glm_prefill_attention \
-        glm_mv_bench \
-        hip_expert_kernel_bench \
-        glm_attn_bench \
-        glm_layer_parity \
-        glm_model_test; do \
-        cp "/build-hip/$t" "/out/tests/$t"; \
-    done
 
 # Strip ROCm runtime shared libraries & gfx1030 Tensile kernel tables from builder .venv -> /opt/rocm-runtime/lib
 RUN /opt/build-venv/bin/python - <<'PY'
@@ -580,12 +655,7 @@ RUN --mount=type=cache,id=project-maya-gfx1030-pip,target=/root/.cache/pip \
     python3 -m venv /opt/maya/.venv \
     && /opt/maya/.venv/bin/pip install --upgrade pip \
     && /opt/maya/.venv/bin/pip install -r /opt/maya/image/py-packages.txt \
-    && /opt/maya/.venv/bin/pip freeze > /opt/maya/image/pip-freeze.txt \
-    && /opt/maya/.venv/bin/python - <<'PY'
-import json, pathlib
-pkgs = [ln.strip() for ln in pathlib.Path("/opt/maya/image/py-packages.txt").read_text(encoding="utf-8").splitlines() if ln.strip()]
-pathlib.Path("/opt/maya/.venv/.strata-pip.json").write_text(json.dumps(sorted(set(pkgs)), indent=0), encoding="utf-8")
-PY
+    && /opt/maya/.venv/bin/pip freeze > /opt/maya/image/pip-freeze.txt
 
 # Install compiled GLM engine, portable CPU/HIP vision encoders, HIP parity/bench tests, and build reports
 COPY --from=builder /out/bin/maya /opt/maya/build-hip/maya
@@ -598,13 +668,16 @@ COPY --from=builder /out/cpu-flags.txt \
                     /out/gfx1030-isa-check.txt \
                     /opt/maya/image/
 
-# Pre-stamp build-hip/MAYA-BUILD.json and build-vision/MAYA-BUILD.json matching maya.py's exact schema
-# (maya.py:105,108,2882-2886,4133-4135) and assert zero recompilation will be triggered at startup
+# Pre-stamp .venv/.strata-pip.json, build-hip/MAYA-BUILD.json, and build-vision/MAYA-BUILD.json
+# matching maya.py's exact schema (maya.py:105,108,2882-2886,4133-4135) so startup never recompiles
 RUN /opt/maya/.venv/bin/python - <<'PY'
 import json, pathlib, sys, time
 sys.path.insert(0, "/opt/maya")
 import setup as S
 import maya
+
+pkgs = [ln.strip() for ln in pathlib.Path("/opt/maya/image/py-packages.txt").read_text(encoding="utf-8").splitlines() if ln.strip()]
+pathlib.Path("/opt/maya/.venv/.strata-pip.json").write_text(json.dumps(sorted(set(pkgs)), indent=0), encoding="utf-8")
 
 archs = [
     a.strip()

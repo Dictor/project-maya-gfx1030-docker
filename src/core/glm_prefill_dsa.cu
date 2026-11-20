@@ -49,6 +49,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -294,6 +295,16 @@ bool gemm(const Io& io, const WSlot& w, int N, int K, const float* X32, const ui
         // strided X or a scaled product
         if (io.lt != nullptr && ldx == K && alpha == 1.0f) {
             io.lt->f16(X16, io.w16, Y + r0, T, n, K, ldy, 0.0f);
+            continue;
+        }
+        if (ldy >= n && ldy <= INT_MAX / 2 && strata::kernels::glmb::prompt_f16_enabled()) {
+            const cublasStatus_t st = cublasGemmEx(io.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, T, K, &alpha, io.w16,
+                                                   CUDA_R_16F, K, X16, CUDA_R_16F, ldx, &zero, Y + r0, CUDA_R_16F,
+                                                   2 * ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            blas_ck(st, "gemm f16 (fp16 out)", ok);
+            if (st == CUBLAS_STATUS_SUCCESS)
+                strata::kernels::glmb::widen_rows_f16(Y + r0, n, (size_t) ldy, T, io.s,
+                                                      strata::kernels::glmb::prompt_f16_check());
             continue;
         }
 #endif
@@ -726,6 +737,18 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
             ok = ok && weight16(L.k_b, (int64_t) H * KV, NOPE, io.w16, io.s);
             ok = ok && glmd::pack_f16(q, (int64_t) H * QH, QH, H, NOPE, tn, q16, io.s);
             ok = ok && glmd::f16_guard_rows(q, (int64_t) H * QH, QH, H, NOPE, tn, q16, io.s);   // B15.1
+#if defined(STRATA_USE_HIP)
+            if ((int64_t) H * KV <= INT_MAX / 2 && strata::kernels::glmb::prompt_f16_enabled()) {
+                const cublasStatus_t st = cublasGemmStridedBatchedEx(
+                    io.blas, CUBLAS_OP_T, CUBLAS_OP_N, KV, tn, NOPE, &one, io.w16, CUDA_R_16F, NOPE,
+                    (long long) KV * NOPE, q16, CUDA_R_16F, H * NOPE, NOPE, &zero, q_abs, CUDA_R_16F, 2 * H * KV,
+                    (long long) 2 * KV, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                blas_ck(st, "q_abs f16 (fp16 out)", ok);
+                if (st == CUBLAS_STATUS_SUCCESS)
+                    strata::kernels::glmb::widen_rows_f16(q_abs, KV, (size_t) KV, tn * H, io.s,
+                                                          strata::kernels::glmb::prompt_f16_check());
+            } else
+#endif
             blas_ck(cublasGemmStridedBatchedEx(io.blas, CUBLAS_OP_T, CUBLAS_OP_N, KV, tn, NOPE, &one, io.w16, CUDA_R_16F,
                                                NOPE, (long long) KV * NOPE, q16, CUDA_R_16F, H * NOPE, NOPE, &zero, q_abs,
                                                CUDA_R_32F, H * KV, KV, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
@@ -771,6 +794,18 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
             ok = ok && weight16(L.v_b, (int64_t) H * VH, KV, io.w16, io.s);
             ok = ok && glmd::pack_f16(ctx, (int64_t) H * KV, KV, H, KV, tn, q16, io.s);
             ok = ok && glmd::f16_guard_rows(ctx, (int64_t) H * KV, KV, H, KV, tn, q16, io.s);   // B15.1
+#if defined(STRATA_USE_HIP)
+            if ((int64_t) H * VH <= INT_MAX / 2 && strata::kernels::glmb::prompt_f16_enabled()) {
+                const cublasStatus_t st = cublasGemmStridedBatchedEx(
+                    io.blas, CUBLAS_OP_T, CUBLAS_OP_N, VH, tn, KV, &one, io.w16, CUDA_R_16F, KV,
+                    (long long) VH * KV, q16, CUDA_R_16F, H * KV, KV, &zero, attn, CUDA_R_16F, 2 * H * VH,
+                    (long long) 2 * VH, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                blas_ck(st, "mla out f16 (fp16 out)", ok);
+                if (st == CUBLAS_STATUS_SUCCESS)
+                    strata::kernels::glmb::widen_rows_f16(attn, VH, (size_t) VH, tn * H, io.s,
+                                                          strata::kernels::glmb::prompt_f16_check());
+            } else
+#endif
             blas_ck(cublasGemmStridedBatchedEx(io.blas, CUBLAS_OP_T, CUBLAS_OP_N, VH, tn, KV, &one, io.w16, CUDA_R_16F, KV,
                                                (long long) VH * KV, q16, CUDA_R_16F, H * KV, KV, &zero, attn, CUDA_R_32F,
                                                H * VH, VH, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),

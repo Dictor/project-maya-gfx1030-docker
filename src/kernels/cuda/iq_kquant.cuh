@@ -57,7 +57,12 @@ __device__ __forceinline__ float vec_dot_q3_K_q8_1(const void* __restrict__ vbq,
         const int sc = (sc_low | sc_high) - 32;
         const int vil = (vl >> (2 * i)) & 0x03030303;
         const int vih = ((vh >> i) << 2) & 0x04040404;
-        sumf += d8 * (__dp4a((int) __vsubss4(vil, vih), u, 0) * sc);
+#if defined(STRATA_USE_HIP)
+        const int vi = static_cast<int>(static_cast<uint32_t>(vil) | (static_cast<uint32_t>(vih) * 0x3fu));
+#else
+        const int vi = __vsubss4(vil, vih);
+#endif
+        sumf += d8 * (__dp4a(vi, u, 0) * sc);
     }
     return d * sumf;
 }
@@ -122,7 +127,12 @@ __device__ __forceinline__ float vec_dot_q6_K_q8_1(const void* __restrict__ vbq,
         const int sc = scales[4 * i];
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+#if defined(STRATA_USE_HIP)
+        // Each byte of (vil | vih) is in [0x00, 0x3f], so +0x60 never carries across bytes.
+        const int vi = static_cast<int>((static_cast<uint32_t>(vil | vih) + 0x60606060u) ^ 0x80808080u);
+#else
         const int vi = __vsubss4(vil | vih, 0x20202020);
+#endif
         sumf += d8 * (__dp4a(vi, u, 0) * sc);
     }
     return __half2float(w->d) * sumf;

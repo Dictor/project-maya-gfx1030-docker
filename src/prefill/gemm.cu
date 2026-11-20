@@ -1,6 +1,9 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#if defined(STRATA_USE_HIP)
+#include "strata/kernels/glm_batch.hpp"
+#endif
 #include "strata/prefill/failure.hpp"
 
 #include <cublas_v2.h>
@@ -411,6 +414,18 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,
                       beta, stream_)) {
+        return;
+    }
+#endif
+#if defined(STRATA_USE_HIP)
+    if (beta == 0.0f && ldy >= N && ldy <= INT_MAX / 2 && T <= INT_MAX && N <= INT_MAX && K <= INT_MAX &&
+        strata::kernels::glmb::prompt_f16_enabled()) {
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_16F, (int) (2 * ldy),
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx f16 (fp16 out)");
+        strata::kernels::glmb::widen_rows_f16(Y, (int) N, (size_t) ldy, (int) T, (cudaStream_t) stream_,
+                                              strata::kernels::glmb::prompt_f16_check());
         return;
     }
 #endif

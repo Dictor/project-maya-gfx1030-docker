@@ -2832,6 +2832,12 @@ def copy_hip_dlls(bindir: Path, dest: Path) -> None:
                 warn(f"could not copy {dll.name} next to {dest} ({e})")
 
 
+def portable_build() -> bool:
+    """Opt-in portable AVX2 CPU baseline (-DSTRATA_PORTABLE=ON) via MAYA_PORTABLE=1 (e.g. Docker / Haswell builds)."""
+    val = N.lookup(os.environ, "MAYA_PORTABLE", "")
+    return str(val).strip().lower() in ("1", "on", "true", "yes")
+
+
 def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
     cmake = pick_cmake()
     if not cmake:
@@ -2857,6 +2863,8 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
              f"-DCMAKE_HIP_ARCHITECTURES={';'.join(pc['archs'])}",
              f"-DCMAKE_HIP_COMPILER={clang.as_posix()}", f"-DCMAKE_PREFIX_PATH={root.as_posix()}",
              f"-DSTRATA_GGML_DIR={llama.as_posix()}"]
+    if not WIN and portable_build():
+        conf.append("-DSTRATA_PORTABLE=ON")
     if not WIN and root == Path("/usr"):   # a distribution's ROCm: CMake's HIP check looks for hip-lang under this root
         conf.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}")
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
@@ -4093,6 +4101,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     archs = meta.get("archs") or pc.get("archs") or []
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}"]
+    if not metal and portable_build():
+        conf.append("-DSTRATA_PORTABLE=ON")
     hip = pc.get("backend") == "hip"
     env = vcvars = bindir = None
     if hip:
@@ -4609,7 +4619,11 @@ CAL_STORE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") /
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: these GPUs, this CPU and RAM, the model (its quant), the context, text or
     images (the context's KV cache and the image encoder take VRAM from the expert pool)."""
-    found = {g["index"]: g for g in S.gpus() or []}
+    if cfg.get("backend") == "hip":
+        gpus = S.amd_gpus(installed_hip_info()) if WIN else S.amd_gpus()
+    else:
+        gpus = S.gpus()
+    found = {g["index"]: g for g in gpus or []}
     sel = [found.get(i) or {} for i in cfg.get("gpu") or []]
     a = cfg.get("args") or []
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a[:-1] else "?"
@@ -4630,11 +4644,11 @@ def load_calibrations() -> dict:
 
 
 def saved_calibration(cfg: dict, any_context=False) -> dict | None:
-    """The settings an earlier tuning found for this PC, model and context, if any (CUDA only, as the tuning).
+    """The settings an earlier tuning found for this PC, model and context, if any (CUDA and HIP; Metal has no CPU lane).
     any_context: else the ones tuned at the nearest other context, with that context in "context" - the CPU lane's
     split depends on the PC far more than on the context, and a setup for another context used to drop them (#57: the
     engine's own settings, half the speed on a two-socket DDR3 PC)."""
-    if cfg.get("backend") in ("hip", "metal"):
+    if cfg.get("backend") == "metal":
         return None
     store, key = load_calibrations(), hardware_key(cfg)
     now = None
@@ -4745,6 +4759,8 @@ def stale_tuning(cfg: dict) -> str | None:
 
 def busy_gpus(cfg: dict) -> list:
     """The config's GPUs with more than 1 GiB of VRAM in use (another engine on them): [(index, MiB)]."""
+    if cfg.get("backend") in ("hip", "metal"):
+        return []
     used = gpu_used_mib()
     return [(i, used[i]) for i in cfg.get("gpu") or [] if used.get(i, 0) > 1024]
 
@@ -4826,9 +4842,6 @@ def calibrate_config(cfg_path: Path) -> bool:
     if config_family(cfg) == "hy4":       # (maya-hy4 sizes its CPU lane and its expert pool by this PC at every start)
         ok(f"{HY4}: nothing to tune - its engine sizes its CPU lane and its expert pool by this PC at every start")
         return True
-    if cfg.get("backend") == "hip":
-        warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
-        return False
     if cfg.get("backend") == "metal":
         warn("the tuning measures the CUDA engine's CPU lane: it does not apply to the Metal engine")
         return False

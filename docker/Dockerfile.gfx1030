@@ -1,0 +1,692 @@
+# syntax=docker/dockerfile:1
+#
+# Project Maya - AMD RDNA2 (gfx1030, Dual Radeon PRO W6800 32GB) Multi-Stage Docker Image
+# Focused on GLM-5.3-Flash (Maya-S & Maya-M) on Unraid / Linux x86-64 hosts with AVX2-only CPUs
+# (e.g. Intel Xeon E5-2666 v3 Haswell, 110 GiB RAM, THP [always], HDD-backed GGUF shards).
+#
+# Stage 1 (builder): ubuntu:24.04 + AMD TheRock ROCm 7 wheels (.venv) -> compiles:
+#   - build-hip/maya                (GLM-5.3-Flash HIP engine, gfx1030, STRATA_PORTABLE=ON)
+#   - build-vision/bin/maya-vision  (GLM-5.3-Flash HIP gfx1030 + CPU portable AVX2 vision encoder)
+#   - build-vision-cpu/bin/maya-vision (CPU-only portable AVX2 vision encoder, zero ROCm deps)
+#   - GLM HIP parity & benchmark tests -> /opt/maya/tests/
+#   Verifies Haswell AVX2 host portability (zmm == 0 in ggml-cpu/vision/non-dispatched objects)
+#   and gfx1030 AMDGPU offload code object + native ISA (v_dot4_i32_i8) before staging.
+#
+# Stage 2 (runner): minimal ubuntu:24.04 + stripped /opt/rocm/lib runtime libs + runtime .venv +
+#   pre-stamped build-hip/MAYA-BUILD.json & build-vision/MAYA-BUILD.json (never recompiles).
+#   Verifies ldd resolves 100% of shared libraries for every built binary.
+
+# ==============================================================================
+# Stage 1: Builder (TheRock ROCm 7 wheels + Clang HIP compiler)
+# ==============================================================================
+FROM ubuntu:24.04 AS builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    CCACHE_DIR=/root/.cache/ccache \
+    CCACHE_MAXSIZE=30G \
+    CCACHE_COMPILERCHECK=content
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        binutils \
+        build-essential \
+        ca-certificates \
+        ccache \
+        curl \
+        git \
+        libatomic1 \
+        libgomp1 \
+        libnuma1 \
+        ninja-build \
+        python3 \
+        python3-pip \
+        python3-venv \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG HIP_ARCHITECTURES="gfx1030"
+ARG LLAMA_CPP_COMMIT="3cf03257f219afbe7334045ff7c6a06ac68c627d"
+ARG THEROCK_INDEX="https://rocm.nightlies.amd.com/v2/gfx103X-all/"
+ARG THEROCK_SPEC="rocm[libraries,devel]==7.13.0a20260515"
+ARG JOBS=""
+
+COPY . /src
+WORKDIR /src
+
+# Fetch llama.cpp at the exact commit pinned in setup.py (ggml CPU/MMQ + gguf-py + mtmd)
+RUN python3 - "$LLAMA_CPP_COMMIT" <<'PY'
+import ast, pathlib, sys
+tree = ast.parse(pathlib.Path("/src/setup.py").read_text(encoding="utf-8"))
+pins = [
+    ast.literal_eval(n.value)
+    for n in ast.walk(tree)
+    if isinstance(n, ast.Assign)
+    and any(isinstance(t, ast.Name) and t.id == "LLAMA_CPP_COMMIT" for t in n.targets)
+]
+assert len(pins) == 1, f"expected single LLAMA_CPP_COMMIT in setup.py, got {pins}"
+want = sys.argv[1] or pins[0]
+assert want == pins[0], f"LLAMA_CPP_COMMIT arg ({want}) != setup.py ({pins[0]})"
+print(f"Verified pinned llama.cpp commit: {want}")
+PY
+RUN curl -fsSL --retry 5 -o /tmp/llama.zip \
+        "https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.zip" \
+    && unzip -q /tmp/llama.zip -d /tmp \
+    && mv "/tmp/llama.cpp-${LLAMA_CPP_COMMIT}" /llama.cpp \
+    && rm -f /tmp/llama.zip
+
+# Install CMake, Ninja, and lightweight AMD TheRock ROCm 7 gfx103X wheels into builder .venv
+RUN --mount=type=cache,id=project-maya-gfx1030-pip,target=/root/.cache/pip \
+    python3 -m venv /opt/build-venv \
+    && /opt/build-venv/bin/pip install --upgrade pip \
+    && /opt/build-venv/bin/pip install cmake ninja \
+    && /opt/build-venv/bin/pip install --index-url "${THEROCK_INDEX}" "${THEROCK_SPEC}" \
+    && if [ -x /opt/build-venv/bin/rocm-sdk ]; then /opt/build-venv/bin/rocm-sdk init; fi
+
+# Resolve TheRock ROCm toolchain paths into /tmp/rocm-env.sh
+RUN /opt/build-venv/bin/python - <<'PY'
+import os, pathlib, shlex, subprocess
+
+venv = pathlib.Path("/opt/build-venv")
+site = next(venv.glob("lib/python*/site-packages"))
+sdk_bin = venv / "bin" / "rocm-sdk"
+
+rocm_root = None
+if sdk_bin.is_file():
+    r = subprocess.run([str(sdk_bin), "path", "--root"], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        cand = pathlib.Path(r.stdout.strip().splitlines()[-1].strip())
+        if cand.is_dir():
+            rocm_root = cand
+if rocm_root is None:
+    rocm_root = site / "_rocm_sdk_devel"
+assert rocm_root.is_dir(), f"TheRock ROCm root not found at {rocm_root}"
+
+clang_cands = [
+    rocm_root / "llvm" / "bin" / "clang++",
+    rocm_root / "lib" / "llvm" / "bin" / "clang++",
+]
+hip_clang = next((p for p in clang_cands if p.is_file()), None)
+assert hip_clang is not None, f"ROCm clang++ not found under {rocm_root}"
+llvm_bin = hip_clang.parent
+
+bitcode_cands = [
+    rocm_root / "lib" / "llvm" / "amdgcn" / "bitcode",
+    rocm_root / "llvm" / "amdgcn" / "bitcode",
+    rocm_root / "amdgcn" / "bitcode",
+]
+bitcode_dir = next((p for p in bitcode_cands if p.is_dir()), None)
+assert bitcode_dir is not None, f"ROCm device bitcode dir not found under {rocm_root}"
+
+sdk_dirs = [rocm_root]
+for p in sorted(site.glob("_rocm_sdk*")):
+    if p.is_dir() and p != rocm_root:
+        sdk_dirs.append(p)
+
+prefix_dirs = ";".join(str(p) for p in sdk_dirs)
+lib_dirs = []
+for d in sdk_dirs:
+    for sub in ("lib", "lib/rocm_sysdeps/lib", "lib/llvm/lib"):
+        q = d / sub
+        if q.is_dir():
+            lib_dirs.append(str(q))
+
+lines = [
+    f"export ROCM_ROOT={shlex.quote(str(rocm_root))}",
+    f"export ROCM_PATH={shlex.quote(str(rocm_root))}",
+    f"export HIP_PATH={shlex.quote(str(rocm_root))}",
+    f"export HIP_CLANG={shlex.quote(str(hip_clang))}",
+    f"export LLVM_BIN={shlex.quote(str(llvm_bin))}",
+    f"export BITCODE_DIR={shlex.quote(str(bitcode_dir))}",
+    f"export PREFIX_DIRS={shlex.quote(prefix_dirs)}",
+    f"export ROCM_LIB_DIRS={shlex.quote(':'.join(lib_dirs))}",
+    "export HIP_PLATFORM=amd",
+    "export HIP_COMPILER=clang",
+    "export HIP_RUNTIME=rocclr",
+    'export PATH="${ROCM_ROOT}/bin:${LLVM_BIN}:${PATH}"',
+    'export LD_LIBRARY_PATH="${ROCM_LIB_DIRS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+]
+pathlib.Path("/tmp/rocm-env.sh").write_text("\n".join(lines) + "\n", encoding="utf-8")
+print("Resolved TheRock ROCm toolchain:")
+print("  ROCM_ROOT   =", rocm_root)
+print("  HIP_CLANG   =", hip_clang)
+print("  BITCODE_DIR =", bitcode_dir)
+print("  PREFIX_DIRS =", prefix_dirs)
+PY
+
+# Configure & build GLM-5.3-Flash engine (maya) + GLM HIP parity/bench tests for gfx1030
+RUN --mount=type=cache,id=project-maya-gfx1030-ccache,target=/root/.cache/ccache \
+    set -euo pipefail; \
+    . /tmp/rocm-env.sh; \
+    /opt/build-venv/bin/cmake -S /src -B /build-hip -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSTRATA_BACKEND=hip \
+        -DSTRATA_ENABLE_HIP=ON \
+        -DSTRATA_ENABLE_CUDA=OFF \
+        "-DSTRATA_HIP_ARCHS=${HIP_ARCHITECTURES}" \
+        "-DCMAKE_HIP_ARCHITECTURES=${HIP_ARCHITECTURES}" \
+        -DSTRATA_PREFILL_MMQ=ON \
+        -DSTRATA_NATIVE_EXPERTS=ON \
+        -DSTRATA_PORTABLE=ON \
+        -DSTRATA_BUILD_TESTS=ON \
+        -DSTRATA_GGML_DIR=/llama.cpp \
+        "-DCMAKE_HIP_COMPILER=${HIP_CLANG}" \
+        "-DCMAKE_HIP_COMPILER_ROCM_ROOT=${ROCM_ROOT}" \
+        "-DCMAKE_PREFIX_PATH=${PREFIX_DIRS}" \
+        "-DCMAKE_HIP_FLAGS=--rocm-path=${ROCM_ROOT} --rocm-device-lib-path=${BITCODE_DIR}" \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache; \
+    jobs="${JOBS:-$(( $(nproc) / 2 ))}"; [ "$jobs" -ge 1 ] || jobs=1; \
+    ccache --zero-stats >/dev/null || true; \
+    /opt/build-venv/bin/cmake --build /build-hip --target \
+        maya \
+        hip_intrinsics \
+        hip_glm_handoff \
+        hip_prefill_mmq_parity \
+        hip_glm_prefill_attention \
+        glm_mv_bench \
+        hip_expert_kernel_bench \
+        glm_attn_bench \
+        glm_layer_parity \
+        glm_model_test \
+        -j "$jobs"; \
+    ccache --show-stats || true
+
+# Patch llama.cpp for GLM-5.3-Flash vision and build BOTH portable AVX2 CPU and HIP gfx1030 maya-vision
+RUN --mount=type=cache,id=project-maya-gfx1030-ccache,target=/root/.cache/ccache \
+    set -euo pipefail; \
+    . /tmp/rocm-env.sh; \
+    /opt/build-venv/bin/python /src/tools/vision/glm5next_patch.py /llama.cpp; \
+    jobs="${JOBS:-$(( $(nproc) / 2 ))}"; [ "$jobs" -ge 1 ] || jobs=1; \
+    /opt/build-venv/bin/cmake -S /src/tools/vision -B /build-vision-cpu -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_DIR=/llama.cpp \
+        -DSTRATA_VISION_CUDA=OFF \
+        -DSTRATA_VISION_HIP=OFF \
+        -DSTRATA_PORTABLE=ON \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache; \
+    /opt/build-venv/bin/cmake --build /build-vision-cpu --target maya-vision -j "$jobs"; \
+    /opt/build-venv/bin/cmake -S /src/tools/vision -B /build-vision -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_DIR=/llama.cpp \
+        -DSTRATA_VISION_CUDA=OFF \
+        -DSTRATA_VISION_HIP=ON \
+        "-DSTRATA_VISION_HIP_TARGETS=${HIP_ARCHITECTURES}" \
+        "-DAMDGPU_TARGETS=${HIP_ARCHITECTURES}" \
+        "-DCMAKE_HIP_ARCHITECTURES=${HIP_ARCHITECTURES}" \
+        -DSTRATA_PORTABLE=ON \
+        -DCMAKE_EXE_LINKER_FLAGS=-no-pie \
+        "-DCMAKE_HIP_COMPILER=${HIP_CLANG}" \
+        "-DCMAKE_HIP_COMPILER_ROCM_ROOT=${ROCM_ROOT}" \
+        "-DCMAKE_PREFIX_PATH=${PREFIX_DIRS}" \
+        "-DCMAKE_HIP_FLAGS=--rocm-path=${ROCM_ROOT} --rocm-device-lib-path=${BITCODE_DIR}" \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache; \
+    /opt/build-venv/bin/cmake --build /build-vision --target maya-vision -j "$jobs"
+
+# Build-time verification:
+#   1. CMakeCache CPU portability flags (STRATA_PORTABLE=ON, GGML_NATIVE=OFF, GGML_AVX2=ON, no AVX-512/VNNI/AMX)
+#   2. Host ISA objdump check (Haswell AVX2-only: zmm == 0 in vision binaries, ggml-cpu, core/engine/kernels,
+#      and every non-CPUID-dispatched TU of strata_kernels_cpu)
+#   3. AMDGPU gfx1030 offload bundle & ISA check (clang-offload-bundler + llvm-objdump)
+#   4. Stage compiled binaries and build reports into /out/
+RUN set -euo pipefail; \
+    . /tmp/rocm-env.sh; \
+    mkdir -p /out/bin /out/vision /out/vision-cpu /out/tests; \
+    /opt/build-venv/bin/python - <<'PY'
+import os, pathlib, re, shutil, subprocess, tempfile
+
+# 1. Verify CMakeCache portability flags across engine and both vision builds
+cpu_report_lines = []
+for name, cache_path in (
+    ("engine", pathlib.Path("/build-hip/CMakeCache.txt")),
+    ("vision-hip", pathlib.Path("/build-vision/CMakeCache.txt")),
+    ("vision-cpu", pathlib.Path("/build-vision-cpu/CMakeCache.txt")),
+):
+    seen = {}
+    for line in cache_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if re.match(r"^(STRATA_PORTABLE|GGML_NATIVE|GGML_AVX[A-Z0-9_]*|GGML_FMA|GGML_F16C|GGML_BMI2|GGML_AMX_[A-Z0-9_]*):", line):
+            cpu_report_lines.append(f"[{name}] {line}")
+            k, _, v = line.partition("=")
+            seen[k.split(":")[0]] = v.strip().upper()
+    bad = []
+    for k, want in (("STRATA_PORTABLE", "ON"), ("GGML_NATIVE", "OFF"), ("GGML_AVX2", "ON")):
+        if seen.get(k) != want:
+            bad.append(f"{name}: {k}={seen.get(k, '(unset)')}, want {want}")
+    for k, v in sorted(seen.items()):
+        if k.startswith(("GGML_AVX512", "GGML_AVX_VNNI", "GGML_AMX_")) and v != "OFF":
+            bad.append(f"{name}: {k}={v}, want OFF")
+    assert not bad, "CMake portability check failed:\n" + "\n".join(bad)
+
+pathlib.Path("/out/cpu-flags.txt").write_text("\n".join(cpu_report_lines) + "\n", encoding="utf-8")
+hip_archs = re.search(
+    r"^CMAKE_HIP_ARCHITECTURES:[A-Z]*=(.*)$",
+    pathlib.Path("/build-hip/CMakeCache.txt").read_text(encoding="utf-8", errors="replace"),
+    re.M,
+)
+assert hip_archs and "gfx1030" in hip_archs.group(1), f"Missing gfx1030 in CMAKE_HIP_ARCHITECTURES: {hip_archs}"
+pathlib.Path("/out/hip-architectures.txt").write_text(hip_archs.group(1).strip() + "\n", encoding="utf-8")
+
+# 2. Host objdump zmm verification (Haswell Xeon E5-2666 v3 AVX2-only safety)
+def count_zmm(path: pathlib.Path) -> int:
+    r = subprocess.run(["objdump", "-d", str(path)], capture_output=True, text=True, check=True)
+    return sum(1 for ln in r.stdout.splitlines() if re.search(r"\bzmm\d+\b", ln))
+
+def check_symbol_scoped_zmm(path: pathlib.Path, allowed_sym_re: str) -> list[str]:
+    r = subprocess.run(["objdump", "-d", str(path)], capture_output=True, text=True, check=True)
+    cur_sym = "<unknown>"
+    bad = []
+    for ln in r.stdout.splitlines():
+        m = re.match(r"^[0-9a-f]+\s+<([^>]+)>:", ln)
+        if m:
+            cur_sym = m.group(1)
+            continue
+        if re.search(r"\bzmm\d+\b", ln) and not re.search(allowed_sym_re, cur_sym, re.I):
+            bad.append(f"{path.name}: unexpected zmm in symbol {cur_sym}")
+            if len(bad) >= 20:
+                break
+    return sorted(set(bad))
+
+host_lines = []
+# Entire vision binaries must have zero zmm instructions
+for label, bin_path in (
+    ("maya-vision (HIP+CPU)", pathlib.Path("/build-vision/bin/maya-vision")),
+    ("maya-vision-cpu", pathlib.Path("/build-vision-cpu/bin/maya-vision")),
+):
+    n = count_zmm(bin_path)
+    host_lines.append(f"{label}: zmm={n}")
+    assert n == 0, f"FAIL: {label} contains {n} AVX-512 zmm instructions (unsafe for Haswell Xeon)"
+
+# Every non-CPUID-dispatched static archive and object linked into `maya` must have zero zmm
+zero_zmm_targets = [
+    pathlib.Path("/build-hip/ggml/src/libggml-cpu.a"),
+    pathlib.Path("/build-hip/ggml/src/libggml-base.a"),
+    pathlib.Path("/build-hip/libstrata_core.a"),
+    pathlib.Path("/build-hip/libstrata_engine.a"),
+    pathlib.Path("/build-hip/libstrata_kernels.a"),
+    pathlib.Path("/build-hip/libstrata_prefill.a"),
+    pathlib.Path("/build-hip/libstrata_spec.a"),
+    pathlib.Path("/build-hip/libstrata_mmq.a"),
+    pathlib.Path("/build-hip/CMakeFiles/maya.dir/src/program/generate.cpp.o"),
+]
+for p in zero_zmm_targets:
+    assert p.is_file(), f"Expected build artifact missing: {p}"
+    n = count_zmm(p)
+    host_lines.append(f"{p.name}: zmm={n}")
+    assert n == 0, f"FAIL: {p} contains {n} AVX-512 zmm instructions (unsafe for Haswell Xeon)"
+
+# In strata_kernels_cpu, ONLY the explicitly runtime-CPUID-dispatched AVX-512 TUs may contain zmm
+# (CMakeLists.txt compiles expert.cpp, iq_avx512.cpp, iq_avx512_one.cpp, kq_avx512.cpp with -mavx512*
+#  and guards them at runtime via cpu_avx512_ok()/cpu_avx512bw_ok(); exl3_cpu.cpp uses target("avx512*")).
+allowed_avx512_objs = {"expert.cpp.o", "iq_avx512.cpp.o", "iq_avx512_one.cpp.o", "kq_avx512.cpp.o"}
+cpu_objs = sorted(pathlib.Path("/build-hip/CMakeFiles/strata_kernels_cpu.dir").rglob("*.o"))
+assert cpu_objs, "No object files found under strata_kernels_cpu.dir"
+for obj in cpu_objs:
+    if obj.name in allowed_avx512_objs:
+        n = count_zmm(obj)
+        host_lines.append(f"strata_kernels_cpu/{obj.name} (CPUID-guarded AVX-512 TU): zmm={n}")
+    elif obj.name == "exl3_cpu.cpp.o":
+        bad = check_symbol_scoped_zmm(obj, r"avx512|512")
+        assert not bad, "FAIL: unguarded zmm in exl3_cpu.cpp.o:\n" + "\n".join(bad)
+        host_lines.append(f"strata_kernels_cpu/{obj.name}: symbol-scoped AVX-512 only (ok)")
+    else:
+        n = count_zmm(obj)
+        host_lines.append(f"strata_kernels_cpu/{obj.name}: zmm={n}")
+        assert n == 0, f"FAIL: non-AVX512 TU {obj} contains {n} zmm instructions"
+
+# Final linked `maya` binary sanity check: zero zmm in main() and all ggml_* functions
+r_maya = subprocess.run(["objdump", "-d", "/build-hip/maya"], capture_output=True, text=True, check=True)
+cur_sym = ""
+for ln in r_maya.stdout.splitlines():
+    m = re.match(r"^[0-9a-f]+\s+<([^>]+)>:", ln)
+    if m:
+        cur_sym = m.group(1)
+        continue
+    if re.search(r"\bzmm\d+\b", ln) and (cur_sym == "main" or cur_sym.startswith("ggml_")):
+        raise AssertionError(f"FAIL: linked /build-hip/maya has zmm in {cur_sym}")
+host_lines.append("maya (linked binary): main and all ggml_* symbols zmm=0 (ok)")
+pathlib.Path("/out/host-isa-check.txt").write_text("\n".join(host_lines) + "\n", encoding="utf-8")
+print("=== Host ISA Portability Check PASSED ===")
+print("\n".join(host_lines))
+
+# 3. Verify AMDGPU gfx1030 offload code objects & ISA (clang-offload-bundler + llvm-objdump)
+llvm_bin = pathlib.Path(os.environ["LLVM_BIN"])
+bundler = llvm_bin / "clang-offload-bundler"
+llvm_objdump = llvm_bin / "llvm-objdump"
+llvm_readobj = llvm_bin / "llvm-readobj"
+assert bundler.is_file() and llvm_objdump.is_file(), f"Missing LLVM offload tools in {llvm_bin}"
+
+gpu_lines = []
+with tempfile.TemporaryDirectory() as tmpd:
+    for obj_rel in (
+        "CMakeFiles/strata_kernels.dir/src/kernels/cuda/glm_fast.cu.o",
+        "CMakeFiles/strata_kernels.dir/src/kernels/cuda/glm_batch.cu.o",
+    ):
+        obj = pathlib.Path("/build-hip") / obj_rel
+        assert obj.is_file(), f"Missing HIP object: {obj}"
+        lst = subprocess.run([str(bundler), "--list", "-i", str(obj)], capture_output=True, text=True, check=True)
+        targets = [t.strip() for t in lst.stdout.splitlines() if t.strip()]
+        gfx_tgt = next((t for t in targets if "gfx1030" in t), None)
+        assert gfx_tgt is not None, f"No gfx1030 offload target in {obj}: {targets}"
+        hsaco = pathlib.Path(tmpd) / f"{obj.stem}.hsaco"
+        subprocess.run(
+            [str(bundler), "-type=o", f"-targets={gfx_tgt}", f"-input={obj}", f"-output={hsaco}", "-unbundle"],
+            check=True,
+        )
+        assert hsaco.stat().st_size > 0, f"Empty gfx1030 code object extracted from {obj}"
+        dis = subprocess.run(
+            [str(llvm_objdump), "-d", "--mcpu=gfx1030", str(hsaco)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        assert len(dis) > 1000, f"Unexpectedly tiny disassembly for {obj}"
+        counts = {
+            inst: len(re.findall(inst, dis))
+            for inst in ("v_dot4_i32_i8", "v_dot2_f32_f16", "v_permlanex16_b32", "row_xmask")
+        }
+        max_scratch = None
+        if llvm_readobj.is_file():
+            notes = subprocess.run(
+                [str(llvm_readobj), "--notes", str(hsaco)],
+                capture_output=True, text=True,
+            ).stdout
+            scratches = [int(x) for x in re.findall(r"private_segment_fixed_size:\s*(\d+)", notes)]
+            if scratches:
+                max_scratch = max(scratches)
+        summary = f"{obj.name} [{gfx_tgt}]: bytes={hsaco.stat().st_size} " + " ".join(
+            f"{k}={v}" for k, v in counts.items()
+        ) + (f" max_private_scratch={max_scratch}" if max_scratch is not None else "")
+        gpu_lines.append(summary)
+        if obj.name == "glm_fast.cu.o":
+            assert counts["v_dot4_i32_i8"] > 0, f"Expected native v_dot4_i32_i8 in gfx1030 glm_fast.cu.o: {summary}"
+
+pathlib.Path("/out/gfx1030-isa-check.txt").write_text("\n".join(gpu_lines) + "\n", encoding="utf-8")
+print("=== gfx1030 Offload ISA Check PASSED ===")
+print("\n".join(gpu_lines))
+PY
+    cp /build-hip/maya /out/bin/maya; \
+    cp /build-vision/bin/maya-vision /out/vision/maya-vision; \
+    cp /build-vision-cpu/bin/maya-vision /out/vision-cpu/maya-vision; \
+    for t in \
+        hip_intrinsics \
+        hip_glm_handoff \
+        hip_prefill_mmq_parity \
+        hip_glm_prefill_attention \
+        glm_mv_bench \
+        hip_expert_kernel_bench \
+        glm_attn_bench \
+        glm_layer_parity \
+        glm_model_test; do \
+        cp "/build-hip/$t" "/out/tests/$t"; \
+    done
+
+# Strip ROCm runtime shared libraries & gfx1030 Tensile kernel tables from builder .venv -> /opt/rocm-runtime/lib
+RUN /opt/build-venv/bin/python - <<'PY'
+import os, pathlib, shutil
+
+venv = pathlib.Path("/opt/build-venv")
+site = next(venv.glob("lib/python*/site-packages"))
+dest = pathlib.Path("/opt/rocm-runtime/lib")
+dest.mkdir(parents=True, exist_ok=True)
+
+# Order: libraries & core packages first so real files win over devel cross-package symlinks
+sdk_pkgs = sorted(site.glob("_rocm_sdk_libraries*")) + sorted(site.glob("_rocm_sdk_core*"))
+devel = site / "_rocm_sdk_devel"
+if devel.is_dir():
+    sdk_pkgs.append(devel)
+
+SKIP_TOP_DIRS = {"cmake", "pkgconfig", "python3", "python3.12", "hip", "clang"}
+KEEP_SUBDIRS = {"rocm_sysdeps", "rocblas", "hipblaslt", "rocsolver", "kpack"}
+
+def copy_entry(src: pathlib.Path, dst: pathlib.Path, root_lib: pathlib.Path) -> None:
+    if dst.exists() or dst.is_symlink():
+        return
+    if src.is_symlink():
+        raw_target = os.readlink(src)
+        resolved = src.resolve()
+        if not resolved.exists():
+            return
+        # Keep intra-directory relative symlinks (e.g. libhipblas.so -> libhipblas.so.3);
+        # materialize symlinks that escape into another _rocm_sdk_* package.
+        try:
+            resolved.relative_to(root_lib)
+            in_same_lib = not os.path.isabs(raw_target)
+        except ValueError:
+            in_same_lib = False
+        if in_same_lib:
+            os.symlink(raw_target, dst)
+        elif resolved.is_file():
+            shutil.copy2(resolved, dst)
+        elif resolved.is_dir():
+            shutil.copytree(resolved, dst, symlinks=True, dirs_exist_ok=True)
+    elif src.is_file():
+        shutil.copy2(src, dst)
+
+for pkg in sdk_pkgs:
+    lib_dir = pkg / "lib"
+    if not lib_dir.is_dir():
+        continue
+    for item in sorted(lib_dir.iterdir()):
+        name = item.name
+        if name in SKIP_TOP_DIRS or name.endswith((".a", ".la", ".o", ".bc")):
+            continue
+        if item.is_dir() and not item.is_symlink():
+            if name == "llvm":
+                # Keep only llvm/lib shared objects (libLLVM / libclang-cpp for libamd_comgr), skip clang bins/headers
+                llvm_lib = item / "lib"
+                if llvm_lib.is_dir():
+                    out_llvm_lib = dest / "llvm" / "lib"
+                    out_llvm_lib.mkdir(parents=True, exist_ok=True)
+                    for sub in sorted(llvm_lib.iterdir()):
+                        if sub.is_dir() and not sub.is_symlink():
+                            continue
+                        if ".so" in sub.name:
+                            copy_entry(sub, out_llvm_lib / sub.name, llvm_lib)
+            elif name in KEEP_SUBDIRS or name.startswith("rocm"):
+                target_dir = dest / name
+                for root_s, dirs_s, files_s in os.walk(item):
+                    # Skip non-runtime cmake/include subdirs inside nested packages
+                    dirs_s[:] = [d for d in dirs_s if d not in ("cmake", "pkgconfig", "include")]
+                    rel = pathlib.Path(root_s).relative_to(item)
+                    out_dir = target_dir / rel
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    for fn in files_s:
+                        if fn.endswith((".a", ".la", ".o")):
+                            continue
+                        copy_entry(pathlib.Path(root_s) / fn, out_dir / fn, lib_dir)
+        else:
+            if ".so" in name or name.endswith(".kpack"):
+                copy_entry(item, dest / name, lib_dir)
+
+# Sanity check: critical HIP/rocBLAS libs & gfx1030 Tensile kernel tables exist with zero dangling .so symlinks
+for pat in ("libamdhip64.so*", "libhipblas.so*", "librocblas.so*"):
+    assert list(dest.glob(pat)), f"Missing required runtime library {pat} in {dest}"
+rocblas_lib = dest / "rocblas" / "library"
+assert rocblas_lib.is_dir() and any(rocblas_lib.iterdir()), f"Missing rocBLAS Tensile kernel tables in {rocblas_lib}"
+broken = [p for p in dest.rglob("*.so*") if p.is_symlink() and not p.exists()]
+assert not broken, f"Broken shared library symlinks in {dest}: {broken[:10]}"
+print(f"Collected stripped ROCm runtime libraries into {dest} ({len(list(dest.glob('*.so*')))} top-level .so entries)")
+PY
+
+
+# ==============================================================================
+# Stage 2: Minimal Runtime Image (Ubuntu 24.04 + Stripped ROCm Runtime)
+# ==============================================================================
+FROM ubuntu:24.04 AS runner
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    MAYA_UPDATE_CHECK=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libatomic1 \
+        libgomp1 \
+        libnuma1 \
+        python3 \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Project Maya runtime tree (keep source files needed for MAYA-BUILD.json hash + GLM test fixtures)
+COPY --from=builder /src /opt/maya
+RUN rm -rf /opt/maya/.git \
+           /opt/maya/tests \
+           /opt/maya/bench \
+           /opt/maya/ref \
+           /opt/maya/third_party/wheels \
+           /opt/maya/data/glm5-big-dumps \
+           /opt/maya/data/glm-dsa \
+           /opt/maya/data/exl3-exllamav3
+
+# llama.cpp's gguf-py (tokenizer export for tools/iq_pack.py) + ggml CMakeLists marker
+COPY --from=builder /llama.cpp/gguf-py /opt/maya/third_party/llama.cpp/gguf-py
+COPY --from=builder /llama.cpp/ggml/CMakeLists.txt /opt/maya/third_party/llama.cpp/ggml/CMakeLists.txt
+
+# Stripped ROCm runtime shared libraries & gfx1030 Tensile kernel tables
+COPY --from=builder /opt/rocm-runtime/lib /opt/rocm/lib
+RUN printf '%s\n' \
+        '/opt/rocm/lib' \
+        '/opt/rocm/lib/rocm_sysdeps/lib' \
+        '/opt/rocm/lib/llvm/lib' \
+        > /etc/ld.so.conf.d/rocm.conf \
+    && ldconfig
+ENV ROCM_PATH=/opt/rocm \
+    LD_LIBRARY_PATH=/opt/rocm/lib
+
+# Runtime-only Python .venv matching setup.py's PY_PACKAGES (excluding build-only cmake/ninja)
+RUN mkdir -p /opt/maya/image && python3 - > /opt/maya/image/py-packages.txt <<'PY'
+import ast, re
+tree = ast.parse(open("/opt/maya/setup.py", encoding="utf-8").read())
+found = [
+    node.value for node in ast.walk(tree)
+    if isinstance(node, ast.Assign)
+    and any(isinstance(t, ast.Name) and t.id == "PY_PACKAGES" for t in node.targets)
+]
+assert len(found) == 1, "setup.py: expected one PY_PACKAGES list"
+packages = [
+    p for p in ast.literal_eval(found[0])
+    if re.split(r"[<>=!~;\[ ]", p, maxsplit=1)[0].lower() not in ("cmake", "ninja")
+]
+assert "numpy" in packages, packages
+print("\n".join(packages))
+PY
+RUN --mount=type=cache,id=project-maya-gfx1030-pip,target=/root/.cache/pip \
+    python3 -m venv /opt/maya/.venv \
+    && /opt/maya/.venv/bin/pip install --upgrade pip \
+    && /opt/maya/.venv/bin/pip install -r /opt/maya/image/py-packages.txt \
+    && /opt/maya/.venv/bin/pip freeze > /opt/maya/image/pip-freeze.txt \
+    && /opt/maya/.venv/bin/python - <<'PY'
+import json, pathlib
+pkgs = [ln.strip() for ln in pathlib.Path("/opt/maya/image/py-packages.txt").read_text(encoding="utf-8").splitlines() if ln.strip()]
+pathlib.Path("/opt/maya/.venv/.strata-pip.json").write_text(json.dumps(sorted(set(pkgs)), indent=0), encoding="utf-8")
+PY
+
+# Install compiled GLM engine, portable CPU/HIP vision encoders, HIP parity/bench tests, and build reports
+COPY --from=builder /out/bin/maya /opt/maya/build-hip/maya
+COPY --from=builder /out/vision/maya-vision /opt/maya/build-vision/bin/maya-vision
+COPY --from=builder /out/vision-cpu/maya-vision /opt/maya/build-vision-cpu/bin/maya-vision
+COPY --from=builder /out/tests/ /opt/maya/tests/
+COPY --from=builder /out/cpu-flags.txt \
+                    /out/hip-architectures.txt \
+                    /out/host-isa-check.txt \
+                    /out/gfx1030-isa-check.txt \
+                    /opt/maya/image/
+
+# Pre-stamp build-hip/MAYA-BUILD.json and build-vision/MAYA-BUILD.json matching maya.py's exact schema
+# (maya.py:105,108,2882-2886,4133-4135) and assert zero recompilation will be triggered at startup
+RUN /opt/maya/.venv/bin/python - <<'PY'
+import json, pathlib, sys, time
+sys.path.insert(0, "/opt/maya")
+import setup as S
+import maya
+
+archs = [
+    a.strip()
+    for a in pathlib.Path("/opt/maya/image/hip-architectures.txt").read_text(encoding="utf-8").replace(",", ";").split(";")
+    if a.strip()
+]
+now = time.strftime("%Y-%m-%d %H:%M")
+llama = "/opt/maya/third_party/llama.cpp"
+
+maya.select_build_backend("hip")
+assert maya.STAMP == pathlib.Path("/opt/maya/build-hip/MAYA-BUILD.json"), maya.STAMP
+assert maya.VSTAMP == pathlib.Path("/opt/maya/build-vision/MAYA-BUILD.json"), maya.VSTAMP
+
+eng_src = S.source_hash(S.ENGINE_SOURCES)
+eng_meta = {
+    "backend": "hip",
+    "src": eng_src,
+    "archs": archs,
+    "rocm": "/opt/rocm",
+    "gpu_ids": [0, 1],
+    "llama": llama,
+    "lib_dirs": ["/opt/rocm/lib"],
+    "date": now,
+    "targets": ["maya"],
+}
+maya.STAMP.write_text(json.dumps(eng_meta, indent=1), encoding="utf-8")
+
+vis_src = S.source_hash(("tools/vision",))
+vis_meta = {
+    "src": vis_src,
+    "archs": archs,
+    "llama": llama,
+    "backend": "hip",
+    "date": now,
+}
+maya.VSTAMP.write_text(json.dumps(vis_meta, indent=1), encoding="utf-8")
+
+# Simulate maya.py build_step / refresh_engine / vision_step up-to-date checks
+assert maya.EXE.is_file(), f"Missing {maya.EXE}"
+assert maya.VEXE.is_file(), f"Missing {maya.VEXE}"
+assert eng_meta["backend"] == "hip" and eng_meta["src"] == S.source_hash(S.ENGINE_SOURCES)
+assert "maya" in eng_meta["targets"] and "gfx1030" in eng_meta["archs"]
+assert vis_meta["src"] == S.source_hash(("tools/vision",)) and "gfx1030" in vis_meta["archs"]
+print(f"Pre-stamped MAYA-BUILD.json OK: engine src={eng_src} archs={archs}; vision src={vis_src}")
+PY
+
+# Verify dynamic library linkage (ldd) has ZERO "not found" on ALL built binaries,
+# verify CLI entrypoints, gguf-py import, fixtures, and strict LF on entrypoint script
+RUN set -euo pipefail; \
+    for bin in \
+        /opt/maya/build-hip/maya \
+        /opt/maya/build-vision/bin/maya-vision \
+        /opt/maya/build-vision-cpu/bin/maya-vision \
+        /opt/maya/tests/*; do \
+        test -x "$bin"; \
+        echo "=== ldd $bin ==="; \
+        out="$(ldd "$bin")"; \
+        if printf '%s\n' "$out" | grep -qi "not found"; then \
+            printf '%s\n' "$out" >&2; \
+            echo "ERROR: unresolved shared library in $bin" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    chmod +x /opt/maya/docker/entrypoint-gfx1030.sh /opt/maya/maya.sh; \
+    /opt/maya/.venv/bin/python -c 'import pathlib; b = pathlib.Path("/opt/maya/docker/entrypoint-gfx1030.sh").read_bytes(); assert b"\r" not in b, "CRLF detected in entrypoint-gfx1030.sh"'; \
+    sh -n /opt/maya/docker/entrypoint-gfx1030.sh; \
+    /opt/maya/.venv/bin/python /opt/maya/serve/server.py --help >/dev/null; \
+    /opt/maya/.venv/bin/python /opt/maya/tools/iq_pack.py --help >/dev/null; \
+    cd /opt/maya && /opt/maya/.venv/bin/python -c 'import sys; sys.path.insert(0, "tools"); import _paths; _paths.add_gguf_py(); import gguf'; \
+    test -s /opt/maya/data/expert-profile-glm.bin; \
+    test -s /opt/maya/data/glm5-synth.gguf; \
+    test -d /opt/maya/data/glm5-synth-dumps; \
+    test -d /opt/maya/data/glm5-synth-dumps12
+
+WORKDIR /opt/maya
+VOLUME ["/data", "/models"]
+EXPOSE 8080
+
+# Generous 1200s start-period accommodates one-time HDD cold loading of Maya-S (96.5 GB)
+# and Maya-M (116 GB) into VRAM + pinned RAM (MAYA_GLM_RAM_RESIDENT=1).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=1200s --retries=3 \
+    CMD curl -fs "http://127.0.0.1:${MAYA_PORT:-${PORT:-8080}}/health" >/dev/null || exit 1
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/opt/maya/docker/entrypoint-gfx1030.sh"]

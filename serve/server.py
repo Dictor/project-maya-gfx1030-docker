@@ -7440,8 +7440,9 @@ def main() -> int:
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
-        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
-            venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
+        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") != "metal":
+            # the encoder on the first GPU only (matching VLEND's dev_ == 0 pool-tail lend)
+            venv["HIP_VISIBLE_DEVICES" if cfg.get("backend") == "hip" else "CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])
         # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
         # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
         # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)

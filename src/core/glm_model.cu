@@ -3473,8 +3473,25 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         M.cb = m.cb;
         const x3::Mat& slot = exl3_mats_["output.weight.hi"] = M;
         ws_map_["output.weight.hi"] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, nc};
+        const char* prio_env = getenv("MAYA_GLM_STREAM_PRIO");
+        bool prio_on = prio_env == nullptr || std::atoi(prio_env) != 0;
+#if defined(STRATA_USE_HIP)
+        // #621: RDNA 2 (gfx103x) can stall/hang when high-priority kernels wait on default-priority work
+        if (prio_env == nullptr) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, dev_) == cudaSuccess &&
+                std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
+                prio_on = false;
+                std::fprintf(stderr, "glm pack: CUDA%d (%s): head-split streams at default priority (RDNA 2; "
+                                     "MAYA_GLM_STREAM_PRIO=1 to raise)\n", dev_, prop.gcnArchName);
+            }
+        }
+#endif
         int lo = 0, hi = 0;
-        cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        if (!prio_on || cudaDeviceGetStreamPriorityRange(&lo, &hi) != cudaSuccess) {
+            cudaGetLastError();
+            hi = 0;
+        }
         if (cudaStreamCreateWithPriority(&hh_s_, cudaStreamNonBlocking, hi) != cudaSuccess ||
             cudaStreamCreateWithPriority(&hd_s_, cudaStreamNonBlocking, hi) != cudaSuccess) {
             err = "pack: the head split's stream";

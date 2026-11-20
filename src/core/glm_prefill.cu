@@ -48,6 +48,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -215,17 +216,32 @@ bool mla_f16_on() {
     static const bool on = env_on("MAYA_GLM_MLA_F16") || mla_wmma_on();
     return on;
 }
-enum class MlaAttnPath { F32, F16Q, WMMA2 };
+bool mla_fdot2_on() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_MLA_FDOT2");
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+    }();
+    return on;
+}
+enum class MlaAttnPath { F32, F16Q, WMMA2, FDOT2 };
 MlaAttnPath mla_attn_path() {
-    if (!mla_wmma_on()) return MlaAttnPath::F32;   // MAYA_GLM_MLA_WMMA=0 keeps the F32 kernel as before
     static const char* mode = getenv("MAYA_GLM_PREFILL_ATTN");
+    static const bool want_fdot2 = mode != nullptr && std::strcmp(mode, "fdot2") == 0;
+    static const bool want_f32 = mode != nullptr && std::strcmp(mode, "f32") == 0;
+    if (want_f32) return MlaAttnPath::F32;
+    if (want_fdot2) return gb::mla_fdot2_supported() ? MlaAttnPath::FDOT2 : MlaAttnPath::F32;
+#if !defined(STRATA_HAS_WMMA) || !STRATA_HAS_WMMA
+    return (mla_fdot2_on() && gb::mla_fdot2_supported()) ? MlaAttnPath::FDOT2 : MlaAttnPath::F32;
+#else
+    if (!gb::mla_wmma2_supported())
+        return (mla_fdot2_on() && gb::mla_fdot2_supported()) ? MlaAttnPath::FDOT2 : MlaAttnPath::F32;
+    if (!mla_wmma_on()) return MlaAttnPath::F32;   // MAYA_GLM_MLA_WMMA=0 keeps the F32 kernel as before
     static const bool want_wmma2 = mode != nullptr && std::strcmp(mode, "wmma2") == 0;
     static const bool want_f16q = mode != nullptr && std::strcmp(mode, "f16q") == 0;
-    static const bool want_f32 = mode != nullptr && std::strcmp(mode, "f32") == 0;
-    if (want_f32 || !gb::mla_wmma2_supported()) return MlaAttnPath::F32;   // (no WMMA: f16q's rocWMMA neither)
     if (want_f16q) return MlaAttnPath::F16Q;
     if (want_wmma2) return MlaAttnPath::WMMA2;
     return gb::mla_wmma2_default() ? MlaAttnPath::WMMA2 : MlaAttnPath::F16Q;
+#endif
 }
 #endif
 // The Volta grouped-WMMA MoE products (MAYA_PF_WMMA, the same switch as the Qwen prompt path): the FP16
@@ -402,32 +418,28 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     return b;
 }
 
-// the shared expert's sub-batch: each one dequantizes its three matrices to FP16 again, so on CUDA it runs in larger
-// ones than the mixers; MAYA_GLM_PREFILL_SH_SUB overrides, sub_env sets it
+// the shared expert's sub-batch: each one dequantizes its three matrices to FP16 again, so it runs in larger
+// sub-batches than kSub (2048 on CUDA, 1024 on HIP); MAYA_GLM_PREFILL_SH_SUB overrides, sub_env sets it
 int shexp_sub(int sub_env) {
     if (sub_env > 0) return sub_env;
-#if defined(STRATA_USE_HIP)
-    return kSub;
-#else
     static const int v = [] {
         const char* e = getenv("MAYA_GLM_PREFILL_SH_SUB");
+#if defined(STRATA_USE_HIP)
+        return e ? std::clamp(std::atoi(e), 16, 8192) : 1024;
+#else
         return e ? std::clamp(std::atoi(e), 16, 8192) : kShSub;
+#endif
     }();
     return v;
-#endif
 }
 
 // the mixers' and the dense FFN's sub-batch for chunks of T tokens: kSub, doubled (up to 4096) while their buffers
 // stay within what the chunk's MoE buffers take of the union anyway - no extra memory, fewer and larger GEMMs, and
 // each projection dequantized to FP16 once a sub-batch instead of once every 256 tokens (a 14.8K chunk: 58 -> 4).
-// sub_env (MAYA_GLM_PREFILL_SUB, 16-8192) sets every sub-batch instead; HIP keeps kSub without it.
+// sub_env (MAYA_GLM_PREFILL_SUB, 16-8192) sets every sub-batch instead.
 int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, bool moe, int max_pools, int sub_env) {
     if (sub_env > 0) return sub_env;
     if (dsa && g.arch == GlmArch::GlmDsa) return (int) std::min<size_t>(T, glmpf::kSubBatch);   // glm-dsa B9.1
-#if defined(STRATA_USE_HIP)
-    (void) T; (void) g; (void) kda; (void) dsa; (void) dense; (void) moe; (void) max_pools;
-    return kSub;
-#else
     size_t room = 0;
     if (moe) { Carve m; carve_moe(m, T, kSub, g); room = m.off; }
     int ts = kSub;
@@ -440,13 +452,34 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
         ts = t2;
     }
     return ts;
-#endif
 }
 
 void blas_ck(cublasStatus_t st, const char* what) {
     if (st != CUBLAS_STATUS_SUCCESS)
         std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d (cuda: %s)\n", what, (int) st,
                      cudaGetErrorString(cudaGetLastError()));
+}
+
+// FP16 x FP16 -> FP32 GEMM (col-major op(A)=T, op(B)=N): on HIP with MAYA_GLM_PROMPT_F16 (default on gfx103x),
+// writes FP16 into the start of each FP32 output row (2 * ldc halves apart) and widens in place when beta == 0
+// and ldc >= m so non-overlapping rows are guaranteed.
+cublasStatus_t hgemm_ex_f32(cublasHandle_t blas, cudaStream_t s, int m, int n, int k, const float* alpha,
+                            const uint16_t* A, int lda, const uint16_t* B, int ldb, const float* beta, float* C,
+                            int ldc) {
+#if defined(STRATA_USE_HIP)
+    if (*beta == 0.0f && m > 0 && n > 0 && ldc >= m && ldc <= INT_MAX / 2 && gb::prompt_f16_enabled()) {
+        const cublasStatus_t st = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, alpha, A, CUDA_R_16F, lda,
+                                               B, CUDA_R_16F, ldb, beta, C, CUDA_R_16F, 2 * ldc,
+                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st == CUBLAS_STATUS_SUCCESS)
+            gb::widen_rows_f16(C, m, (size_t) ldc, n, s, gb::prompt_f16_check());
+        return st;
+    }
+#else
+    (void) s;
+#endif
+    return cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, alpha, A, CUDA_R_16F, lda, B, CUDA_R_16F, ldb, beta,
+                        C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // EXL3 experts (MMQ does not read their trellis), each by its row count: a lightly routed one through the tensor-core
@@ -538,10 +571,8 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
             for (int r = 0; r < 2; ++r) {
                 uint16_t* Xr = X16 + (size_t) r * gu_rows * E;
                 x3::rows_rot_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, mat(r).suh, Xr, s);
-                blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, nff, n, E, &one,
-                                     L.w16 + (size_t) r * nff * E, CUDA_R_16F, E, Xr, CUDA_R_16F, E, &zero,
-                                     GU + (size_t) c0 * E + (size_t) r * nff, CUDA_R_32F, E,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                blas_ck(hgemm_ex_f32(L.blas, s, nff, n, E, &one, L.w16 + (size_t) r * nff * E, E, Xr, E, &zero,
+                                     GU + (size_t) c0 * E + (size_t) r * nff, E),
                         "gemm exl3 gate/up");
             }
         }
@@ -552,9 +583,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
         for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
             const int n = std::min(dn_rows, nrows - c0);
             x3::rows_rot_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, mat(2).suh, H16, s);
-            blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff,
-                                 H16, CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E,
-                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+            blas_ck(hgemm_ex_f32(L.blas, s, E, n, nff, &one, L.w16, nff, H16, nff, &zero, GU + (size_t) c0 * E, E),
                     "gemm exl3 down");
         }
         x3::rows_rot_out(GU, E, nrows, E, mat(2).svh, s);
@@ -566,9 +595,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
     for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
         const int n = std::min(gu_rows, nrows - c0);
         x3::rows_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
-        blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, L.w16, CUDA_R_16F, E,
-                             X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+        blas_ck(hgemm_ex_f32(L.blas, s, 2 * nff, n, E, &one, L.w16, E, X16, E, &zero, GU + (size_t) c0 * E, E),
                 "gemm exl3 gate/up");
     }
     gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
@@ -577,9 +604,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
     for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
         const int n = std::min(dn_rows, nrows - c0);
         x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
-        blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff, H16,
-                             CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+        blas_ck(hgemm_ex_f32(L.blas, s, E, n, nff, &one, L.w16, nff, H16, nff, &zero, GU + (size_t) c0 * E, E),
                 "gemm exl3 down");
     }
 }
@@ -1529,6 +1554,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
             const cublasStatus_t w2 =
                 cublasGemmEx(S->blas, CUBLAS_OP_N, CUBLAS_OP_N, 16, 16, 16, &one, wa, CUDA_R_16F, 16, wb, CUDA_R_16F,
                              16, &zero, wc, CUDA_R_32F, 16, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#if defined(STRATA_USE_HIP)
+            if (gb::prompt_f16_enabled()) {
+                (void) cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 16, 16, 16, &one, wa, CUDA_R_16F, 16, wb,
+                                    CUDA_R_16F, 16, &zero, wc, CUDA_R_16F, 16, CUBLAS_COMPUTE_32F,
+                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            }
+#endif
             const cudaError_t we = cudaStreamSynchronize(F->cs);
             std::fprintf(stderr, "glm prefill: CUDA%d cuBLAS warm-up: sgemm %d, gemm f16 %d, sync %s\n", dev_,
                          (int) w1, (int) w2, cudaGetErrorString(we));
@@ -2275,9 +2307,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 continue;
             }
 #endif
-            const cublasStatus_t st = cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16,
-                                                   CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy,
-                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            const cublasStatus_t st = hgemm_ex_f32(S->blas, s, n, Tn, Kd, &one, S->w16, Kd, X16, ldx, &beta, Y + r0, ldy);
             gemm_fail(st, "gemm f16", S->w16, X16, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
             blas_ck(st, "gemm f16");
         }
@@ -3079,17 +3109,32 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const MlaAttnPath attn_path = mla_attn_path();
                 const bool use_f16q = f16 && attn_path == MlaAttnPath::F16Q;
                 const bool use_wmma2 = attn_path == MlaAttnPath::WMMA2;
+                const bool use_fdot2 = attn_path == MlaAttnPath::FDOT2;
+                const bool prompt_f16 = gb::prompt_f16_enabled();
                 uint16_t* const hp_q = (uint16_t*) B.attn;
                 uint16_t* const hp_c = (uint16_t*) B.q_abs;
                 if (f16) {
                     bf16_to_f16<<<1024, 256, 0, s>>>(Ly.k_b, S->w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.q, hp_q, tn, g.n_head, g.qk_nope);
-                    blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
-                                                        S->w16, HIP_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
-                                                        hp_q, HIP_R_16F, g.qk_nope, (long long) tn * g.qk_nope, &zero,
-                                                        B.q_abs, use_f16q ? HIP_R_16F : HIP_R_32F, g.n_head * g.kv_lora,
-                                                        g.kv_lora, g.n_head, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
-                            "q_abs f16");
+                    if (!use_f16q && prompt_f16 && (int64_t) g.n_head * g.kv_lora <= INT_MAX / 2) {
+                        const hipblasStatus_t st = hipblasGemmStridedBatchedEx(
+                            S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
+                            S->w16, HIP_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
+                            hp_q, HIP_R_16F, g.qk_nope, (long long) tn * g.qk_nope, &zero,
+                            B.q_abs, HIP_R_16F, 2 * g.n_head * g.kv_lora, (long long) 2 * g.kv_lora, g.n_head,
+                            HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+                        blas_ck(st, "q_abs f16 (fp16 out)");
+                        if (st == HIPBLAS_STATUS_SUCCESS)
+                            gb::widen_rows_f16(B.q_abs, g.kv_lora, (size_t) g.kv_lora, tn * g.n_head, s,
+                                               gb::prompt_f16_check());
+                    } else {
+                        blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
+                                                            S->w16, HIP_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
+                                                            hp_q, HIP_R_16F, g.qk_nope, (long long) tn * g.qk_nope, &zero,
+                                                            B.q_abs, use_f16q ? HIP_R_16F : HIP_R_32F, g.n_head * g.kv_lora,
+                                                            g.kv_lora, g.n_head, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                                "q_abs f16");
+                    }
                 } else
 #endif
                 {
@@ -3110,22 +3155,52 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gb::mla_attn_wmma2(B.q_abs, lat, B.cells,
                                        B.n_sel, g.n_sel_max(), g.n_head, g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn,
                                        B.ctx, s, lat_q8_);
+                else if (use_fdot2)
+                    gb::mla_attn_fdot2(B.q_abs, lat, B.cells,
+                                       B.n_sel, g.n_sel_max(), g.n_head, g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn,
+                                       B.ctx, s, lat_q8_);
                 else
 #endif
                 gb::mla_attn(B.q_abs, lat, B.cells, B.n_sel, g.n_sel_max(), g.n_head,
                              g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn, B.ctx, s, lat_q8_);
                 S->mark("dsa_attn", s);
                 // out[t][h] = wv_b[h] (v_head x kv_lora) . ctx[t][h]
+                bool attn16_written = false;
 #if defined(STRATA_USE_HIP)
                 if (f16) {
                     bf16_to_f16<<<1024, 256, 0, s>>>(Ly.v_b, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.ctx, hp_c, tn, g.n_head, g.kv_lora);
-                    blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
-                                                        S->w16, HIP_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
-                                                        hp_c, HIP_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
-                                                        B.attn, HIP_R_32F, g.n_head * g.v_head, g.v_head, g.n_head,
-                                                        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
-                            "mla out f16");
+                    // Direct FP16 output into B.attn16 skips both the slow FP32-out Tensile fallback and f32_to_f16.
+                    const bool direct_attn16 = prompt_f16 && g_.arch != GlmArch::GlmDsa && (cb_dir == nullptr || !cb_dir[0]);
+                    if (direct_attn16) {
+                        blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
+                                                            S->w16, HIP_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
+                                                            hp_c, HIP_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
+                                                            B.attn16, HIP_R_16F, g.n_head * g.v_head, g.v_head, g.n_head,
+                                                            HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                                "mla out f16 (direct attn16)");
+                        if (gb::prompt_f16_check())
+                            gb::check_f16_finite(B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
+                        attn16_written = true;
+                    } else if (prompt_f16 && (int64_t) g.n_head * g.v_head <= INT_MAX / 2) {
+                        const hipblasStatus_t st = hipblasGemmStridedBatchedEx(
+                            S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
+                            S->w16, HIP_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
+                            hp_c, HIP_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
+                            B.attn, HIP_R_16F, 2 * g.n_head * g.v_head, (long long) 2 * g.v_head, g.n_head,
+                            HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+                        blas_ck(st, "mla out f16 (fp16 out)");
+                        if (st == HIPBLAS_STATUS_SUCCESS)
+                            gb::widen_rows_f16(B.attn, g.v_head, (size_t) g.v_head, tn * g.n_head, s,
+                                               gb::prompt_f16_check());
+                    } else {
+                        blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
+                                                            S->w16, HIP_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
+                                                            hp_c, HIP_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
+                                                            B.attn, HIP_R_32F, g.n_head * g.v_head, g.v_head, g.n_head,
+                                                            HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                                "mla out f16");
+                    }
                 } else
 #endif
                 {
@@ -3136,7 +3211,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                                   g.v_head, g.n_head),
                         "mla out");
                 }
-                gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
+                if (!attn16_written)
+                    gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
                 if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_rows(B.attn, g.n_head * g.v_head, 0, 1, g.n_head * g.v_head, tn, B.attn16, s);   // glm-dsa B15.1
                 if (!skip_output)
                     hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, g.n_head * g.v_head, mixer, E, tn, 0.0f);
@@ -3847,9 +3923,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 for (int c0 = 0; c0 < n_i; c0 += cap) {
                     const int n = std::min(cap, n_i - c0);
                     x3::rows_f16(S->x, E, M.row_tok + r0 + hb[i] + c0, n, E, X16, s);
-                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
-                                         X16, CUDA_R_16F, E, &zero, GU + (size_t) (hb[i] - a + c0) * (2 * nff),
-                                         CUDA_R_32F, 2 * nff, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    blas_ck(hgemm_ex_f32(S->blas, s, 2 * nff, n, E, &one, S->w16, E, X16, E, &zero,
+                                         GU + (size_t) (hb[i] - a + c0) * (2 * nff), 2 * nff),
                             "gemm f16 expert gate/up");
                 }
             }
@@ -3874,9 +3949,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     float* Y = Y0 + (size_t) k * E;
                     x3::rows_f16(h, 2 * nff, nullptr, n, nff, H16, s);
                     if (guard) glmd::f16_guard_rows(h, 2 * nff, 0, 1, nff, n, H16, s);
-                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff,
-                                         H16, CUDA_R_16F, nff, &zero, Y, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    blas_ck(hgemm_ex_f32(S->blas, s, E, n, nff, &one, S->w16, nff, H16, nff, &zero, Y, E),
                             "gemm f16 expert down");
                     if (guard) glmd::f16_guard_after(H16, nff, Y, E, E, n, 0.0f, s);
                 }
@@ -4070,9 +4143,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
                 const int n = std::min(gu_rows, nrows - c0);
                 x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
-                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
-                                     X16, CUDA_R_16F, E, &zero, G2 + (size_t) c0 * ldg, CUDA_R_32F, ldg,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                blas_ck(hgemm_ex_f32(S->blas, s, 2 * nff, n, E, &one, S->w16, E, X16, E, &zero,
+                                     G2 + (size_t) c0 * ldg, ldg),
                         "gemm q gate/up");
             }
             gb::swiglu_rows(G2, G2, nrows, nff, g.swiglu_exp, s, 2 * nff);
@@ -4081,9 +4153,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
                 const int n = std::min(dn_rows, nrows - c0);
                 x3::rows_f16(G2 + (size_t) c0 * ldg, ldg, nullptr, n, nff, H16, s);
-                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
-                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                blas_ck(hgemm_ex_f32(S->blas, s, E, n, nff, &one, S->w16, nff, H16, nff, &zero,
+                                     GU + (size_t) c0 * E, E),
                         "gemm q down");
             }
         };
@@ -5520,6 +5591,18 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             return false;
         }
     }
+#if defined(STRATA_USE_HIP)
+    if (gb::prompt_f16_check()) {
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!gb::prompt_f16_enabled()) continue;
+            const unsigned long long bad = gb::widen_bad_take();
+            std::fprintf(stderr, "glm prefill: CUDA%d: FP16-out GEMM outputs not finite in this run: %llu\n",
+                         m->dev_, bad);
+        }
+        cudaSetDevice(dev_);
+    }
+#endif
     // glm-dsa B15.2: an MMQ product moe_mmq.cu refused (an expert stride that is not whole blocks) is a failed launch
     if (gb::launch_errors() > 0 || strata::kernels::glmf::launch_errors() > 0 || mmq::launch_errors() > 0) {
         err = "glm prefill: " +

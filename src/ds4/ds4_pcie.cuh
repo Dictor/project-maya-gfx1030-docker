@@ -38,14 +38,15 @@ struct Mats {
     size_t off[3], bytes[3];
 };
 
-// the device's clock in ns (NVIDIA's globaltimer; HIP's wall clock, 100 MHz on gfx11/gfx12); 0 on other AMD GPUs,
-// whose wall clock may tick at another rate - the host then times the pull itself
+// the device's clock in ns (NVIDIA's globaltimer; HIP's wall clock, 100 MHz on gfx103x/gfx11/gfx12); 0 on other AMD
+// GPUs, whose wall clock may tick at another rate - the host then times the pull itself
 __device__ __forceinline__ unsigned long long pull_clock() {
 #if !defined(STRATA_USE_HIP)
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
-#elif defined(__GFX11__) || defined(__GFX12__)
+#elif defined(__GFX11__) || defined(__GFX12__) || defined(__gfx1030__) || defined(__gfx1031__) || \
+    defined(__gfx1032__) || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
     return (unsigned long long) wall_clock64() * 10ull;
 #else
     return 0ull;

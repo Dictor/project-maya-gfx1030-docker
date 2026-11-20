@@ -842,8 +842,25 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (const char* pn = getenv("MAYA_GLM_PREFETCH_N")) {
         F->max_pf = std::max(0, std::min(gf::kSpares - 1, std::atoi(pn)));
         if (F->max_pf > 0 && getenv("MAYA_GLM_PF_CE") != nullptr && std::atoi(getenv("MAYA_GLM_PF_CE")) != 0) {
+            const char* prio_env = getenv("MAYA_GLM_STREAM_PRIO");
+            bool prio_on = prio_env == nullptr || std::atoi(prio_env) != 0;
+#if defined(STRATA_USE_HIP)
+            // #621: RDNA 2 (gfx103x) can stall/hang when high-priority kernels wait on default-priority work
+            if (prio_env == nullptr) {
+                cudaDeviceProp prop{};
+                if (cudaGetDeviceProperties(&prop, dev_) == cudaSuccess &&
+                    std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
+                    prio_on = false;
+                    std::fprintf(stderr, "glm fast: CUDA%d (%s): prefetch stream at default priority (RDNA 2; "
+                                         "MAYA_GLM_STREAM_PRIO=1 to raise)\n", dev_, prop.gcnArchName);
+                }
+            }
+#endif
             int lo = 0, hi = 0;
-            cudaDeviceGetStreamPriorityRange(&lo, &hi);
+            if (!prio_on || cudaDeviceGetStreamPriorityRange(&lo, &hi) != cudaSuccess) {
+                cudaGetLastError();
+                hi = 0;
+            }
             if (cudaStreamCreateWithPriority(&F->pfce_stream, cudaStreamNonBlocking, hi) == cudaSuccess &&
                 cudaMalloc((void**) &F->pf_flag_d, 64) == cudaSuccess &&
                 cudaHostAlloc((void**) &F->pfce_seq_h, gf::kRingSize * sizeof(unsigned int), cudaHostAllocPortable) ==

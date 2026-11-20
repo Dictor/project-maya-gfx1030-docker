@@ -4,6 +4,7 @@
 // weights dequantized to FP16, BF16 weights widened to F32) and llama.cpp's MMQ for the routed experts.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -107,6 +108,22 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
 /// where the prompt path prefers it over mla_attn_f16q.
 bool mla_wmma2_supported();
 bool mla_wmma2_default();
+/// RDNA 2 (gfx103x) prompt MLA attention using v_dot2_f32_f16 (__builtin_amdgcn_fdot2): scales each head's F32 query
+/// by a power of two into FP16 to avoid overflow/underflow, F32 softmax and accumulation.  n_head % 16 == 0, kv_lora 512.
+void mla_attn_fdot2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
+                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
+/// True on the current device where mla_attn_fdot2 runs natively (gfx1030/gfx1031/gfx1032).
+bool mla_fdot2_supported();
+/// MAYA_GLM_PROMPT_F16: FP16-output prompt GEMMs + in-place widen (default ON on gfx103x, 0 disables, 1 forces on HIP).
+bool prompt_f16_enabled();
+/// MAYA_GLM_PROMPT_F16_CHECK=1: count non-finite FP16-out GEMM outputs per device.
+int prompt_f16_check();
+/// In-place reverse-walk widen of `rows` rows of `n` FP16 values written at the start of FP32 rows of stride `ldy`.
+void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad = 0);
+/// Count non-finite FP16 values in `h[0..n)` into the per-device overflow counter (used for direct FP16-out GEMMs).
+void check_f16_finite(const uint16_t* h, int64_t n, cudaStream_t s);
+/// Read and reset the current device's FP16-out non-finite output counter.
+unsigned long long widen_bad_take();
 #endif
 /// One decode token's absorbed MLA attention on Volta's tensor cores (mla_attn_v70_kernel in cell splits, then their
 /// merge): ctx[h] = softmax(q_abs[h] . lat_c * scale) . lat_c over its n_sel cells.  part holds part_cap splits of

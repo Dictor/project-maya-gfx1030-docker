@@ -64,6 +64,14 @@ __device__ __forceinline__ float warp_sum(float v) {
     v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));
     v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false));
     return v;
+#elif defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    const int i = __builtin_bit_cast(int, v);
+    v += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x168, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x164, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x162, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x161, 0xf, 0xf, false));
+    return v;
 #else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -77,6 +85,14 @@ __device__ __forceinline__ float warp_max(float v) {
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false)));
+    return v;
+#elif defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    const int i = __builtin_bit_cast(int, v);
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x168, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x164, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x162, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x161, 0xf, 0xf, false)));
     return v;
 #else
 #pragma unroll
@@ -1926,6 +1942,213 @@ int mla_wmma2_arch() {
     }
     return c;
 }
+
+// RDNA 2 (gfx1030/1031/1032) prompt MLA attention via v_dot2_f32_f16 (__builtin_amdgcn_fdot2):
+// strictly guarded on gfx1030/1031/1032 (NEVER bare __GFX10__, since RDNA 1 lacks FeatureDot2Insts).
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
+typedef _Float16 mla_fdot2_h2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float mla_fdot2(uint32_t a, uint32_t b, float c) {
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(mla_fdot2_h2, a), __builtin_bit_cast(mla_fdot2_h2, b), c, false);
+}
+__device__ __forceinline__ uint32_t pack_h2_rn(float a, float b) {
+    const mla_fdot2_h2 v = {(_Float16) a, (_Float16) b};
+    return __builtin_bit_cast(uint32_t, v);
+}
+#else
+__device__ __forceinline__ float mla_fdot2(uint32_t a, uint32_t b, float c) {
+    const float a0 = __half2float(__ushort_as_half((uint16_t) (a & 0xffffu)));
+    const float a1 = __half2float(__ushort_as_half((uint16_t) (a >> 16)));
+    const float b0 = __half2float(__ushort_as_half((uint16_t) (b & 0xffffu)));
+    const float b1 = __half2float(__ushort_as_half((uint16_t) (b >> 16)));
+    return c + a0 * b0 + a1 * b1;
+}
+__device__ __forceinline__ uint32_t pack_h2_rn(float a, float b) {
+    return (uint32_t) __half_as_ushort(__float2half_rn(a)) |
+           ((uint32_t) __half_as_ushort(__float2half_rn(b)) << 16);
+}
+#endif
+
+// Block = (token, 16 heads), 256 threads (8 warps).  Q*K^T pairs adjacent KV columns into FP16x2 (each head's
+// F32 query is scaled by a power of two into [2^13, 2^14) so FP16 packing never overflows or underflows, undone
+// on its scores); P*V pairs adjacent cells (2*s2, 2*s2+1) with FP16 softmax weights and zero-padded masked/tail
+// cells so odd n_sel and masked entries need no tail branch; each thread owns adjacent output columns 2*tid and
+// 2*tid+1 via bank-conflict-free 32-bit LDS loads and v_perm_b32 transposes.
+constexpr size_t kFdot2Smem = (size_t) MB_CH * 512 * sizeof(uint16_t) + (size_t) MB_HG * MB_CH * sizeof(float);
+static_assert(kFdot2Smem <= 48 * 1024, "the fdot2 prompt attention must fit 48 KB of shared memory");
+__global__ void __launch_bounds__(256) mla_attn_fdot2_kernel(
+        const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+        const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
+        int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8) {
+    constexpr int KV = 512;
+    extern __shared__ __align__(16) unsigned char fd_sm[];
+    uint16_t* sL = (uint16_t*) fd_sm;                                   // MB_CH x KV, FP16 (32 KiB)
+    uint32_t* sL32 = (uint32_t*) fd_sm;                                 // MB_CH x (KV/2), packed FP16 pairs
+    float* sP = (float*) (fd_sm + (size_t) MB_CH * KV * sizeof(uint16_t)); // MB_HG x MB_CH, F32 scores (2 KiB)
+    __shared__ __align__(4) uint16_t sP16[MB_HG * MB_CH];               // MB_HG x MB_CH, FP16 weights (1 KiB)
+    __shared__ float s_m[MB_HG], s_l[MB_HG], s_scale[MB_HG];
+    __shared__ int s_cell[MB_CH];
+    const int t = blockIdx.x, h0 = blockIdx.y * MB_HG, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int ns = n_sel_arr[t];
+    const int* cl = cells_all + (size_t) t * n_sel_max;
+    // Scale and pack head 2*warp then 2*warp+1 sequentially to keep prologue VGPRs minimal.
+    uint32_t q0[8], q1[8];
+    float q_scale0 = scale, q_scale1 = scale;
+    {
+        const float* qa0 = q_abs + ((size_t) t * n_head + h0 + 2 * warp) * KV;
+        float ra[8], rb[8];
+        float mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int c = 2 * (lane + 32 * j);
+            ra[j] = qa0[c];
+            rb[j] = qa0[c + 1];
+            mx = fmaxf(mx, fmaxf(fabsf(ra[j]), fabsf(rb[j])));
+        }
+        mx = warp_max(mx);
+        int ex = 0;
+        if (mx > 0.0f && isfinite(mx)) {
+            frexpf(mx, &ex);
+            ex = max(-60, min(60, 14 - ex));
+        }
+        const float f = ldexpf(1.0f, ex);
+        q_scale0 = scale * ldexpf(1.0f, -ex);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) q0[j] = pack_h2_rn(ra[j] * f, rb[j] * f);
+    }
+    {
+        const float* qa1 = q_abs + ((size_t) t * n_head + h0 + 2 * warp + 1) * KV;
+        float ra[8], rb[8];
+        float mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int c = 2 * (lane + 32 * j);
+            ra[j] = qa1[c];
+            rb[j] = qa1[c + 1];
+            mx = fmaxf(mx, fmaxf(fabsf(ra[j]), fabsf(rb[j])));
+        }
+        mx = warp_max(mx);
+        int ex = 0;
+        if (mx > 0.0f && isfinite(mx)) {
+            frexpf(mx, &ex);
+            ex = max(-60, min(60, 14 - ex));
+        }
+        const float f = ldexpf(1.0f, ex);
+        q_scale1 = scale * ldexpf(1.0f, -ex);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) q1[j] = pack_h2_rn(ra[j] * f, rb[j] * f);
+    }
+    float acc0[MB_HG], acc1[MB_HG];
+#pragma unroll
+    for (int hh = 0; hh < MB_HG; ++hh) acc0[hh] = acc1[hh] = 0.0f;
+    if (tid < MB_HG) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+    const uint32_t* sP2 = (const uint32_t*) sP16;
+    for (int s0 = 0; s0 < ns; s0 += MB_CH) {
+        __syncthreads();
+        if (tid < MB_CH) s_cell[tid] = s0 + tid < ns ? cl[s0 + tid] : -1;
+        __syncthreads();
+        for (int i = tid; i < MB_CH * (KV / 8); i += blockDim.x) {
+            const int s = i / (KV / 8), c8 = i - s * (KV / 8);
+            const int cell = s_cell[s];
+            ((uint4*) sL)[i] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+                               : q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                                    : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+        }
+        __syncthreads();
+        for (int s = 0; s < MB_CH; ++s) {
+            if (s_cell[s] < 0) {
+                if (lane == 0) {
+                    sP[(2 * warp) * MB_CH + s] = -INFINITY;
+                    sP[(2 * warp + 1) * MB_CH + s] = -INFINITY;
+                }
+                continue;
+            }
+            float a0 = 0.0f, a1 = 0.0f;
+            const uint32_t* lrow = sL32 + s * (KV / 2) + lane;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const uint32_t lv = lrow[32 * j];
+                a0 = mla_fdot2(q0[j], lv, a0);
+                a1 = mla_fdot2(q1[j], lv, a1);
+            }
+            a0 = warp_sum(a0);
+            a1 = warp_sum(a1);
+            if (lane == 0) {
+                sP[(2 * warp) * MB_CH + s] = a0 * q_scale0;
+                sP[(2 * warp + 1) * MB_CH + s] = a1 * q_scale1;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            const int h = 2 * warp + hh;
+            const float v = sP[h * MB_CH + lane];
+            const float m_old = s_m[h];
+            const float m_new = fmaxf(m_old, warp_max(v));
+            const float e = (v == -INFINITY) ? 0.0f : expf(v - m_new);
+            const float l = warp_sum(e);
+            sP16[h * MB_CH + lane] = __half_as_ushort(__float2half_rn(e));
+            __syncwarp();
+            if (lane == 0) {
+                const float sc = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+                s_scale[h] = sc;
+                s_l[h] = s_l[h] * sc + l;
+                s_m[h] = m_new;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int hh = 0; hh < MB_HG; ++hh) {
+            const float sc = s_scale[hh];
+            acc0[hh] *= sc;
+            acc1[hh] *= sc;
+        }
+        for (int s2 = 0; s2 < MB_CH / 2; ++s2) {
+            if (s_cell[2 * s2] < 0 && s_cell[2 * s2 + 1] < 0) continue;
+            const uint32_t row_a = sL32[(2 * s2) * (KV / 2) + tid];
+            const uint32_t row_b = sL32[(2 * s2 + 1) * (KV / 2) + tid];
+            const uint32_t v0 = __byte_perm(row_a, row_b, 0x5410u);
+            const uint32_t v1 = __byte_perm(row_a, row_b, 0x7632u);
+#pragma unroll
+            for (int hh = 0; hh < MB_HG; ++hh) {
+                const uint32_t p2 = sP2[hh * (MB_CH / 2) + s2];
+                acc0[hh] = mla_fdot2(p2, v0, acc0[hh]);
+                acc1[hh] = mla_fdot2(p2, v1, acc1[hh]);
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int hh = 0; hh < MB_HG; ++hh) {
+        const float L = s_l[hh];
+        const float inv = L > 0.0f ? 1.0f / L : 0.0f;
+        float* o = ctx + ((size_t) t * n_head + h0 + hh) * KV;
+        o[2 * tid] = acc0[hh] * inv;
+        o[2 * tid + 1] = acc1[hh] * inv;
+    }
+}
+
+// Per device: 0 not probed, 1 unsupported, 2 gfx1030/1031/1032 (native v_dot2_f32_f16).
+int mla_fdot2_arch() {
+    static std::atomic<int> cache[64]{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 1;
+    int c = cache[dev].load(std::memory_order_relaxed);
+    if (!c) {
+        cudaDeviceProp prop{};
+        c = 1;
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+            const char* arch = prop.gcnArchName;
+            if (std::strncmp(arch, "gfx1030", 7) == 0 || std::strncmp(arch, "gfx1031", 7) == 0 ||
+                std::strncmp(arch, "gfx1032", 7) == 0)
+                c = 2;
+        }
+        cache[dev].store(c, std::memory_order_relaxed);
+    }
+    return c;
+}
 #endif
 
 // ---------------------------------------------------------------- the NextN block's caches over a prompt
@@ -2657,6 +2880,112 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
     const dim3 grid((unsigned) T, (unsigned) (n_head / 16));
     mla_attn_wmma2_kernel<<<grid, 256, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
     check("mla_attn_wmma2");
+}
+
+bool mla_fdot2_supported() { return mla_fdot2_arch() == 2; }
+
+void mla_attn_fdot2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
+                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
+    if (T <= 0) return;
+    if (kv_lora != 512 || n_head % MB_HG != 0) {
+        std::fprintf(stderr, "glm_batch mla_attn_fdot2: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
+        g_errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    static std::atomic<signed char> logged[64]{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
+        signed char expected = 0;
+        if (logged[dev].compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+            std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: RDNA 2 v_dot2_f32_f16 (mla_attn_fdot2; "
+                                 "MAYA_GLM_MLA_FDOT2=0 for F32)\n", dev);
+        }
+    }
+    const dim3 grid((unsigned) T, (unsigned) (n_head / MB_HG));
+    mla_attn_fdot2_kernel<<<grid, 256, kFdot2Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+    check("mla_attn_fdot2");
+}
+
+// MAYA_GLM_PROMPT_F16 (mirrors ds4_model.cu's prompt_f16 and ds4_kernels.cu's widen_rows_f16):
+// FP16-output rocBLAS GEMMs on gfx103x widened in place from the end of each row in blocks of 256 values.
+__device__ unsigned long long g_glmb_widen_bad = 0;
+__global__ void __launch_bounds__(256) widen_rows_f16_kernel(float* y0, int n, size_t ldy, int count_bad) {
+    float* y = y0 + (size_t) blockIdx.x * ldy;
+    const uint16_t* h = (const uint16_t*) y;
+    const int nb = (n + 255) / 256;
+    for (int b = nb - 1; b >= 0; --b) {
+        const int c = b * 256 + (int) threadIdx.x;
+        const float v = c < n ? __half2float(__ushort_as_half(h[c])) : 0.0f;
+        if (count_bad && c < n && !isfinite(v)) atomicAdd(&g_glmb_widen_bad, 1ull);
+        __syncthreads();
+        if (c < n) y[c] = v;
+        __syncthreads();
+    }
+}
+__global__ void __launch_bounds__(256) check_f16_finite_kernel(const uint16_t* __restrict__ h, int64_t n) {
+    unsigned long long bad = 0;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        if (!isfinite(__half2float(__ushort_as_half(h[i])))) ++bad;
+    }
+    if (bad) atomicAdd(&g_glmb_widen_bad, bad);
+}
+
+bool prompt_f16_enabled() {
+    // Unset/empty: default ON on gfx103x HIP devices; explicit =0 disables; explicit nonzero forces ON on HIP.
+    static const int env_mode = [] {
+        const char* v = std::getenv("MAYA_GLM_PROMPT_F16");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    if (env_mode == 0) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return env_mode == 1;
+    static std::atomic<signed char> known[64]{};   // 0: not asked yet, 1: no, 2: yes
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp prop{};
+        const bool got_prop = cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+        const bool is_gfx103 = got_prop && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0;
+        const bool on = env_mode == 1 || is_gfx103;
+        v = on ? 2 : 1;
+        signed char expected = 0;
+        if (known[dev].compare_exchange_strong(expected, (signed char) v, std::memory_order_relaxed) && on) {
+            std::fprintf(stderr, "glm prefill: CUDA%d (%s): FP16-out prompt GEMMs on (%s; not bit-identical, "
+                                 "MAYA_GLM_PROMPT_F16=0 to disable)\n",
+                         dev, got_prop ? prop.gcnArchName : "unknown",
+                         env_mode == 1 ? "MAYA_GLM_PROMPT_F16=1" : "RDNA 2 default");
+        }
+    }
+    return v == 2;
+}
+
+int prompt_f16_check() {
+    static const int on = [] {
+        const char* v = std::getenv("MAYA_GLM_PROMPT_F16_CHECK");
+        return v != nullptr && std::atoi(v) != 0 ? 1 : 0;
+    }();
+    return on;
+}
+
+void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad) {
+    if (rows <= 0 || n <= 0) return;
+    widen_rows_f16_kernel<<<(unsigned) rows, 256, 0, s>>>(y, n, ldy, count_bad);
+    check("widen_rows_f16");
+}
+
+void check_f16_finite(const uint16_t* h, int64_t n, cudaStream_t s) {
+    if (n <= 0) return;
+    const unsigned blocks = (unsigned) std::min<int64_t>(1024, (n + 255) / 256);
+    check_f16_finite_kernel<<<blocks, 256, 0, s>>>(h, n);
+    check("check_f16_finite");
+}
+
+unsigned long long widen_bad_take() {
+    unsigned long long bad = 0;
+    const unsigned long long zero = 0;
+    if (hipMemcpyFromSymbol(&bad, HIP_SYMBOL(g_glmb_widen_bad), sizeof bad) != hipSuccess) return 0;
+    if (bad != 0) (void) hipMemcpyToSymbol(HIP_SYMBOL(g_glmb_widen_bad), &zero, sizeof zero);
+    return bad;
 }
 #endif
 

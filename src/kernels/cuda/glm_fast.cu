@@ -74,10 +74,12 @@ __device__ __forceinline__ float warp_max_shfl(float v) {
     return v;
 }
 // warp_sum / warp_max's butterfly - partner lane ^ 16, 8, 4, 2, 1, each step v op v[lane ^ o] - with the partner read
-// across the VALU's lanes on RDNA3 (v_permlanex16 with the identity selects for ^16: a row's lane i reads lane i of the
-// other row; DPP row_xmask for 8, 4, 2, 1) instead of through LDS (__shfl_xor_sync is a ds_bpermute on AMD): the same
-// operations on the same values in the same order, so the same bits (glm_attn_bench checks it); elsewhere the shuffles
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
+// across the VALU's lanes on RDNA2/3/4 (v_permlanex16 with the identity selects for ^16: a row's lane i reads lane i of
+// the other row; DPP row_xmask for 8, 4, 2, 1 - gfx103x and newer, NOT RDNA1) instead of through LDS (__shfl_xor_sync
+// is a ds_bpermute on AMD): the same operations on the same values in the same order, so the same bits (glm_attn_bench
+// checks it); elsewhere the shuffles
+#if defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || \
+                                defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
 template<int Mask> __device__ __forceinline__ float lane_swizzle(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), Mask));
 }
@@ -125,14 +127,14 @@ __device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum_shfl(
 __device__ __forceinline__ float warp_max_lanes(float v) { return warp_max_shfl(v); }
 #endif
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx906__))
     return warp_sum_lanes(v);
 #else
     return warp_sum_shfl(v);
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx906__))
     return warp_max_lanes(v);
 #else
     return warp_max_shfl(v);
@@ -188,6 +190,17 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t s = v ^ p << 7;
     return s * 0x01010101;
 }
+#if defined(STRATA_USE_HIP)
+// Fast bit-parallel sign expansion for HIP (gfx906/gfx103x/gfx11/gfx12) where __vcmpne4/__vsub4 are software-emulated.
+// Every IQ2/IQ3 grid byte is nonzero and <= 62, so two's-complement negation uses a whole-word add without carries.
+__device__ __forceinline__ uint4 hip_fast_signs(unsigned b, bool parity) {
+    b &= parity ? 127u : 255u;
+    if (parity) b |= (__popc(b) & 1u) << 7;
+    const unsigned lo = (((b & 15u) * 0x10204080u) & 0x80808080u) >> 7;
+    const unsigned hi = ((((b >> 4) & 15u) * 0x10204080u) & 0x80808080u) >> 7;
+    return make_uint4(lo * 255u, lo, hi * 255u, hi);
+}
+#endif
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
     const uint32_t* table32 = (const uint32_t*) table;
     uint32_t tmp[2];
@@ -297,8 +310,21 @@ __device__ __forceinline__ float dot_q5_K(const void* vbq, const block_q8_1* bq8
 //   dp4a * scale: |dp4a| <= 4 * 32 * 128 and |scale| <= 128 fit 16 bits - one mul.wide.s16 for the 32-bit multiply;
 //   the product to float: |p| <= 2^21 < 2^22, so 0x4B400000 + p is the float 1.5 * 2^23 + p exactly and subtracting
 //     1.5 * 2^23 is exact - an add and an FADD for the conversion (the same float as (float) p).
+#if GLMF_SM60 || defined(STRATA_USE_HIP)
+// q - 32 per byte for four 6-bit bytes q in [0, 63]: (q + 0x60) ^ 0x80 never carries out of any byte
+// (0x00..0x3f + 0x60 = 0x60..0x9f < 0x100) and matches __vsubss4(q, 0x20202020) bit for bit in 2 ops.
+__device__ __forceinline__ int q6_m32(int q) {
+    return static_cast<int>((static_cast<uint32_t>(q) + 0x60606060u) ^ 0x80808080u);
+}
+#endif
+#if defined(STRATA_USE_HIP)
+// vil - vih per byte for Q3_K (vil bytes in [0, 3], vih bytes in {0, 4}): vih * 0x3f = 0x00 or 0xfc per byte with
+// zero cross-byte carries, so vil | (vih * 0x3f) matches __vsubss4(vil, vih) bit for bit in 2 ops.
+__device__ __forceinline__ int q3_sub4(int vil, int vih) {
+    return static_cast<int>(static_cast<uint32_t>(vil) | (static_cast<uint32_t>(vih) * 0x3fu));
+}
+#endif
 #if GLMF_SM60
-__device__ __forceinline__ int q6_m32(int q) { return (q + 0x60606060) ^ (int) 0x80808080; }
 __device__ __forceinline__ int mul_s16(int a, int b) {
     int r;
     asm("mul.wide.s16 %0, %1, %2;" : "=r"(r) : "h"((short) a), "h"((short) b));
@@ -325,6 +351,9 @@ __device__ __forceinline__ float dot_q6_K(const void* vbq, const block_q8_1* bq8
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
 #if GLMF_SM60
         sumf += d8 * i2f_s22(mul_s16(__dp4a(q6_m32(vil | vih), u, 0), sc));
+#elif defined(STRATA_USE_HIP)
+        const int vi = q6_m32(vil | vih);
+        sumf += d8 * (__dp4a(vi, u, 0) * sc);
 #else
         const int vi = __vsubss4(vil | vih, 0x20202020);
         sumf += d8 * (__dp4a(vi, u, 0) * sc);
@@ -454,8 +483,8 @@ template<> struct DecW<14> {
             sc[i] = scales[4 * i];
             const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
             const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
-#if GLMF_SM60
-            vi[i] = q6_m32(vil | vih);   // (dot_q6_K's sm_60 rewrites)
+#if GLMF_SM60 || defined(STRATA_USE_HIP)
+            vi[i] = q6_m32(vil | vih);   // (dot_q6_K's exact 2-op rewrite)
 #else
             vi[i] = __vsubss4(vil | vih, 0x20202020);
 #endif
@@ -529,7 +558,11 @@ __device__ __forceinline__ float dot_q3_K(const void* vbq, const block_q8_1* bq8
         const int sc = (sc_low | sc_high) - 32;
         const int vil = (vl >> (2 * i)) & 0x03030303;
         const int vih = ((vh >> i) << 2) & 0x04040404;
+#if defined(STRATA_USE_HIP)
+        sumf += d8 * (__dp4a(q3_sub4(vil, vih), u, 0) * sc);
+#else
         sumf += d8 * (__dp4a((int) __vsubss4(vil, vih), u, 0) * sc);
+#endif
     }
     return d * sumf;
 }
@@ -542,6 +575,15 @@ __device__ __forceinline__ float dot_iq2_xxs(const void* vbq, const block_q8_1* 
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
+        const int grid0 = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
+        sumi = __dp4a(grid0, u0, sumi);
+        const int grid1 = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
+        sumi = __dp4a(grid1, u1, sumi);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -551,6 +593,7 @@ __device__ __forceinline__ float dot_iq2_xxs(const void* vbq, const block_q8_1* 
         const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi = __dp4a(grid1, u1, sumi);
+#endif
     }
     const int ls = aux32 >> 27 | 1;
     sumi = sumi * ls / 8;
@@ -566,6 +609,13 @@ __device__ __forceinline__ float dot_iq3_xxs(const void* vbq, const block_q8_1* 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -573,6 +623,7 @@ __device__ __forceinline__ float dot_iq3_xxs(const void* vbq, const block_q8_1* 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+#endif
         sumi = __dp4a(grid_l, u0, sumi);
         sumi = __dp4a(grid_h, u1, sumi);
     }
@@ -717,6 +768,15 @@ __device__ __forceinline__ float dot_iq2_xxs_t(const void* vbq, const block_q8_1
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
+        const int grid0 = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
+        sumi = __dp4a(grid0, u0, sumi);
+        const int grid1 = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
+        sumi = __dp4a(grid1, u1, sumi);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -726,6 +786,7 @@ __device__ __forceinline__ float dot_iq2_xxs_t(const void* vbq, const block_q8_1
         const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi = __dp4a(grid1, u1, sumi);
+#endif
     }
     const int ls = aux32 >> 27 | 1;
     sumi = sumi * ls / 8;
@@ -742,6 +803,13 @@ __device__ __forceinline__ float dot_iq3_xxs_t(const void* vbq, const block_q8_1
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -749,6 +817,7 @@ __device__ __forceinline__ float dot_iq3_xxs_t(const void* vbq, const block_q8_1
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+#endif
         sumi = __dp4a(grid_l, u0, sumi);
         sumi = __dp4a(grid_h, u1, sumi);
     }
@@ -815,17 +884,6 @@ template<> __device__ __forceinline__ float dw<19>(const uint8_t* row, int kbx, 
     const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
     return d1q * (x.d * sumi + x.s * delta);
 }
-#if defined(STRATA_USE_HIP)
-// Fast bit-parallel sign expansion for HIP (gfx906/gfx11/gfx12) where __vcmpne4/__vsub4 are software-emulated.
-// Every IQ2/IQ3 grid byte is nonzero and <= 62, so two's-complement negation uses a whole-word add without carries.
-__device__ __forceinline__ uint4 hip_fast_signs(unsigned b, bool parity) {
-    b &= parity ? 127u : 255u;
-    if (parity) b |= (__popc(b) & 1u) << 7;
-    const unsigned lo = (((b & 15u) * 0x10204080u) & 0x80808080u) >> 7;
-    const unsigned hi = ((((b >> 4) & 15u) * 0x10204080u) & 0x80808080u) >> 7;
-    return make_uint4(lo * 255u, lo, hi * 255u, hi);
-}
-#endif
 template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) row + kbx;
     const int q2 = get_int_b2(bq2->qs, iqs);
@@ -1147,12 +1205,12 @@ __device__ __forceinline__ uint2 quant_load8(const void* p) {
     __builtin_memcpy(&words, p, sizeof(words)); // GGUF super-blocks are only 2-byte aligned.
     return words;
 }
-template<int T> constexpr int sign_count = T == 22 ? 256 : 128;
+template<int T> constexpr int sign_count = (T == 21 || T == 22) ? 256 : 128;
 template<int T>
 __device__ __forceinline__ void load_signs(uint4* signs) {
     for (int i = threadIdx.x; i < sign_count<T>; i += blockDim.x) {
         unsigned b = i;
-        if constexpr (T != 22) b |= (__popc(b) & 1) << 7;
+        if constexpr (T != 21 && T != 22) b |= (__popc(b) & 1) << 7;
         unsigned lo = 0, hi = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -1161,6 +1219,12 @@ __device__ __forceinline__ void load_signs(uint4* signs) {
         }
         signs[i] = make_uint4(lo, lo & 0x01010101u, hi, hi & 0x01010101u);
     }
+}
+template<int T> __device__ __forceinline__ const uint32_t* global_tab() {
+    return T == 16 ? (const uint32_t*) iq2xxs_grid :
+           T == 17 ? (const uint32_t*) iq2xs_grid :
+           T == 18 ? (const uint32_t*) iq3xxs_grid :
+           T == 21 ? (const uint32_t*) iq3s_grid : (const uint32_t*) iq2s_grid;
 }
 template<int T>
 __device__ __forceinline__ float dw_rdna(const uint8_t* row, int kbx, int iqs, const XV& x,
@@ -1237,8 +1301,27 @@ template<> __device__ __forceinline__ float dw_rdna<17>(const uint8_t* row, int 
     return dw<17>(row, kbx, iqs, x, tab);
 }
 template<> __device__ __forceinline__ float dw_rdna<21>(const uint8_t* row, int kbx, int iqs,
-    const XV& x, const uint32_t* tab, const uint4*, bool, bool) {
-    return dw<21>(row, kbx, iqs, x, tab);
+    const XV& x, const uint32_t* tab, const uint4* sign_tab, bool direct, bool wide) {
+    (void) wide;
+    const block_iq3_s* bq3 = (const block_iq3_s*) row + kbx;
+    const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq3->qh[iqs / 2];
+    const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                                        tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+        const uint4 signs = direct ? direct_signs(signs_packed_8[l0 / 2], false) : sign_tab[signs_packed_8[l0 / 2]];
+        const int grid_l = (int) ((grid_pos.x ^ signs.x) + signs.y);
+        const int grid_h = (int) ((grid_pos.y ^ signs.z) + signs.w);
+        sumi = __dp4a(grid_l, x.u[l0 + 0], sumi);
+        sumi = __dp4a(grid_h, x.u[l0 + 1], sumi);
+    }
+    sumi *= 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    return __half2float(bq3->d) * x.d * sumi;
 }
 template<int T, int NR>
 __device__ __forceinline__ void rows_dot_rdna(const uint8_t* const* rows, const block_q8_1* x,
@@ -1315,7 +1398,11 @@ template<> __device__ __forceinline__ float dwk<11>(const uint8_t* row, int kbx,
         const int sc_high = ((b->scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
         const int vil = (vl >> (2 * i)) & 0x03030303;
         const int vih = ((vh >> i) << 2) & 0x04040404;
+#if defined(STRATA_USE_HIP)
+        sumf += x.d8[i] * (__dp4a(q3_sub4(vil, vih), x.u[i], 0) * ((sc_low | sc_high) - 32));
+#else
         sumf += x.d8[i] * (__dp4a((int) __vsubss4(vil, vih), x.u[i], 0) * ((sc_low | sc_high) - 32));
+#endif
     }
     return __half2float(b->d) * sumf;
 }
@@ -2218,22 +2305,44 @@ __device__ __forceinline__ Q6X q6_xload(const block_q8_1* x, int lane) {   // x:
     r.d1 = __low2float(b[2].ds);
     return r;
 }
-// sum (q_i - 32) u_i for four 6-bit q: __dp4a(__vsubss4(q, 0x20202020), u, 0) without the SWAR subtract
-__device__ __forceinline__ int q6_idot(int q, int u) {
+// sum (q_i - 32) u_i for four 6-bit q: __dp4a(__vsubss4(q, 0x20202020), u, 0) without the SWAR subtract.
+// Every q byte is in [0, 63] (sign bit 0), so signed sdot4 on RDNA2 (gfx103x) treats q identically to unsigned:
+//   q6_u_bias(u) = sum (-32) * u_i  in [-16256, +16384] (depends only on u; hoists across R rows in q6_rows_rdna)
+//   q6_idot(q, u, bias) = sum q_i * u_i + bias  in [-16384, +16384] (exact int32, zero overflow, clamp = false)
+__device__ __forceinline__ int q6_u_bias(int u) {
 #if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1101__) || \
     defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
-    return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u, __builtin_amdgcn_sudot4(false, q, true, u, 0, false),
-                                   false);
+    return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u, 0, false);
+#elif __has_builtin(__builtin_amdgcn_sdot4) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    return __builtin_amdgcn_sdot4((int) 0xe0e0e0e0u, u, 0, false);
 #else
-    return __dp4a(__vsubss4(q, 0x20202020), u, 0);
+    (void) u;
+    return 0;
 #endif
 }
+__device__ __forceinline__ int q6_idot(int q, int u, int bias) {
+#if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
+    return __builtin_amdgcn_sudot4(false, q, true, u, bias, false);
+#elif __has_builtin(__builtin_amdgcn_sdot4) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    return __builtin_amdgcn_sdot4(q, u, bias, false);
+#else
+    (void) bias;
+    return __dp4a(q6_m32(q), u, 0);
+#endif
+}
+__device__ __forceinline__ int q6_idot(int q, int u) {
+    return q6_idot(q, u, q6_u_bias(u));
+}
 // dot_q6_K's float arithmetic, term for term (the same products, sums and order)
-__device__ __forceinline__ float q6_val(const Q6W& w, const Q6X& x) {
+__device__ __forceinline__ float q6_val(const Q6W& w, const Q6X& x, int b0, int b1) {
     float sumf = 0.0f;
-    sumf += x.d0 * (q6_idot((w.vl & 0x0f0f0f0f) | ((w.vh << 4) & 0x30303030), x.u0) * w.sc0);
-    sumf += x.d1 * (q6_idot(((w.vl >> 4) & 0x0f0f0f0f) | (w.vh & 0x30303030), x.u1) * w.sc1);
+    sumf += x.d0 * (q6_idot((w.vl & 0x0f0f0f0f) | ((w.vh << 4) & 0x30303030), x.u0, b0) * w.sc0);
+    sumf += x.d1 * (q6_idot(((w.vl >> 4) & 0x0f0f0f0f) | (w.vh & 0x30303030), x.u1, b1) * w.sc1);
     return w.d * sumf;
+}
+__device__ __forceinline__ float q6_val(const Q6W& w, const Q6X& x) {
+    return q6_val(w, x, q6_u_bias(x.u0), q6_u_bias(x.u1));
 }
 // R weight rows (rb bytes apart) x NT activations (xs q8_1 blocks apart), nb super-blocks, U of them per step
 template<int R, int NT, int U>
@@ -2258,16 +2367,24 @@ __device__ __forceinline__ void q6_rows_rdna(const uint8_t* w0, size_t rb, const
 #pragma unroll
         for (int k = 0; k < U; ++k)
 #pragma unroll
-            for (int r = 0; r < R; ++r)
+            for (int t = 0; t < NT; ++t) {
+                const int b0 = q6_u_bias(xv[k][t].u0);
+                const int b1 = q6_u_bias(xv[k][t].u1);
 #pragma unroll
-                for (int t = 0; t < NT; ++t) acc[r][t] += q6_val(w[k][r], xv[k][t]);
+                for (int r = 0; r < R; ++r) acc[r][t] += q6_val(w[k][r], xv[k][t], b0, b1);
+            }
     }
     for (; b < nb; ++b) {
+        Q6W w[R];
 #pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const Q6W w = q6_wload((const block_q6_K*) (w0 + (size_t) r * rb) + b, lane);
+        for (int r = 0; r < R; ++r) w[r] = q6_wload((const block_q6_K*) (w0 + (size_t) r * rb) + b, lane);
 #pragma unroll
-            for (int t = 0; t < NT; ++t) acc[r][t] += q6_val(w, q6_xload(x + (size_t) t * xs + (size_t) b * 8, lane));
+        for (int t = 0; t < NT; ++t) {
+            const Q6X xv = q6_xload(x + (size_t) t * xs + (size_t) b * 8, lane);
+            const int b0 = q6_u_bias(xv.u0);
+            const int b1 = q6_u_bias(xv.u1);
+#pragma unroll
+            for (int r = 0; r < R; ++r) acc[r][t] += q6_val(w[r], xv, b0, b1);
         }
     }
 #pragma unroll
@@ -4555,6 +4672,9 @@ __global__ void moe_wait_kernel(MoeDev d, int n_embd) {
         const long long t0 = clock64();
         while (r->seq != s_need) {
             if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 1u, s_need, r->seq); break; }
+#if defined(STRATA_USE_HIP)
+            __nanosleep(128);
+#endif
         }
         __threadfence_system();
     }
@@ -4584,6 +4704,9 @@ __global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out) {
         const long long t0 = clock64();   // bounded like moe_wait (~60 s)
         while (r->seq != s_need) {
             if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 2u, s_need, r->seq); break; }
+#if defined(STRATA_USE_HIP)
+            __nanosleep(128);
+#endif
         }
         __threadfence_system();
     }
@@ -4606,6 +4729,9 @@ __global__ void moe_cpu_wait_streams_kernel(MoeDev d, int n_embd, const float* p
         const long long t0 = clock64();
         while (r->seq != s_need) {
             if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 3u, s_need, r->seq); break; }
+#if defined(STRATA_USE_HIP)
+            __nanosleep(128);
+#endif
         }
         __threadfence_system();
     }
@@ -4662,7 +4788,7 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
             const long long t0 = clock64();
             while (((r->ready[i] >> bit) & 1u) == 0u) {
                 if (clock64() - t0 > (1ll << 36)) break;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(STRATA_USE_HIP) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700)
                 __nanosleep(128);   // (fewer polls over PCIe beside the copies)
 #endif
             }
@@ -4727,6 +4853,9 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
                         wait_gave_up(d.wait_diag, 5u, s_need, ((volatile const MoeResponse*) r)->seq);
                         break;
                     }
+#if defined(STRATA_USE_HIP)
+                    __nanosleep(128);
+#endif
                 }
                 __threadfence_system();
             }
@@ -4749,6 +4878,9 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
             const long long t0 = clock64();
             while (*(volatile unsigned int*) d.wait_seq == s_need) {
                 if (clock64() - t0 > (1ll << 36)) { wait_gave_up(d.wait_diag, 5u, s_need, 0u); break; }
+#if defined(STRATA_USE_HIP)
+                __nanosleep(128);
+#endif
             }
             __threadfence();
         }
@@ -4786,6 +4918,9 @@ __global__ void moe_cpu_wait_rows_kernel(CpuWaitRows w, int n_embd) {
         const long long t0 = clock64();   // bounded like moe_wait (~60 s)
         while (a->seq != s_need) {
             if (clock64() - t0 > (1ll << 36)) break;
+#if defined(STRATA_USE_HIP)
+            __nanosleep(128);
+#endif
         }
         __threadfence_system();
     }
@@ -4850,7 +4985,11 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     const unsigned long long ptr = d.plan_ptr[ei];
     if (ptr == 0ull) return;
     __shared__ float sg[GU_ROWS], su[GU_ROWS];
+#if defined(STRATA_USE_HIP)
+    __shared__ uint32_t s_tab[!GLOBAL && TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+#else
     __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+#endif
     const block_q8_1* xg = xq;
 #if GLMF_SM60
     __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TG> ? sm60_sign_n<TG> * sm60_sign_w<TG> : 1];
@@ -4889,8 +5028,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     float s[2 * RPW];
     const uint32_t* tab = s_tab;
 #if defined(STRATA_USE_HIP)
-    if constexpr (GLOBAL) tab = TG == 16 ? (const uint32_t*) iq2xxs_grid :
-                                TG == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
+    if constexpr (GLOBAL) tab = global_tab<TG>();
     if constexpr (LUT) {
         rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
     } else
@@ -4950,7 +5088,11 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     __shared__ unsigned long long s_ptr[8];
     __shared__ float s_w[8];
     __shared__ float s_part[8][NR];
+#if defined(STRATA_USE_HIP)
+    __shared__ uint32_t s_tab[!GLOBAL && TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
+#else
     __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
+#endif
 #if GLMF_SM60
     __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TD> ? sm60_sign_n<TD> * sm60_sign_w<TD> : 1];
     if constexpr (sm60_sign_on<TD>) sm60_load_signs<TD>(s_sg);
@@ -4977,8 +5119,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
             for (int j = 0; j < NR; ++j) rows[j] = (const uint8_t*) s_ptr[warp] + down_off + (size_t) (r0 + j) * drb;
             const uint32_t* tab = s_tab;
 #if defined(STRATA_USE_HIP)
-            if constexpr (GLOBAL) tab = TD == 16 ? (const uint32_t*) iq2xxs_grid :
-                                        TD == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
+            if constexpr (GLOBAL) tab = global_tab<TD>();
             if constexpr (LUT) {
                 rows_dot_rdna<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s_sign, s, DIRECT, WIDE);
             } else
@@ -5052,6 +5193,24 @@ __device__ __forceinline__ void dec_hip(const uint8_t* row, int kbx, int iqs, co
         o.l0 = aux32 >> 28;
         o.l1 = 0;
         o.d = __half2float(bq3->d);
+    } else if constexpr (T == 21) {   // IQ3_S
+        const block_iq3_s* bq3 = (const block_iq3_s*) row + kbx;
+        const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const int qh = bq3->qh[iqs / 2];
+        const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                                            tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            const uint4 signs = direct_signs(signs_packed_8[l0 / 2], false);
+            o.g[l0] = (int) ((grid_pos.x ^ signs.x) + signs.y);
+            o.g[l0 + 1] = (int) ((grid_pos.y ^ signs.z) + signs.w);
+        }
+        o.l0 = 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+        o.l1 = 0;
+        o.d = __half2float(bq3->d);
     } else {   // 22: IQ2_S
         const block_iq2_s* bq2 = (const block_iq2_s*) row + kbx;
         const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
@@ -5086,6 +5245,7 @@ __device__ __forceinline__ float dot_hip(const DecH& o, const XV& x) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) sumi = __dp4a(o.g[i], x.u[i], sumi);
         if constexpr (T == 18) sumi = (o.l0 * sumi + sumi / 2) / 2;
+        else if constexpr (T == 21) sumi *= o.l0;
         else sumi = sumi * o.l0 / 8;
         return o.d * x.d * sumi;
     }
@@ -5125,10 +5285,7 @@ __device__ __forceinline__ void rows_dot_users(const uint8_t* const* rows, const
     else if (nu == 3) rows_dot_users_n<T, NR, 3>(rows, xs, n_in, lane, tab, s);
     else rows_dot_users_n<T, NR, 4>(rows, xs, n_in, lane, tab, s);
 }
-template<int T> constexpr bool win_dedup_type = T == 16 || T == 18 || T == 22;
-template<int T> __device__ __forceinline__ const uint32_t* global_tab() {
-    return T == 16 ? (const uint32_t*) iq2xxs_grid : T == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
-}
+template<int T> constexpr bool win_dedup_type = T == 16 || T == 18 || T == 21 || T == 22;
 
 // gate/up: moe_experts_multi's grid (x = (expert slot, token) with the token fastest, y = the chunk of GU_ROWS rows).
 // The block of the FIRST token that routed an expert computes the chunk for every token of the window that routed
@@ -5233,7 +5390,7 @@ moe_down_win_kernel(MoeDev d, int k, int n_embd, int n_ff, size_t down_off, cons
     __shared__ float s_w[32];
     __shared__ float s_part[32][NR];
     __shared__ int s_nu[32], s_us[32][WD_MU];
-    __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
+    __shared__ uint32_t s_tab[!GLOBAL && TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
     if constexpr (!GLOBAL) load_tab<TD>(s_tab);
     if ((int) threadIdx.x < nw) {
         const int t = (int) threadIdx.x / k, i = (int) threadIdx.x % k;
@@ -5343,11 +5500,17 @@ __device__ __forceinline__ void dwm(const uint8_t* row, int kbx, int iqs, const 
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
+#if defined(STRATA_USE_HIP)
+            const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
+            g[l0] = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+            g[l0 + 1] = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             g[l0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
             g[l0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         const int ls = aux32 >> 28;
         const float d = __half2float(bq3->d);
@@ -5368,11 +5531,17 @@ __device__ __forceinline__ void dwm(const uint8_t* row, int kbx, int iqs, const 
 #pragma unroll
         for (int k0 = 0; k0 < 8; k0 += 2) {
             const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
+#if defined(STRATA_USE_HIP)
+            const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
+            g[k0] = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+            g[k0 + 1] = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             g[k0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
             g[k0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         const int ls = aux32 >> 27 | 1;
         const float d = __half2float(bq2->d);
@@ -5417,11 +5586,17 @@ __device__ __forceinline__ void dec_sub(const uint8_t* row, int kbx, int iqs, co
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
+#if defined(STRATA_USE_HIP)
+            const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
+            o.g[l0] = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+            o.g[l0 + 1] = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             o.g[l0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
             o.g[l0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         o.ls = aux32 >> 28;
         o.a = __half2float(bq3->d);
@@ -5433,11 +5608,17 @@ __device__ __forceinline__ void dec_sub(const uint8_t* row, int kbx, int iqs, co
 #pragma unroll
         for (int k0 = 0; k0 < 8; k0 += 2) {
             const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
+#if defined(STRATA_USE_HIP)
+            const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
+            o.g[k0] = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+            o.g[k0 + 1] = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             o.g[k0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
             o.g[k0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         o.ls = aux32 >> 27 | 1;
         o.a = __half2float(bq2->d);
@@ -5850,7 +6031,7 @@ void note_mv(int device, bool on) {
     std::fprintf(stderr, "glm mv: CUDA%d dense GEMVs on the %s\n", device, on ? "RDNA3 kernel" : "original kernels");
 }
 bool mv_rdna_device() {
-    static const int mode = [] {   // -1: default (gfx115x + gfx120x), 0: off, 1: every gfx11/gfx12
+    static const int mode = [] {   // -1: default (gfx103x + gfx115x + gfx120x), 0: off, 1: every gfx103x/gfx11/gfx12
         const char* v = std::getenv("MAYA_GLM_MV_RDNA");
         return v == nullptr ? -1 : v[0] == '0' ? 0 : 1;
     }();
@@ -5862,7 +6043,8 @@ bool mv_rdna_device() {
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
-        on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0 ||
+        on = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ||
+             std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0 ||
              std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
         cached_device = device;
         note_mv(device, on);
@@ -7131,7 +7313,7 @@ __global__ void moe_pf_wait_kernel(const unsigned int* need, const unsigned int*
     if (n == 0u) return;
     for (long long i = 0; i < (1ll << 27); ++i) {
         if ((int) (*(volatile const unsigned int*) flag - n) >= 0) return;
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
+#if defined(STRATA_USE_HIP) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700)   // (Pascal: no __nanosleep, a plain spin)
         __nanosleep(200);
 #endif
     }
@@ -7179,9 +7361,22 @@ void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) 
 
 #if defined(STRATA_USE_HIP)
 namespace {
-// Limit automatic dispatch to the measured decode geometry and RDNA3/3.5
+// Limit automatic dispatch to the measured decode geometry and RDNA2/3/3.5/4
 // targets (plus opt-in gfx906 when allow_gfx906 is set via MAYA_GLM_GU22_TUNED=1).
-// RDNA4 and all other shapes retain the original expert kernels.
+// All other shapes and architectures retain the original expert kernels; MAYA_HIP_EXPERTS_LEGACY=1 forces legacy.
+bool is_gfx103x_device() {
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    static thread_local int cached_device = -1;
+    static thread_local bool gfx103x = false;
+    if (cached_device != device) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
+        gfx103x = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0;
+        cached_device = device;
+    }
+    return gfx103x;
+}
 bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     static const bool legacy = [] {
         const char* v = std::getenv("MAYA_HIP_EXPERTS_LEGACY");
@@ -7191,6 +7386,7 @@ bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     int device = 0;
     if (hipGetDevice(&device) != hipSuccess) return false;
     static thread_local int cached_device = -1;
+    static thread_local bool gfx103x = false;
     static thread_local bool gfx1100 = false;
     static thread_local bool gfx1151 = false;
     static thread_local bool gfx120x = false;
@@ -7198,23 +7394,26 @@ bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
+        gfx103x = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0;
         gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
         gfx1151 = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
         gfx120x = std::strncmp(prop.gcnArchName, "gfx120", 6) == 0;
         gfx906 = std::strncmp(prop.gcnArchName, "gfx906", 6) == 0;
         cached_device = device;
     }
-    return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151) || (allow_gfx906 && gfx906);
+    return gfx103x || gfx1100 || gfx120x || (allow_gfx1151 && gfx1151) || (allow_gfx906 && gfx906);
 }
-// IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (MAYA_GLM_GU22_TUNED=1) until it is measured end
-// to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel on gfx1100 and
-// gfx1151 and 1.34-1.43x (gfx1100, device memory) / 1.12x (gfx1151, pinned host memory) faster at 4-8 experts a call
+// IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above: on by default on gfx103x (MAYA_GLM_GU22_TUNED=0 or
+// MAYA_HIP_EXPERTS_LEGACY=1 reverts to original); opt-in (MAYA_GLM_GU22_TUNED=1) on gfx1100/gfx1151/gfx906 until
+// measured end to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel
+// on gfx1100 and gfx1151 and 1.34-1.43x (gfx1100, device memory) / 1.12x (gfx1151, pinned host memory) faster at 4-8 experts a call
 bool gu22_tuned() {
-    static const bool on = [] {
+    static const int mode = [] {   // -1: default (on for gfx103x, off elsewhere), 0: off, 1: on
         const char* v = std::getenv("MAYA_GLM_GU22_TUNED");
-        return v && v[0] == '1';
+        return v == nullptr ? -1 : (v[0] == '1' ? 1 : 0);
     }();
-    return on;
+    if (mode >= 0) return mode == 1;
+    return is_gfx103x_device();
 }
 // Which kernel IQ2_S gate/up ran, once per device and call path (0 the token path, 1 the window's multi-token launch):
 // the engine's own record that MAYA_GLM_GU22_TUNED reached the dispatch - or did not
@@ -7389,12 +7588,13 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
-    if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
+    // IQ3_XXS / IQ3_S down keep original dispatch on gfx1151 (IQ3_XXS regressed there).
+    if ((d_type == 22 || d_type == 18 || d_type == 21) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         // Two rows lower the register budget; IQ2_S prefers global grid reads,
-        // while the smaller IQ3_XXS grid is faster in LDS on gfx1100.
+        // while the smaller IQ3_XXS (1 KiB) and IQ3_S (2 KiB) grids stay in LDS.
         if (d_type == 22) launch_expert_down<22, 2, true, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
-        else launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
+        else if (d_type == 18) launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
+        else launch_expert_down<21, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
         launch_check("moe_down RDNA3");
         return;
     }
@@ -7428,7 +7628,7 @@ void keep_busy(unsigned n, unsigned* sink, cudaStream_t s) {
 
 bool win_dedup_shape(int gu_type, int d_type, int T, int k) {
 #if defined(STRATA_USE_HIP)
-    const auto ok = [](int t) { return t == 16 || t == 18 || t == 22; };
+    const auto ok = [](int t) { return t == 16 || t == 18 || t == 21 || t == 22; };
     return ok(gu_type) && ok(d_type) && T >= 2 && T <= WD_MU && k >= 1 && k <= 8 && T * k <= 32;
 #else
     (void) gu_type, (void) d_type, (void) T, (void) k;
@@ -7456,25 +7656,28 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
         // shared experts unpacked once (moe_gate_up_win_kernel / moe_down_win_kernel): the same bits per token
         switch (gu_type) {
 #define GLMF_GUW(TT)             case TT: moe_gate_up_win_kernel<TT><<<ggu, GU_WARPS * 32, 0, s>>>(                 d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out); break;
-            GLMF_GUW(16) GLMF_GUW(18) GLMF_GUW(22)
+            GLMF_GUW(16) GLMF_GUW(18) GLMF_GUW(21) GLMF_GUW(22)
 #undef GLMF_GUW
             default: return false;
         }
         const auto* HW = (const block_q8_1*) hq;
         const unsigned wthreads = (unsigned) (T * k * 32);
-        if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
+        if ((d_type == 22 || d_type == 18 || d_type == 21) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
             // (the token path's shapes there: two rows a block, IQ2_S's grid read from global memory)
             if (d_type == 22)
                 moe_down_win_kernel<22, 2, true><<<(unsigned) (n_embd / 2), wthreads, 0, s>>>(
                     d, k, n_embd, n_ff, down_off, HW, sh_out, out);
-            else
+            else if (d_type == 18)
                 moe_down_win_kernel<18, 2, false><<<(unsigned) (n_embd / 2), wthreads, 0, s>>>(
+                    d, k, n_embd, n_ff, down_off, HW, sh_out, out);
+            else
+                moe_down_win_kernel<21, 2, false><<<(unsigned) (n_embd / 2), wthreads, 0, s>>>(
                     d, k, n_embd, n_ff, down_off, HW, sh_out, out);
         } else {
             const unsigned blocks = (unsigned) (n_embd / DOWN_ROWS);
             switch (d_type) {
 #define GLMF_DNW(TT)                 case TT: moe_down_win_kernel<TT, DOWN_ROWS, false><<<blocks, wthreads, 0, s>>>(                     d, k, n_embd, n_ff, down_off, HW, sh_out, out); break;
-                GLMF_DNW(16) GLMF_DNW(18) GLMF_DNW(22)
+                GLMF_DNW(16) GLMF_DNW(18) GLMF_DNW(21) GLMF_DNW(22)
 #undef GLMF_DNW
                 default: return false;
             }
@@ -7504,12 +7707,15 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     }
     // down: moe_down's kernel for the type, the (row block, token) blocks side by side
     const auto* HC = (const block_q8_1*) hq;
-    if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
+    if ((d_type == 22 || d_type == 18 || d_type == 21) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         if (d_type == 22)
             moe_down_kernel<22, 2, true, true, true, false, true><<<(unsigned) (n_embd / 2 * T), 256, 0, s>>>(
                 d, k, n_embd, n_ff, down_off, HC, sh_out, out);
-        else
+        else if (d_type == 18)
             moe_down_kernel<18, 2, true, false, true, false, true><<<(unsigned) (n_embd / 2 * T), 256, 0, s>>>(
+                d, k, n_embd, n_ff, down_off, HC, sh_out, out);
+        else
+            moe_down_kernel<21, 2, true, false, true, false, true><<<(unsigned) (n_embd / 2 * T), 256, 0, s>>>(
                 d, k, n_embd, n_ff, down_off, HC, sh_out, out);
     } else {
         const unsigned blocks = (unsigned) (n_embd / DOWN_ROWS * T);

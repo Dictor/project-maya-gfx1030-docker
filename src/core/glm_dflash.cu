@@ -754,10 +754,22 @@ cudaStream_t GlmDflash::stream() {
         int cur = 0;
         cudaGetDevice(&cur);
         cudaSetDevice(d_->dev);
-        static const bool prio = [] {
-            const char* v = getenv("MAYA_GLM_DFLASH_PRIO");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        const char* df_env = getenv("MAYA_GLM_DFLASH_PRIO");
+        const char* prio_env = df_env != nullptr ? df_env : getenv("MAYA_GLM_STREAM_PRIO");
+        bool prio = prio_env == nullptr || std::atoi(prio_env) != 0;
+#if defined(STRATA_USE_HIP)
+        // #621: RDNA 2 (gfx103x) can stall/hang when high-priority kernels wait on default-priority work
+        if (prio_env == nullptr) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, d_->dev) == cudaSuccess &&
+                std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
+                prio = false;
+                std::fprintf(stderr, "glm dflash: CUDA%d (%s): drafter stream at default priority (RDNA 2; "
+                                     "MAYA_GLM_DFLASH_PRIO=1 or MAYA_GLM_STREAM_PRIO=1 to raise)\n",
+                             d_->dev, prop.gcnArchName);
+            }
+        }
+#endif
         int least = 0, greatest = 0;
         if (!prio || cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
             cudaGetLastError();
@@ -1150,8 +1162,27 @@ bool GlmDflash::inject(int64_t lo, int64_t hi, cudaStream_t s, std::string& err)
         return v == nullptr || std::atoi(v) != 0;
     }();
     if (ovl && m.is == nullptr) {
+        const char* df_env = getenv("MAYA_GLM_DFLASH_PRIO");
+        const char* prio_env = df_env != nullptr ? df_env : getenv("MAYA_GLM_STREAM_PRIO");
+        bool prio = prio_env == nullptr || std::atoi(prio_env) != 0;
+#if defined(STRATA_USE_HIP)
+        // #621: RDNA 2 (gfx103x) can stall/hang when high-priority kernels wait on default-priority work
+        if (prio_env == nullptr) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, m.dev) == cudaSuccess &&
+                std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
+                prio = false;
+                std::fprintf(stderr, "glm dflash: CUDA%d (%s): inject stream at default priority (RDNA 2; "
+                                     "MAYA_GLM_DFLASH_PRIO=1 or MAYA_GLM_STREAM_PRIO=1 to raise)\n",
+                             m.dev, prop.gcnArchName);
+            }
+        }
+#endif
         int least = 0, greatest = 0;
-        if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) greatest = 0;
+        if (!prio || cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
+            cudaGetLastError();
+            greatest = 0;
+        }
         bool ok = cudaStreamCreateWithPriority(&m.is, cudaStreamNonBlocking, greatest) == cudaSuccess &&
                   cudaEventCreateWithFlags(&m.ev_s, cudaEventDisableTiming) == cudaSuccess;
         m.ev_kv.assign((size_t) m.n_layer, nullptr);

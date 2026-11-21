@@ -121,7 +121,7 @@ if [ -n "${MAYA_CONFIG:-}" ]; then
 elif [ -n "${MAYA_PACK:-}" ] || [ -n "${MAYA_GGUF:-}" ] || [ -n "${MAYA_GGUF_DIR:-}" ]; then
   mkdir -p "$DATA_DIR"
   CFG="$("$PYBIN" - <<'PYEOF'
-import json, os, pathlib, re, subprocess, sys
+import json, os, pathlib, re, shutil, subprocess, sys
 
 sys.path.insert(0, "/opt/maya/tools")
 import maya_quants as Q
@@ -153,6 +153,21 @@ def find_first_gguf() -> pathlib.Path | None:
         sys.exit(f"[maya-gfx1030] ERROR: no model .gguf files found in MAYA_GGUF_DIR='{d}'.")
     return None
 
+def resolve_shards(first: pathlib.Path) -> list[pathlib.Path]:
+    m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", first.name)
+    if m:
+        total = int(m.group(2))
+        shards = [
+            first.with_name(first.name[:m.start()] + f"-{i:05d}-of-{total:05d}.gguf")
+            for i in range(1, total + 1)
+        ]
+    else:
+        shards = [first]
+    missing = [str(s) for s in shards if not s.is_file()]
+    if missing:
+        sys.exit(f"[maya-gfx1030] ERROR: missing model shard(s): {', '.join(missing)}")
+    return shards
+
 def slug_for(path: pathlib.Path) -> str:
     stem = re.sub(r"-00001-of-\d+$", "", path.stem, flags=re.I)
     return re.sub(r"[^a-z0-9._-]+", "-", stem.lower()).strip("-") or "glm5-flash"
@@ -160,30 +175,69 @@ def slug_for(path: pathlib.Path) -> str:
 gguf_first = find_first_gguf()
 if pack_env:
     pack_dir = pathlib.Path(pack_env)
-    tag = slug_for(pack_dir)
+    model_dir = pack_dir.parent
+    tag = slug_for(pack_dir.parent if pack_dir.name == "pack" and pack_dir.parent.name else pack_dir)
 elif gguf_first is not None:
     tag = slug_for(gguf_first)
-    pack_dir = data_dir / "pack" / tag
+    model_dir = data_dir / "pack" / tag
+    pack_dir = model_dir / "pack"
 else:
     sys.exit("[maya-gfx1030] ERROR: set MAYA_CONFIG, MAYA_PACK, MAYA_GGUF, or MAYA_GGUF_DIR.")
 
-need_pack = [pack_dir / "index.txt", pack_dir / "dense.bin", pack_dir / "tokenizer" / "vocab.json"]
+if gguf_first is not None:
+    shards = resolve_shards(gguf_first)
+    can_write_model_dir = os.access(model_dir if model_dir.exists() else model_dir.parent, os.W_OK)
+    if can_write_model_dir:
+        model_dir.mkdir(parents=True, exist_ok=True)
+    for shard in shards:
+        link_path = model_dir / shard.name
+        if link_path.is_symlink():
+            if os.readlink(link_path) != str(shard):
+                try:
+                    link_path.unlink()
+                    os.symlink(str(shard), str(link_path))
+                except OSError as exc:
+                    sys.exit(f"[maya-gfx1030] ERROR: cannot update shard symlink {link_path} -> {shard}: {exc}")
+        elif not link_path.exists():
+            try:
+                model_dir.mkdir(parents=True, exist_ok=True)
+                os.symlink(str(shard), str(link_path))
+            except OSError as exc:
+                if not (pack_env and (model_dir / shard.name).is_file()):
+                    sys.exit(f"[maya-gfx1030] ERROR: cannot place shard {link_path} -> {shard}: {exc}")
+    for shard in shards:
+        if not (model_dir / shard.name).is_file():
+            sys.exit(f"[maya-gfx1030] ERROR: shard '{model_dir / shard.name}' missing beside pack '{pack_dir}'.")
+
+need_pack = [
+    pack_dir / "index.txt",
+    pack_dir / "native_experts.txt",
+    pack_dir / "dense.bin",
+    pack_dir / "tokenizer" / "vocab.json",
+]
 if not all(p.is_file() for p in need_pack):
     if gguf_first is None:
         sys.exit(f"[maya-gfx1030] ERROR: incomplete pack at '{pack_dir}' and no MAYA_GGUF/MAYA_GGUF_DIR provided.")
     pack_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[maya-gfx1030] Indexing GGUF pack into {pack_dir} from {gguf_first} ...", file=sys.stderr, flush=True)
+    gguf_for_pack = model_dir / gguf_first.name
+    gguf_arg = gguf_for_pack if gguf_for_pack.is_file() else gguf_first
+    print(f"[maya-gfx1030] Indexing GGUF pack into {pack_dir} from {gguf_arg} ...", file=sys.stderr, flush=True)
     subprocess.run(
         [
             "/opt/maya/.venv/bin/python",
             "/opt/maya/tools/iq_pack.py",
-            "--gguf", str(gguf_first),
+            "--gguf", str(gguf_arg),
             "--out", str(pack_dir),
             "--compat-bf16",
         ],
         check=True,
         stdout=sys.stderr,
     )
+
+tmpl_dst = pack_dir / "tokenizer" / "chat_template.jinja"
+tmpl_src = pathlib.Path("/opt/maya/serve/glm5_chat_template.jinja")
+if not tmpl_dst.is_file() and tmpl_src.is_file() and os.access(tmpl_dst.parent, os.W_OK):
+    shutil.copyfile(tmpl_src, tmpl_dst)
 
 gpus_raw = (os.environ.get("MAYA_GPUS") or "0,1").strip()
 gpus = [int(x.strip()) for x in gpus_raw.split(",") if x.strip()]
@@ -203,9 +257,14 @@ args = [
 ]
 if kv_fmt:
     args += ["--kv", kv_fmt]
-profile = pathlib.Path("/opt/maya/data/expert-profile-glm.bin")
-if profile.is_file():
-    args += ["--expert-profile", str(profile)]
+learned_profile = pack_dir / "expert-profile.bin"
+shipped_profile = pathlib.Path("/opt/maya/data/expert-profile-glm.bin")
+if learned_profile.is_file():
+    args += ["--expert-profile", str(learned_profile)]
+elif shipped_profile.is_file():
+    args += ["--expert-profile", str(shipped_profile)]
+if os.access(pack_dir, os.W_OK):
+    args += ["--expert-profile-save", str(learned_profile)]
 
 sampling, effort = Q.MODEL_DEFAULTS["glm"]
 cfg = {

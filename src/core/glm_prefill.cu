@@ -58,6 +58,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -163,11 +164,35 @@ inline bool prefill_stable() {
     return on;
 }
 
+#if defined(STRATA_USE_HIP)
+bool dense_mmq_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_GLM_DENSE_MMQ");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+bool bf16_f16_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_GLM_BF16_F16");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+__global__ void set_dense_bounds_kernel(int32_t* bounds, int32_t tn) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        bounds[0] = 0;
+        bounds[1] = tn;
+    }
+}
+#endif
+
 struct KdaBufs {
     float* proj[3];
     float* conv[3];
     float *fa, *ga, *beta, *g1, *g2;
     uint16_t* out16;
+    uint8_t* xq;
 };
 KdaBufs carve_kda(Carve& c, size_t T, const Glm5Geometry& g) {
     KdaBufs b{};
@@ -180,6 +205,10 @@ KdaBufs carve_kda(Carve& c, size_t T, const Glm5Geometry& g) {
     b.g1 = c.take<float>(T * DI);
     b.g2 = c.take<float>(T * DI);
     b.out16 = c.take<uint16_t>(T * DI);
+#if defined(STRATA_USE_HIP)
+    if (g.arch != GlmArch::GlmDsa && dense_mmq_enabled())
+        b.xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) T, std::max<int64_t>(g.n_embd, (int64_t) DI)));
+#endif
     return b;
 }
 
@@ -311,6 +340,7 @@ struct DsaBufs {
     float *qr_raw, *qr, *kv_raw, *ik_raw, *ig_raw, *iw, *q, *iq, *score, *q_abs, *ctx, *attn;
     uint16_t *qr16, *attn16;
     int *cells, *n_sel;
+    uint8_t* xq;
     int score_ld;
 };
 DsaBufs carve_dsa(Carve& c, size_t T, const Glm5Geometry& g, int max_pools) {
@@ -333,18 +363,29 @@ DsaBufs carve_dsa(Carve& c, size_t T, const Glm5Geometry& g, int max_pools) {
     b.ctx = c.take<float>(T * (size_t) g.n_head * g.kv_lora);
     b.attn = c.take<float>(T * (size_t) g.n_head * g.v_head);
     b.attn16 = c.take<uint16_t>(T * (size_t) g.n_head * g.v_head);
+#if defined(STRATA_USE_HIP)
+    if (dense_mmq_enabled()) {
+        const int64_t max_k = std::max<int64_t>({g.n_embd, g.q_lora, (int64_t) g.n_head * g.v_head});
+        b.xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) T, max_k));
+    }
+#endif
     return b;
 }
 
 struct DenseBufs {
     float *dg, *du;
     uint16_t* dh16;
+    uint8_t* xq;
 };
 DenseBufs carve_dense(Carve& c, size_t T, const Glm5Geometry& g) {
     DenseBufs b{};
     b.dg = c.take<float>(T * g.n_ff_dense);
     b.du = c.take<float>(T * g.n_ff_dense);
     b.dh16 = c.take<uint16_t>(T * g.n_ff_dense);
+#if defined(STRATA_USE_HIP)
+    if (g.arch != GlmArch::GlmDsa && dense_mmq_enabled())
+        b.xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) T, std::max<int64_t>(g.n_embd, g.n_ff_dense)));
+#endif
     return b;
 }
 
@@ -723,6 +764,7 @@ struct Glm5Model::PrefillState {
     float *pre = nullptr, *post = nullptr, *comb = nullptr, *ss = nullptr, *mix = nullptr;
     uint16_t* x16 = nullptr;
     int* iota = nullptr;
+    int32_t* d_dense_bounds = nullptr;
     // KV streaming: one layer's latent cache in position order, staged from its host copy - what the prompt attention
     // reads (a chunk's selections can name any position, so the slots' window does not hold them).  The copy runs on
     // kv_ss once the attention before has read the stage (kv_free), while the layers in between compute; the layer it
@@ -1696,7 +1738,8 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T * 16);
     a.take<float>(T);
     a.take<float>(T * 24);
-    a.take<int>(T * (size_t) g.n_exp_used + mmq::IDS_PAD);   // iota (MMQ reads whole tiles of ids past its last row)
+    a.take<int>(std::max<size_t>(T, T * (size_t) g.n_exp_used) + mmq::IDS_PAD);   // iota (MMQ reads whole tiles of ids past its last row)
+    a.take<int32_t>(2);                                                            // d_dense_bounds: {0, Tn} for dense MMQ
     if (has_dsa && g.arch == GlmArch::GlmDsa) a.take<uint8_t>(glmpf::keep_bytes(g, T, max_pools));   // glm-dsa B9.3
     a.take<uint8_t>(kv_stage);
     size_t uni = 0;
@@ -1782,7 +1825,8 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->comb = a.take<float>(T * 16);
     S->ss = a.take<float>(T);
     S->mix = a.take<float>(T * 24);
-    S->iota = a.take<int>(T * (size_t) g.n_exp_used + mmq::IDS_PAD);   // (see mmq::IDS_PAD)
+    S->iota = a.take<int>(std::max<size_t>(T, T * (size_t) g.n_exp_used) + mmq::IDS_PAD);   // (see mmq::IDS_PAD)
+    S->d_dense_bounds = a.take<int32_t>(2);
     S->dsa_keep = S->has_dsa && g.arch == GlmArch::GlmDsa ? a.take<uint8_t>(glmpf::keep_bytes(g, T, S->max_pools)) : nullptr;   // glm-dsa B9.3
     S->kv_stage = stage > 0 ? a.take<uint8_t>(stage) : nullptr;
     S->uni = S->arena + a.off;
@@ -1847,7 +1891,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
         }
     }
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
-    mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used + mmq::IDS_PAD, F->cs);
+    mmq::iota(S->iota, std::max<int64_t>(S->T_bound, (int64_t) S->T_bound * g_.n_exp_used) + mmq::IDS_PAD, F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
     if (S->ev_pfree) cudaEventRecord(S->ev_pfree, F->cs);
     S->pre_layer = -1;
@@ -2313,6 +2357,103 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_after(X16, ldx, Y, ldy, N, Tn, beta, s);   // glm-dsa B15.1: a guarded X16's rows scaled back
     };
+    int dense_bounds_tn = -1;
+    const auto can_dense_mmq = [&](const WSlot& w, int Kd) -> bool {
+#if defined(STRATA_USE_HIP)
+        if (g.arch == GlmArch::GlmDsa || !dense_mmq_enabled() || S->mq == nullptr ||
+            S->d_dense_bounds == nullptr || S->iota == nullptr || w.q == nullptr ||
+            !mmq::supported(w.type) || Kd <= 0)
+            return false;
+        const ggml_type t = (ggml_type) w.type;
+        const int64_t qk = ggml_blck_size(t);
+        return qk > 0 && (Kd % qk) == 0 && w.n_in >= Kd && w.n_out > 0;
+#else
+        (void) w;
+        (void) Kd;
+        return false;
+#endif
+    };
+    const auto mmq_dense_proj = [&](const WSlot& w, int N, int Kd, const float* X32, int ldx, uint8_t* Xq, int& xqt,
+                                    float* Y, int ldy, int Tn) {
+#if defined(STRATA_USE_HIP)
+        if (Tn <= 0 || N <= 0) return;
+        static std::atomic<signed char> logged[64]{};
+        if (dev_ >= 0 && dev_ < 64) {
+            signed char expected = 0;
+            if (logged[dev_].compare_exchange_strong(expected, 1, std::memory_order_relaxed))
+                std::fprintf(stderr, "glm prefill: CUDA%d dense MMQ on (MAYA_GLM_DENSE_MMQ=0 to disable)\n", dev_);
+        }
+        if (xqt != w.type) {
+            mmq::quantize(X32, nullptr, Xq, w.type, Kd, ldx, Tn, s);
+            xqt = w.type;
+        }
+        if (dense_bounds_tn != Tn) {
+            set_dense_bounds_kernel<<<1, 1, 0, s>>>(S->d_dense_bounds, Tn);
+            dense_bounds_tn = Tn;
+        }
+        mmq::Product p;
+        p.w = w.q;
+        p.type = w.type;
+        p.w_rows = N;
+        p.w_cols = Kd;
+        p.expert_bytes = mmq::matrix_bytes(w.type, N, Kd);
+        p.n = 1;
+        p.xq = Xq;
+        p.bounds = S->d_dense_bounds;
+        p.ids = S->iota;
+        p.total_rows = Tn;
+        p.max_rows = Tn;
+        p.dst = Y;
+        p.ld_dst = ldy;
+        S->mq->run(p, s);
+#else
+        (void) w; (void) N; (void) Kd; (void) X32; (void) ldx; (void) Xq; (void) xqt;
+        (void) Y; (void) ldy; (void) Tn;
+#endif
+    };
+    const auto proj_q = [&](const WSlot& w, int N, int Kd, const float* X32, const uint16_t* X16, int ldx, uint8_t* Xq,
+                            int& xqt, float* Y, int ldy, int Tn) {
+        if (can_dense_mmq(w, Kd) && Xq != nullptr && X32 != nullptr)
+            mmq_dense_proj(w, N, Kd, X32, ldx, Xq, xqt, Y, ldy, Tn);
+        else
+            hgemm_q(w, N, Kd, X16, ldx, Y, ldy, Tn, 0.0f);
+    };
+    const auto can_bf16_f16 = [&](int Kd) -> bool {
+#if defined(STRATA_USE_HIP)
+        return g.arch != GlmArch::GlmDsa && bf16_f16_enabled() && S->w16 != nullptr && Kd > 0 && S->w16_elems >= Kd;
+#else
+        (void) Kd;
+        return false;
+#endif
+    };
+    const auto bf16_f16_gemm = [&](const uint16_t* W, int N, int Kd, const uint16_t* X16, int ldx, float* Y, int ldy,
+                                   int Tn, float alpha) {
+#if defined(STRATA_USE_HIP)
+        static std::atomic<signed char> logged[64]{};
+        if (dev_ >= 0 && dev_ < 64) {
+            signed char expected = 0;
+            if (logged[dev_].compare_exchange_strong(expected, 1, std::memory_order_relaxed))
+                std::fprintf(stderr, "glm prefill: CUDA%d dense BF16->FP16 on (MAYA_GLM_BF16_F16=0 for F32)\n", dev_);
+        }
+        const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / Kd));
+        for (int r0 = 0; r0 < N; r0 += rows) {
+            const int n = std::min(rows, N - r0);
+            gb::bf16_to_f16(W + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
+            const cublasStatus_t st = hgemm_ex_f32(S->blas, s, n, Tn, Kd, &alpha, S->w16, Kd, X16, ldx, &zero, Y + r0, ldy);
+            gemm_fail(st, "bf16 f16", S->w16, X16, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
+            blas_ck(st, "bf16 f16");
+        }
+#else
+        (void) W; (void) N; (void) Kd; (void) X16; (void) ldx; (void) Y; (void) ldy; (void) Tn; (void) alpha;
+#endif
+    };
+    const auto proj_bf16 = [&](const uint16_t* W, int N, int Kd, const float* X32, const uint16_t* X16, int ldx,
+                               float* Y, int ldy, int Tn, float alpha) {
+        if (can_bf16_f16(Kd) && X16 != nullptr)
+            bf16_f16_gemm(W, N, Kd, X16, ldx, Y, ldy, Tn, alpha);
+        else
+            sgemm_bf16(W, N, Kd, X32, ldx, Y, ldy, Tn, alpha);
+    };
     // the mHC read half for the whole chunk: (write half of the previous block,) mix dots, gates, x / x16
     glmpf::Io pio{&g, s, S->blas, S->w16, S->w16_elems, S->w32, S->w32_elems, S->uni, S->dsa_keep, S->x, S->x16, S->mixer, S->R, T, p0, state_, &lay_, lat_q8_, (int64_t) S->max_pools, F->dsa.get(), false, S->sub};   // glm-dsa B9.6
     glmpf::KvIo pkv;   // L1-6 KV streaming: glm-dsa's streamed layers run their chunk on the stage
@@ -2432,14 +2573,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     constexpr int kPredT = 1024;
     struct DiskQ {
         std::mutex mu;
+        std::condition_variable cv;
         std::vector<std::pair<int, int>> q;
         std::atomic<int> n{0}, landed{0}, copied{0};
         std::atomic<bool> stop{false};
         int push(int il, int e) {
-            std::lock_guard<std::mutex> lk(mu);
-            q.emplace_back(il, e);
-            n.store((int) q.size(), std::memory_order_release);
-            return (int) q.size() - 1;
+            int idx;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                q.emplace_back(il, e);
+                idx = (int) q.size() - 1;
+                n.store(idx + 1, std::memory_order_release);
+            }
+            cv.notify_all();
+            return idx;
         }
     } dq;
     // MAYA_GLM_DISK_QD=<n>: experts read at once (one batch across the workers) when they are queued and their
@@ -2467,10 +2614,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         cudaSetDevice(dev_);
         for (;;) {
             const int k = rnext.fetch_add(1);
-            for (int spin = 0; dq.n.load(std::memory_order_acquire) <= k ||
-                               (k >= KL && dq.copied.load(std::memory_order_acquire) < k - KL + 1);
-                 ++spin) {
-                if (dq.stop.load()) return;
+            if (dq.n.load(std::memory_order_acquire) <= k) {
+                std::unique_lock<std::mutex> lk(dq.mu);
+                dq.cv.wait(lk, [&] {
+                    return dq.stop.load(std::memory_order_acquire) || dq.n.load(std::memory_order_acquire) > k;
+                });
+                if (dq.stop.load(std::memory_order_acquire)) return;
+            }
+            for (int spin = 0; k >= KL && dq.copied.load(std::memory_order_acquire) < k - KL + 1; ++spin) {
+                if (dq.stop.load(std::memory_order_acquire)) return;
                 if (spin < 1024) std::this_thread::yield();
                 else std::this_thread::sleep_for(std::chrono::microseconds(20));
             }
@@ -2504,10 +2656,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return std::max(1, std::min(16, v ? std::atoi(v) : 8));
         }();
         for (int k = 0;;) {
-            while (dq.n.load(std::memory_order_acquire) <= k ||
-                   (k >= KL && dq.copied.load(std::memory_order_acquire) < k - KL + 1)) {
-                if (dq.stop.load()) return;
-                std::this_thread::yield();
+            if (dq.n.load(std::memory_order_acquire) <= k) {
+                std::unique_lock<std::mutex> lk(dq.mu);
+                dq.cv.wait(lk, [&] {
+                    return dq.stop.load(std::memory_order_acquire) || dq.n.load(std::memory_order_acquire) > k;
+                });
+                if (dq.stop.load(std::memory_order_acquire)) return;
+            }
+            for (int spin = 0; k >= KL && dq.copied.load(std::memory_order_acquire) < k - KL + 1; ++spin) {
+                if (dq.stop.load(std::memory_order_acquire)) return;
+                if (spin < 1024) std::this_thread::yield();
+                else std::this_thread::sleep_for(std::chrono::microseconds(20));
             }
             // this one, and the ones after it that are queued and whose slots are free already
             int nb = 1;
@@ -2535,7 +2694,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         DiskQ& q;
         uint64_t& issued;
         ~Joiner() {
-            q.stop.store(true);
+            {
+                std::lock_guard<std::mutex> lk(q.mu);
+                q.stop.store(true, std::memory_order_release);
+            }
+            q.cv.notify_all();
             if (t.joinable()) t.join();
             issued += (uint64_t) q.n.load();
         }
@@ -2977,19 +3140,27 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (Ly.recr) {
                 Carve c{S->uni};
                 KdaBufs B = carve_kda(c, (size_t) tn, g);
-                hgemm_q(Ly.q, DI, E, x16, E, B.proj[0], DI, tn, 0.0f);
-                hgemm_q(Ly.k, DI, E, x16, E, B.proj[1], DI, tn, 0.0f);
-                hgemm_q(Ly.v, DI, E, x16, E, B.proj[2], DI, tn, 0.0f);
-                sgemm_bf16(Ly.f_a, HD, E, xs, E, B.fa, HD, tn, 1.0f);
-                sgemm_bf16(Ly.g_a, HD, E, xs, E, B.ga, HD, tn, 1.0f);
-                sgemm_bf16(Ly.beta, g.n_head, E, xs, E, B.beta, g.n_head, tn, 1.0f);
+                int kda_xqt = -1;
+                proj_q(Ly.q, DI, E, xs, x16, E, B.xq, kda_xqt, B.proj[0], DI, tn);
+                proj_q(Ly.k, DI, E, xs, x16, E, B.xq, kda_xqt, B.proj[1], DI, tn);
+                proj_q(Ly.v, DI, E, xs, x16, E, B.xq, kda_xqt, B.proj[2], DI, tn);
+                proj_bf16(Ly.f_a, HD, E, xs, x16, E, B.fa, HD, tn, 1.0f);
+                proj_bf16(Ly.g_a, HD, E, xs, x16, E, B.ga, HD, tn, 1.0f);
+                proj_bf16(Ly.beta, g.n_head, E, xs, x16, E, B.beta, g.n_head, tn, 1.0f);
                 const float* pr[3] = {B.proj[0], B.proj[1], B.proj[2]};
                 float* cv[3] = {B.conv[0], B.conv[1], B.conv[2]};
                 float* cst = state_ + kda_conv_[(size_t) il];
                 gb::kda_conv(pr, Ly.conv, cst, cv, tn, DI, g.d_conv, s);
                 gb::kda_conv_state(pr, cst, tn, DI, g.d_conv, s);
-                sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
-                sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
+                if (can_bf16_f16(HD) && HD <= DI) {
+                    gb::f32_to_f16(B.fa, B.out16, (int64_t) tn * HD, s);
+                    bf16_f16_gemm(Ly.f_b, DI, HD, B.out16, HD, B.g1, DI, tn, 1.0f);
+                    gb::f32_to_f16(B.ga, B.out16, (int64_t) tn * HD, s);
+                    bf16_f16_gemm(Ly.g_b, DI, HD, B.out16, HD, B.g2, DI, tn, 1.0f);
+                } else {
+                    sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
+                    sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
+                }
                 S->mark("kda_proj", s);
                 // the recurrence over n_head x 4 blocks (kda_rec_split: the value columns are independent) instead of
                 // one block a head - 32 blocks for a V100's 80 SMs.  Maya-S24, 27K prompts: kda_rec 4.7 / 5.1 -> 3.5 s
@@ -3039,17 +3210,26 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                 Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
                 }
                 S->mark("kda_rec", s);
-                if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+                if (!skip_output) {
+                    if (can_dense_mmq(Ly.out, DI) && B.xq != nullptr) {
+                        gb::f16_to_f32(B.out16, B.proj[0], (int64_t) tn * DI, s);
+                        int kda_out_xqt = -1;
+                        mmq_dense_proj(Ly.out, E, DI, B.proj[0], DI, B.xq, kda_out_xqt, mixer, E, tn);
+                    } else {
+                        hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
+                    }
+                }
             } else {
                 Carve c{S->uni};
                 DsaBufs B = carve_dsa(c, (size_t) tn, g, S->max_pools);
                 const int pt = (int) (p0 + t0);
                 const float prescale = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
-                hgemm_q(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora, tn, 0.0f);
-                hgemm_q(Ly.kv_a, g.kv_lora, E, x16, E, B.kv_raw, g.kv_lora, tn, 0.0f);
-                sgemm_bf16(Ly.idx_k, g.idx_key, E, xs, E, B.ik_raw, g.idx_key, tn, 1.0f);
-                sgemm_bf16(Ly.idx_gate, g.idx_key, E, xs, E, B.ig_raw, g.idx_key, tn, 1.0f);
-                sgemm_bf16(Ly.idx_proj, g.idx_heads, E, xs, E, B.iw, g.idx_heads, tn, prescale);
+                int dsa_xqt = -1;
+                proj_q(Ly.q_a, g.q_lora, E, xs, x16, E, B.xq, dsa_xqt, B.qr_raw, g.q_lora, tn);
+                proj_q(Ly.kv_a, g.kv_lora, E, xs, x16, E, B.xq, dsa_xqt, B.kv_raw, g.kv_lora, tn);
+                proj_bf16(Ly.idx_k, g.idx_key, E, xs, x16, E, B.ik_raw, g.idx_key, tn, 1.0f);
+                proj_bf16(Ly.idx_gate, g.idx_key, E, xs, x16, E, B.ig_raw, g.idx_key, tn, 1.0f);
+                proj_bf16(Ly.idx_proj, g.idx_heads, E, xs, x16, E, B.iw, g.idx_heads, tn, prescale);
                 gb::DsaPrepArgs d;
                 d.qr_raw = B.qr_raw;
                 d.q_a_norm = Ly.q_a_norm;
@@ -3087,13 +3267,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gb::dsa_pool(state_ + dsa_ik_[(size_t) il], state_ + dsa_ig_[(size_t) il], Ly.ape,
                                  state_ + dsa_pool_[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
                                  ik_ring_);
-                hgemm_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr16, g.q_lora, B.q, g.n_head * g.qk_nope, tn, 0.0f);
+                int qr_xqt = -1;
+                proj_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr, B.qr16, g.q_lora, B.xq, qr_xqt, B.q,
+                       g.n_head * g.qk_nope, tn);
                 if (Ly.idx_q_b_x.q != nullptr)   // an EXL3 pack quantizes it
-                    hgemm_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr16, g.q_lora, B.iq,
-                            g.idx_heads * g.idx_key, tn, 0.0f);
+                    proj_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr, B.qr16, g.q_lora, B.xq, qr_xqt,
+                           B.iq, g.idx_heads * g.idx_key, tn);
                 else
-                    sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
-                               g.idx_heads * g.idx_key, tn, 1.0f);
+                    proj_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, B.qr16, g.q_lora, B.iq,
+                              g.idx_heads * g.idx_key, tn, 1.0f);
                 S->mark("dsa_proj", s);
                 const int max_vis = (pt + tn) / kp;
                 if (max_vis > g.top_pools_max())
@@ -3211,11 +3393,22 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                                   g.v_head, g.n_head),
                         "mla out");
                 }
-                if (!attn16_written)
+                const bool use_mmq_out = !skip_output && can_dense_mmq(Ly.out, g.n_head * g.v_head) &&
+                                         B.xq != nullptr && B.attn != nullptr;
+                if (!attn16_written && (!use_mmq_out || g_.arch == GlmArch::GlmDsa))
                     gb::f32_to_f16(B.attn, B.attn16, (int64_t) tn * g.n_head * g.v_head, s);
                 if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_rows(B.attn, g.n_head * g.v_head, 0, 1, g.n_head * g.v_head, tn, B.attn16, s);   // glm-dsa B15.1
-                if (!skip_output)
-                    hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, g.n_head * g.v_head, mixer, E, tn, 0.0f);
+                if (!skip_output) {
+                    if (use_mmq_out) {
+                        if (attn16_written)
+                            gb::f16_to_f32(B.attn16, B.attn, (int64_t) tn * g.n_head * g.v_head, s);
+                        int out_xqt = -1;
+                        mmq_dense_proj(Ly.out, E, g.n_head * g.v_head, B.attn, g.n_head * g.v_head, B.xq, out_xqt,
+                                       mixer, E, tn);
+                    } else {
+                        hgemm_q(Ly.out, E, g.n_head * g.v_head, B.attn16, g.n_head * g.v_head, mixer, E, tn, 0.0f);
+                    }
+                }
                 if (t0 + tn == T) {
                     const std::string Ls = std::to_string(il);
                     dump_row("dsa_qr-" + Ls, B.qr, g.q_lora, tn - 1);
@@ -3284,12 +3477,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const int tn = std::min(S->sub, T - t0);
                 Carve c{S->uni};
                 DenseBufs B = carve_dense(c, (size_t) tn, g);
+                const float* xs = S->x + (size_t) t0 * E;
                 const uint16_t* x16 = S->x16 + (size_t) t0 * E;
-                hgemm_q(Ly.ffn_gate, g.n_ff_dense, E, x16, E, B.dg, g.n_ff_dense, tn, 0.0f);
-                hgemm_q(Ly.ffn_up, g.n_ff_dense, E, x16, E, B.du, g.n_ff_dense, tn, 0.0f);
-                gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.swiglu_shexp, s);
-                if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_swiglu(B.dg, B.du, g.n_ff_dense, tn, g.swiglu_shexp, B.dh16, s);   // glm-dsa B15.1
-                hgemm_q(Ly.ffn_down, E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+                int dense_xqt = -1;
+                proj_q(Ly.ffn_gate, g.n_ff_dense, E, xs, x16, E, B.xq, dense_xqt, B.dg, g.n_ff_dense, tn);
+                proj_q(Ly.ffn_up, g.n_ff_dense, E, xs, x16, E, B.xq, dense_xqt, B.du, g.n_ff_dense, tn);
+                if (can_dense_mmq(Ly.ffn_down, g.n_ff_dense) && B.xq != nullptr) {
+                    gb::swiglu_f32(B.dg, B.du, B.dg, (int64_t) tn * g.n_ff_dense, g.swiglu_shexp, s);
+                    int dn_xqt = -1;
+                    mmq_dense_proj(Ly.ffn_down, E, g.n_ff_dense, B.dg, g.n_ff_dense, B.xq, dn_xqt,
+                                   S->ffn + (size_t) t0 * E, E, tn);
+                } else {
+                    gb::swiglu_f16(B.dg, B.du, B.dh16, (int64_t) tn * g.n_ff_dense, g.swiglu_shexp, s);
+                    if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_swiglu(B.dg, B.du, g.n_ff_dense, tn, g.swiglu_shexp, B.dh16, s);   // glm-dsa B15.1
+                    hgemm_q(Ly.ffn_down, E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+                }
             }
             S->mark("dense_ffn", s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
@@ -3302,12 +3504,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const int FF = g.n_ff_exp * g.n_shared, NE = g.n_expert, nff = g.n_ff_exp;
         for (int t0 = 0, shs = S->sh_sub(); t0 < T; t0 += shs) {
             const int tn = std::min(shs, T - t0);
+            const float* xs = S->x + (size_t) t0 * E;
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
-            hgemm_q(Ly.sh_gate, FF, E, x16, E, M.sh_g, FF, tn, 0.0f);
-            hgemm_q(Ly.sh_up, FF, E, x16, E, M.sh_u, FF, tn, 0.0f);
-            gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.swiglu_shexp, s);
-            if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_swiglu(M.sh_g, M.sh_u, FF, tn, g.swiglu_shexp, M.sh16, s);   // glm-dsa B15.1
-            hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+            int sh_xqt = -1;
+            proj_q(Ly.sh_gate, FF, E, xs, x16, E, M.Xq, sh_xqt, M.sh_g, FF, tn);
+            proj_q(Ly.sh_up, FF, E, xs, x16, E, M.Xq, sh_xqt, M.sh_u, FF, tn);
+            uint8_t* sh_dn_xq = (FF <= g.n_ff_exp) ? M.Hq : (FF <= E) ? M.Xq : nullptr;
+            if (can_dense_mmq(Ly.sh_down, FF) && sh_dn_xq != nullptr) {
+                gb::swiglu_f32(M.sh_g, M.sh_u, M.sh_g, (int64_t) tn * FF, g.swiglu_shexp, s);
+                int dn_xqt = -1;
+                mmq_dense_proj(Ly.sh_down, E, FF, M.sh_g, FF, sh_dn_xq, dn_xqt, S->ffn + (size_t) t0 * E, E, tn);
+            } else {
+                gb::swiglu_f16(M.sh_g, M.sh_u, M.sh16, (int64_t) tn * FF, g.swiglu_shexp, s);
+                if (g_.arch == GlmArch::GlmDsa) glmd::f16_guard_swiglu(M.sh_g, M.sh_u, FF, tn, g.swiglu_shexp, M.sh16, s);   // glm-dsa B15.1
+                hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
+            }
         }
         S->mark("shexp", s);
         if (g.arch == GlmArch::GlmDsa) { if (!glmpf::route(pio, Ly.router_w, Ly.router_type, Ly.router_bias, M.logits, M.ids, M.rw, err)) return false; } else {   // glm-dsa B9.1: F32 router, HF norm
@@ -5322,7 +5533,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             PrefillState* S = m->pf_;
             cudaSetDevice(m->dev_);
             if (m == owner && S->cb_used) {
-                mmq::iota(S->iota, (int64_t) S->T_bound * g.n_exp_used + mmq::IDS_PAD, m->fast_->cs);
+                mmq::iota(S->iota, std::max<int64_t>(S->T_bound, (int64_t) S->T_bound * g.n_exp_used) + mmq::IDS_PAD,
+                      m->fast_->cs);
                 S->cb_used = false;
             }
             cudaEventRecord(S->ev_turn, m->fast_->cs);

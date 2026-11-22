@@ -50,7 +50,9 @@
 #include <thread>
 #include <map>
 #include <atomic>
+#include <cerrno>
 #include <functional>
+#include <mutex>
 #include <sstream>
 #include <memory>
 #ifdef _WIN32
@@ -726,6 +728,7 @@ Glm5Model::~Glm5Model() {
     if (dev_hit_out_) cudaFree(dev_hit_out_);
     if (bounce_) cudaFreeHost(bounce_);
     if (plan_host_) cudaFreeHost(plan_host_);
+    pack_emb_shared_.reset();
 }
 
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
@@ -2975,6 +2978,63 @@ void strata::core::Glm5Model::pack_release_views() {
             UnmapViewOfFile(s.base);
             s.base = nullptr;
         }
+#else
+    const char* er = getenv("MAYA_GLM_EMB_RAM");
+    const char* rr = getenv("MAYA_GLM_RAM_RESIDENT");
+    const bool emb_ram_on = er != nullptr ? (std::atoi(er) != 0) : (rr != nullptr && std::atoi(rr) != 0);
+    if (!emb_ram_on || pack_emb_src_ == nullptr || pack_emb_type_ < 0) return;
+
+    struct EmbCacheKey {
+        std::string path;
+        int type;
+        size_t bytes;
+        bool operator<(const EmbCacheKey& o) const {
+            return std::tie(path, type, bytes) < std::tie(o.path, o.type, o.bytes);
+        }
+    };
+    static std::mutex emb_mu;
+    static std::map<EmbCacheKey, std::weak_ptr<std::vector<uint8_t>>> emb_cache;
+
+    for (const Shard& s : pack_shards_) {
+        if (s.base == nullptr || pack_emb_src_ < s.base || pack_emb_src_ >= s.base + s.size) continue;
+        const size_t bytes = (size_t) g_.n_vocab * ggml_row_size((ggml_type) pack_emb_type_, g_.n_embd);
+        const uint64_t off = (uint64_t) (pack_emb_src_ - s.base);
+        if (bytes == 0 || off + bytes > s.size) break;
+
+        std::lock_guard<std::mutex> lk(emb_mu);
+        const EmbCacheKey key{s.path, pack_emb_type_, bytes};
+        std::shared_ptr<std::vector<uint8_t>> sp = emb_cache[key].lock();
+        if (sp) {
+            std::fprintf(stderr, "glm pack: CUDA%d token_embd sharing RAM copy (%.1f MB)\n", dev_,
+                         (double) bytes / 1048576.0);
+        } else {
+            sp = std::make_shared<std::vector<uint8_t>>(bytes);
+            bool pread_ok = false;
+            if (s.fd >= 0) {
+                constexpr size_t kChunk = 4u << 20;
+                size_t done = 0;
+                while (done < bytes) {
+                    const size_t want = std::min(kChunk, bytes - done);
+                    const ssize_t n = pread(s.fd, sp->data() + done, want, (off_t) (off + done));
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) break;
+                    done += (size_t) n;
+                }
+                if (done == bytes) {
+                    pread_ok = true;
+                    posix_fadvise(s.fd, (off_t) off, (off_t) bytes, POSIX_FADV_DONTNEED);
+                }
+            }
+            if (!pread_ok) std::memcpy(sp->data(), pack_emb_src_, bytes);
+            emb_cache[key] = sp;
+            std::fprintf(stderr,
+                         "glm pack: CUDA%d token_embd pinned in RAM (%.1f MB from %s, MAYA_GLM_EMB_RAM=0 to stream)\n",
+                         dev_, (double) bytes / 1048576.0, pread_ok ? "pread" : "mmap");
+        }
+        pack_emb_shared_ = std::move(sp);
+        pack_emb_src_ = pack_emb_shared_->data();
+        break;
+    }
 #endif
 }
 

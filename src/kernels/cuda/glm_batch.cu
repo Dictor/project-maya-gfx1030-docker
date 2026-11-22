@@ -141,6 +141,10 @@ __global__ void f32_to_f16_kernel(const float* __restrict__ src, __half* __restr
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2half(src[i]);
 }
+__global__ void f16_to_f32_kernel(const __half* __restrict__ src, float* __restrict__ dst, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half2float(src[i]);
+}
 __global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ src, __half* __restrict__ dst, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __float2half(__uint_as_float((uint32_t) src[i] << 16));
@@ -1968,40 +1972,44 @@ __device__ __forceinline__ uint32_t pack_h2_rn(float a, float b) {
 }
 #endif
 
-// Block = (token, 16 heads), 256 threads (8 warps).  Q*K^T pairs adjacent KV columns into FP16x2 (each head's
-// F32 query is scaled by a power of two into [2^13, 2^14) so FP16 packing never overflows or underflows, undone
-// on its scores); P*V pairs adjacent cells (2*s2, 2*s2+1) with FP16 softmax weights and zero-padded masked/tail
-// cells so odd n_sel and masked entries need no tail branch; each thread owns adjacent output columns 2*tid and
-// 2*tid+1 via bank-conflict-free 32-bit LDS loads and v_perm_b32 transposes.
-constexpr size_t kFdot2Smem = (size_t) MB_CH * 512 * sizeof(uint16_t) + (size_t) MB_HG * MB_CH * sizeof(float);
-static_assert(kFdot2Smem <= 48 * 1024, "the fdot2 prompt attention must fit 48 KB of shared memory");
+// Block = (token, HG heads), 256 threads (8 warps), CH = 16 selected cells per step (< 21 KB LDS -> higher CU
+// occupancy).  HG = 32 (4 heads/warp) reuses each LDS K*V load across 2x heads and halves grid.y; HG = 16 fallback
+// keeps VGPR pressure minimal if needed.  Online softmax guards lane < CH before reading/writing CH-wide SMEM.
+constexpr size_t smem_fdot2_bytes(int hg, int ch) {
+    return (size_t) ch * 512 * sizeof(uint16_t) + (size_t) hg * ch * sizeof(float);
+}
+static_assert(smem_fdot2_bytes(32, 16) <= 48 * 1024, "the fdot2 prompt attention must fit 48 KB of shared memory");
+template <int HG, int CH>
 __global__ void __launch_bounds__(256) mla_attn_fdot2_kernel(
         const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
         const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
         int n_sel_max, int n_head, float scale, float* __restrict__ ctx, bool q8) {
+    static_assert(HG == 16 || HG == 32, "mla_attn_fdot2_kernel supports HG=16 or 32");
+    static_assert(CH == 16, "mla_attn_fdot2_kernel expects CH=16");
     constexpr int KV = 512;
+    constexpr int H_PER_WARP = HG / 8;
     extern __shared__ __align__(16) unsigned char fd_sm[];
-    uint16_t* sL = (uint16_t*) fd_sm;                                   // MB_CH x KV, FP16 (32 KiB)
-    uint32_t* sL32 = (uint32_t*) fd_sm;                                 // MB_CH x (KV/2), packed FP16 pairs
-    float* sP = (float*) (fd_sm + (size_t) MB_CH * KV * sizeof(uint16_t)); // MB_HG x MB_CH, F32 scores (2 KiB)
-    __shared__ __align__(4) uint16_t sP16[MB_HG * MB_CH];               // MB_HG x MB_CH, FP16 weights (1 KiB)
-    __shared__ float s_m[MB_HG], s_l[MB_HG], s_scale[MB_HG];
-    __shared__ int s_cell[MB_CH];
-    const int t = blockIdx.x, h0 = blockIdx.y * MB_HG, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    uint16_t* sL = (uint16_t*) fd_sm;                                   // CH x KV, FP16 (16 KiB)
+    uint32_t* sL32 = (uint32_t*) fd_sm;                                 // CH x (KV/2), packed FP16 pairs
+    float* sP = (float*) (fd_sm + (size_t) CH * KV * sizeof(uint16_t)); // HG x CH, F32 scores
+    __shared__ __align__(16) uint16_t sP16[HG * CH];                    // HG x CH, FP16 weights
+    __shared__ float s_m[HG], s_l[HG], s_scale[HG];
+    __shared__ int s_cell[CH];
+    const int t = blockIdx.x, h0 = blockIdx.y * HG, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int ns = n_sel_arr[t];
     const int* cl = cells_all + (size_t) t * n_sel_max;
-    // Scale and pack head 2*warp then 2*warp+1 sequentially to keep prologue VGPRs minimal.
-    uint32_t q0[8], q1[8];
-    float q_scale0 = scale, q_scale1 = scale;
-    {
-        const float* qa0 = q_abs + ((size_t) t * n_head + h0 + 2 * warp) * KV;
+    uint32_t q_reg[H_PER_WARP][8];
+    float q_scale[H_PER_WARP];
+#pragma unroll
+    for (int hh = 0; hh < H_PER_WARP; ++hh) {
+        const float* qa = q_abs + ((size_t) t * n_head + h0 + H_PER_WARP * warp + hh) * KV;
         float ra[8], rb[8];
         float mx = 0.0f;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const int c = 2 * (lane + 32 * j);
-            ra[j] = qa0[c];
-            rb[j] = qa0[c + 1];
+            ra[j] = qa[c];
+            rb[j] = qa[c + 1];
             mx = fmaxf(mx, fmaxf(fabsf(ra[j]), fabsf(rb[j])));
         }
         mx = warp_max(mx);
@@ -2011,45 +2019,23 @@ __global__ void __launch_bounds__(256) mla_attn_fdot2_kernel(
             ex = max(-60, min(60, 14 - ex));
         }
         const float f = ldexpf(1.0f, ex);
-        q_scale0 = scale * ldexpf(1.0f, -ex);
+        q_scale[hh] = scale * ldexpf(1.0f, -ex);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) q0[j] = pack_h2_rn(ra[j] * f, rb[j] * f);
+        for (int j = 0; j < 8; ++j) q_reg[hh][j] = pack_h2_rn(ra[j] * f, rb[j] * f);
     }
-    {
-        const float* qa1 = q_abs + ((size_t) t * n_head + h0 + 2 * warp + 1) * KV;
-        float ra[8], rb[8];
-        float mx = 0.0f;
+    float acc0[HG], acc1[HG];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int c = 2 * (lane + 32 * j);
-            ra[j] = qa1[c];
-            rb[j] = qa1[c + 1];
-            mx = fmaxf(mx, fmaxf(fabsf(ra[j]), fabsf(rb[j])));
-        }
-        mx = warp_max(mx);
-        int ex = 0;
-        if (mx > 0.0f && isfinite(mx)) {
-            frexpf(mx, &ex);
-            ex = max(-60, min(60, 14 - ex));
-        }
-        const float f = ldexpf(1.0f, ex);
-        q_scale1 = scale * ldexpf(1.0f, -ex);
-#pragma unroll
-        for (int j = 0; j < 8; ++j) q1[j] = pack_h2_rn(ra[j] * f, rb[j] * f);
-    }
-    float acc0[MB_HG], acc1[MB_HG];
-#pragma unroll
-    for (int hh = 0; hh < MB_HG; ++hh) acc0[hh] = acc1[hh] = 0.0f;
-    if (tid < MB_HG) {
+    for (int hh = 0; hh < HG; ++hh) acc0[hh] = acc1[hh] = 0.0f;
+    if (tid < HG) {
         s_m[tid] = -INFINITY;
         s_l[tid] = 0.0f;
     }
     const uint32_t* sP2 = (const uint32_t*) sP16;
-    for (int s0 = 0; s0 < ns; s0 += MB_CH) {
+    for (int s0 = 0; s0 < ns; s0 += CH) {
         __syncthreads();
-        if (tid < MB_CH) s_cell[tid] = s0 + tid < ns ? cl[s0 + tid] : -1;
+        if (tid < CH) s_cell[tid] = s0 + tid < ns ? cl[s0 + tid] : -1;
         __syncthreads();
-        for (int i = tid; i < MB_CH * (KV / 8); i += blockDim.x) {
+        for (int i = tid; i < CH * (KV / 8); i += blockDim.x) {
             const int s = i / (KV / 8), c8 = i - s * (KV / 8);
             const int cell = s_cell[s];
             ((uint4*) sL)[i] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
@@ -2057,39 +2043,44 @@ __global__ void __launch_bounds__(256) mla_attn_fdot2_kernel(
                                     : ((const uint4*) (lat + (size_t) KV * cell))[c8];
         }
         __syncthreads();
-        for (int s = 0; s < MB_CH; ++s) {
+        for (int s = 0; s < CH; ++s) {
             if (s_cell[s] < 0) {
                 if (lane == 0) {
-                    sP[(2 * warp) * MB_CH + s] = -INFINITY;
-                    sP[(2 * warp + 1) * MB_CH + s] = -INFINITY;
+#pragma unroll
+                    for (int hh = 0; hh < H_PER_WARP; ++hh)
+                        sP[(H_PER_WARP * warp + hh) * CH + s] = -INFINITY;
                 }
                 continue;
             }
-            float a0 = 0.0f, a1 = 0.0f;
+            float a[H_PER_WARP];
+#pragma unroll
+            for (int hh = 0; hh < H_PER_WARP; ++hh) a[hh] = 0.0f;
             const uint32_t* lrow = sL32 + s * (KV / 2) + lane;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const uint32_t lv = lrow[32 * j];
-                a0 = mla_fdot2(q0[j], lv, a0);
-                a1 = mla_fdot2(q1[j], lv, a1);
+#pragma unroll
+                for (int hh = 0; hh < H_PER_WARP; ++hh)
+                    a[hh] = mla_fdot2(q_reg[hh][j], lv, a[hh]);
             }
-            a0 = warp_sum(a0);
-            a1 = warp_sum(a1);
+#pragma unroll
+            for (int hh = 0; hh < H_PER_WARP; ++hh) a[hh] = warp_sum(a[hh]);
             if (lane == 0) {
-                sP[(2 * warp) * MB_CH + s] = a0 * q_scale0;
-                sP[(2 * warp + 1) * MB_CH + s] = a1 * q_scale1;
+#pragma unroll
+                for (int hh = 0; hh < H_PER_WARP; ++hh)
+                    sP[(H_PER_WARP * warp + hh) * CH + s] = a[hh] * q_scale[hh];
             }
         }
         __syncthreads();
 #pragma unroll
-        for (int hh = 0; hh < 2; ++hh) {
-            const int h = 2 * warp + hh;
-            const float v = sP[h * MB_CH + lane];
+        for (int hh = 0; hh < H_PER_WARP; ++hh) {
+            const int h = H_PER_WARP * warp + hh;
+            const float v = (lane < CH) ? sP[h * CH + lane] : -INFINITY;
             const float m_old = s_m[h];
             const float m_new = fmaxf(m_old, warp_max(v));
-            const float e = (v == -INFINITY) ? 0.0f : expf(v - m_new);
+            const float e = (lane < CH && v != -INFINITY) ? expf(v - m_new) : 0.0f;
             const float l = warp_sum(e);
-            sP16[h * MB_CH + lane] = __half_as_ushort(__float2half_rn(e));
+            if (lane < CH) sP16[h * CH + lane] = __half_as_ushort(__float2half_rn(e));
             __syncwarp();
             if (lane == 0) {
                 const float sc = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
@@ -2100,20 +2091,20 @@ __global__ void __launch_bounds__(256) mla_attn_fdot2_kernel(
         }
         __syncthreads();
 #pragma unroll
-        for (int hh = 0; hh < MB_HG; ++hh) {
+        for (int hh = 0; hh < HG; ++hh) {
             const float sc = s_scale[hh];
             acc0[hh] *= sc;
             acc1[hh] *= sc;
         }
-        for (int s2 = 0; s2 < MB_CH / 2; ++s2) {
+        for (int s2 = 0; s2 < CH / 2; ++s2) {
             if (s_cell[2 * s2] < 0 && s_cell[2 * s2 + 1] < 0) continue;
             const uint32_t row_a = sL32[(2 * s2) * (KV / 2) + tid];
             const uint32_t row_b = sL32[(2 * s2 + 1) * (KV / 2) + tid];
             const uint32_t v0 = __byte_perm(row_a, row_b, 0x5410u);
             const uint32_t v1 = __byte_perm(row_a, row_b, 0x7632u);
 #pragma unroll
-            for (int hh = 0; hh < MB_HG; ++hh) {
-                const uint32_t p2 = sP2[hh * (MB_CH / 2) + s2];
+            for (int hh = 0; hh < HG; ++hh) {
+                const uint32_t p2 = sP2[hh * (CH / 2) + s2];
                 acc0[hh] = mla_fdot2(p2, v0, acc0[hh]);
                 acc1[hh] = mla_fdot2(p2, v1, acc1[hh]);
             }
@@ -2121,12 +2112,83 @@ __global__ void __launch_bounds__(256) mla_attn_fdot2_kernel(
     }
     __syncthreads();
 #pragma unroll
-    for (int hh = 0; hh < MB_HG; ++hh) {
+    for (int hh = 0; hh < HG; ++hh) {
         const float L = s_l[hh];
         const float inv = L > 0.0f ? 1.0f / L : 0.0f;
         float* o = ctx + ((size_t) t * n_head + h0 + hh) * KV;
         o[2 * tid] = acc0[hh] * inv;
         o[2 * tid + 1] = acc1[hh] * inv;
+    }
+}
+
+// RDNA 2 v_dot2_f32_f16 DSA indexer score kernel: packs K=32 F32 pairs into FP16x2 in LDS (~16.5 KB).
+// Padded inner dimensions (R+4=132 and TS_P+4=68 u32s) guarantee 16-byte alignment on every uint4 LDS load.
+__global__ void __launch_bounds__(256) dsa_score_fdot2_kernel(
+        const float* __restrict__ iq, const float* __restrict__ pooled, const float* __restrict__ iw,
+        int p0, int kpool, int T, int max_vis, float* __restrict__ score, int score_ld) {
+    constexpr int H = 32, K = 128, R = TS_T * H;   // 128 query rows
+    __shared__ __align__(16) uint32_t As[TS_K / 2][R + 4];
+    __shared__ __align__(16) uint32_t Bs[TS_K / 2][TS_P + 4];
+    __shared__ float red[4][TS_T][TS_P];
+    const int t0 = blockIdx.y * TS_T, pbeg = blockIdx.x * TS_P;
+    const int t_last = min(T, t0 + TS_T) - 1;
+    if (pbeg >= (p0 + t_last + 1) / kpool) return;
+    const int tid = threadIdx.x, ty = tid >> 4, tx = tid & 15;
+    float acc[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TS_K) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int idx = tid + 256 * q, r = idx >> 3, kk = (idx & 7) * 4;
+            const int t = t0 + (r >> 5);
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (t < T) v = *(const float4*) (iq + ((size_t) t * H + (r & 31)) * K + k0 + kk);
+            As[(kk >> 1) + 0][r] = pack_h2_rn(v.x, v.y);
+            As[(kk >> 1) + 1][r] = pack_h2_rn(v.z, v.w);
+        }
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const int idx = tid + 256 * q, pp = idx >> 3, kk = (idx & 7) * 4;
+            const int p = pbeg + pp;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (p < max_vis) v = *(const float4*) (pooled + (size_t) p * K + k0 + kk);
+            Bs[(kk >> 1) + 0][pp] = pack_h2_rn(v.x, v.y);
+            Bs[(kk >> 1) + 1][pp] = pack_h2_rn(v.z, v.w);
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int kk2 = 0; kk2 < TS_K / 2; ++kk2) {
+            const uint4 a0 = *(const uint4*) &As[kk2][ty * 8];
+            const uint4 a1 = *(const uint4*) &As[kk2][ty * 8 + 4];
+            const uint4 b = *(const uint4*) &Bs[kk2][tx * 4];
+            const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const uint32_t bb[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = mla_fdot2(a[i], bb[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    const int tt = ty >> 2, qh = ty & 3, t = t0 + tt;
+    float wv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) wv[i] = t < T ? iw[(size_t) t * H + qh * 8 + i] : 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sum += fmaxf(acc[i][j], 0.0f) * wv[i];
+        red[qh][tt][tx * 4 + j] = sum;
+    }
+    __syncthreads();
+    {
+        const int ot = tid >> 6, op = tid & 63, tok = t0 + ot, p = pbeg + op;
+        if (tok < T && p < (p0 + tok + 1) / kpool)
+            score[(size_t) tok * score_ld + p] = red[0][ot][op] + red[1][ot][op] + red[2][ot][op] + red[3][ot][op];
     }
 }
 
@@ -2387,6 +2449,15 @@ __global__ void swiglu_f16_kernel(const float* __restrict__ gate, const float* _
     h[i] = __float2half((g / (1.0f + expf(-g))) * u);
 }
 
+__global__ void swiglu_f32_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                  float* __restrict__ out, int64_t n, float limit) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = fminf(gate[i], limit);
+    const float u = fminf(fmaxf(up[i], -limit), limit);
+    out[i] = (g / (1.0f + expf(-g))) * u;
+}
+
 // ffn[t] += sum over t's routes j whose sorted row is in [lo, hi) of w[j] * out[row - base] (in route order)
 __global__ void moe_combine_add_kernel(const float* __restrict__ out, int base, int lo, int hi,
                                        const int* __restrict__ pos, const float* __restrict__ w, int k, int E,
@@ -2454,6 +2525,12 @@ void f32_to_f16(const float* src, void* dst, int64_t n, cudaStream_t s) {
     if (n <= 0) return;
     f32_to_f16_kernel<<<nblk(n), 256, 0, s>>>(src, (__half*) dst, n);
     check("f32_to_f16");
+}
+
+void f16_to_f32(const void* src, float* dst, int64_t n, cudaStream_t s) {
+    if (n <= 0) return;
+    f16_to_f32_kernel<<<nblk(n), 256, 0, s>>>((const __half*) src, dst, n);
+    check("f16_to_f32");
 }
 
 void embed_rows(const float* emb, float* R, int T, int n_embd, cudaStream_t s) {
@@ -2652,6 +2729,28 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
             check("dsa_score_tc");
             return;
         }
+    }
+#endif
+#if defined(STRATA_USE_HIP)
+    // MAYA_GLM_DSA_SCORE: default 2 on HIP (v_dot2_f32_f16 on gfx1030/1031/1032, falls back to 1 FP32 tiled); 1 tiled, 0 warp
+    static const bool fdot2 = [] {
+        const char* v = getenv("MAYA_GLM_DSA_SCORE");
+        return v == nullptr || std::atoi(v) == 2;
+    }();
+    if (fdot2 && idx_heads == 32 && key_dim == 128 && mla_fdot2_supported()) {
+        static std::atomic<signed char> logged[64]{};
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
+            signed char expected = 0;
+            if (logged[dev].compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "glm_batch: CUDA%d DSA indexer: RDNA 2 v_dot2_f32_f16 (dsa_score_fdot2; "
+                                     "MAYA_GLM_DSA_SCORE=1 for F32)\n", dev);
+            }
+        }
+        dsa_score_fdot2_kernel<<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + TS_T - 1) / TS_T)),
+                                 256, 0, s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
+        check("dsa_score_fdot2");
+        return;
     }
 #endif
     if (tiled && idx_heads == 32 && key_dim == 128) {
@@ -2887,22 +2986,34 @@ bool mla_fdot2_supported() { return mla_fdot2_arch() == 2; }
 void mla_attn_fdot2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                     int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
     if (T <= 0) return;
-    if (kv_lora != 512 || n_head % MB_HG != 0) {
+    if (kv_lora != 512 || (n_head % 16) != 0) {
         std::fprintf(stderr, "glm_batch mla_attn_fdot2: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
         g_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    static const int cfg_hg = [] {
+        const char* v = getenv("MAYA_GLM_MLA_FDOT2_HG");
+        const int n = v ? std::atoi(v) : 0;
+        return (n == 16 || n == 32) ? n : 0;
+    }();
+    const int hg = (cfg_hg == 16 || (n_head % 32) != 0) ? 16 : 32;
     static std::atomic<signed char> logged[64]{};
     int dev = 0;
     if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
         signed char expected = 0;
         if (logged[dev].compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
-            std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: RDNA 2 v_dot2_f32_f16 (mla_attn_fdot2; "
-                                 "MAYA_GLM_MLA_FDOT2=0 for F32)\n", dev);
+            std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: RDNA 2 v_dot2_f32_f16 "
+                                 "(mla_attn_fdot2<%d, 16>; MAYA_GLM_MLA_FDOT2=0 for F32)\n", dev, hg);
         }
     }
-    const dim3 grid((unsigned) T, (unsigned) (n_head / MB_HG));
-    mla_attn_fdot2_kernel<<<grid, 256, kFdot2Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+    const dim3 grid((unsigned) T, (unsigned) (n_head / hg));
+    const size_t smem = smem_fdot2_bytes(hg, 16);
+    if (hg == 32)
+        mla_attn_fdot2_kernel<32, 16><<<grid, 256, smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx,
+                                                              lat_q8);
+    else
+        mla_attn_fdot2_kernel<16, 16><<<grid, 256, smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx,
+                                                              lat_q8);
     check("mla_attn_fdot2");
 }
 
@@ -3068,6 +3179,12 @@ void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float 
     if (n <= 0) return;
     swiglu_f16_kernel<<<nblk(n), 256, 0, s>>>(gate, up, (__half*) h16, n, limit);
     check("swiglu_f16");
+}
+
+void swiglu_f32(const float* gate, const float* up, float* out, int64_t n, float limit, cudaStream_t s) {
+    if (n <= 0) return;
+    swiglu_f32_kernel<<<nblk(n), 256, 0, s>>>(gate, up, out, n, limit);
+    check("swiglu_f32");
 }
 
 void moe_combine_add(const float* out, int base, int lo, int hi, const int* pos, const float* w, int T, int k, int n_embd,

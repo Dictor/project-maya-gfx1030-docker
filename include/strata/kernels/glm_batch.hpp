@@ -17,6 +17,8 @@ int launch_errors();
 void bf16_to_f32(const uint16_t* src, float* dst, int64_t n, cudaStream_t s);
 /// dst[i] = half(src[i]) (FP16 bits).
 void f32_to_f16(const float* src, void* dst, int64_t n, cudaStream_t s);
+/// dst[i] = float(src[i]) for FP16 bits.
+void f16_to_f32(const void* src, float* dst, int64_t n, cudaStream_t s);
 /// dst[i] = half(src[i]) for BF16 bits (FP16 bits out).
 void bf16_to_f16(const uint16_t* src, void* dst, int64_t n, cudaStream_t s);
 /// R[t][s][e] = emb[t][e] for the 4 streams.
@@ -162,6 +164,8 @@ void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cud
 void swiglu_rows_h16(const float* gu, void* h16, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
 /// The same from separate gate/up arrays, FP16 out.
 void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float limit, cudaStream_t s);
+/// The same from separate gate/up arrays, F32 out (safe in-place when out == gate or out == up).
+void swiglu_f32(const float* gate, const float* up, float* out, int64_t n, float limit, cudaStream_t s);
 /// ffn[t] = sum_j w[t][j] * out[pos[t*k + j]] + sh[t] (plan order, like the one-token combine).
 /// ffn[t] += sum_j w[t][j] * out[pos[t][j] - base] over the routes j of t whose sorted row pos[t][j] is in [lo, hi):
 /// a window of expert rows added as it fills (out holds sorted rows base, base + 1, ...).

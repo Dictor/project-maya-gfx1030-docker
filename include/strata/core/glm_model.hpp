@@ -503,7 +503,8 @@ public:
     const uint8_t* pack_emb_src_ = nullptr;
     int pack_emb_type_ = -1;
     std::vector<uint8_t> pack_emb_copy_;                   // Windows: token_embd once the shard views are gone
-    void pack_release_views();                             // Windows, fast path: unmap the shards after the load
+    std::shared_ptr<std::vector<uint8_t>> pack_emb_shared_; // Linux: RAM copy of token_embd (avoids HDD mmap stalls)
+    void pack_release_views();                             // Windows: unmap shards; Linux: pin token_embd in RAM
 
     // ---- M2b: the device expert pool.  Slots of [gate|up|down] rows (the native blob layout),
     // filled on miss by streaming the rows straight out of the mmap'd shards; LFU-with-aging

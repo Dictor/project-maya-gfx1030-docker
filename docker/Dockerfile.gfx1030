@@ -456,7 +456,7 @@ with tempfile.TemporaryDirectory() as tmpd:
             if spills:
                 max_spill_vgpr = max(spills)
             for kblock in re.split(r"\n\s*-\s+\.", notes):
-                if any(h in kblock for h in ("mv_rdna", "mla_attn_fdot2", "widen_rows_f16", "dw_rdna")):
+                if any(h in kblock for h in ("mv_rdna", "mla_attn_fdot2", "dsa_score_fdot2", "widen_rows_f16", "dw_rdna")):
                     sc = [int(x) for x in re.findall(r"(?:private|scratch)_segment_fixed_size:\s*(\d+)", kblock)]
                     if sc:
                         hot_scratch = max(hot_scratch, max(sc))
@@ -473,6 +473,13 @@ with tempfile.TemporaryDirectory() as tmpd:
         elif obj.name == "glm_batch.cu.o":
             for req in ("v_dot2_f32_f16", "v_permlanex16_b32", "row_xmask"):
                 assert counts[req] > 0, f"Expected {req} > 0 in gfx1030 glm_batch.cu.o: {summary}"
+            fn_blocks = re.split(r"(?=^[0-9a-f]+\s+<[^>]+>:)", dis, flags=re.M)
+            for kname in ("mla_attn_fdot2", "dsa_score_fdot2"):
+                matches = [b for b in fn_blocks if re.match(rf"^[0-9a-f]+\s+<[^>]*{kname}[^>]*>:", b)]
+                assert matches, f"Missing {kname} symbol in gfx1030 glm_batch.cu.o"
+                assert any(re.search(r"v_dot2c?_f32_f16", b) for b in matches), (
+                    f"Expected v_dot2(c)_f32_f16 in gfx1030 {kname}: {summary}"
+                )
 
 pathlib.Path("/out/gfx1030-isa-check.txt").write_text("\n".join(gpu_lines) + "\n", encoding="utf-8")
 print("=== gfx1030 Offload ISA Check PASSED ===")

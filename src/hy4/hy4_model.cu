@@ -14,6 +14,7 @@
 // and logits = rms(hc_head(x)) w . Wout.
 #include "hy4_model.hpp"
 
+#include "hy4_engram_ram.hpp"
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
 #include "hy4_tp.hpp"
@@ -32,6 +33,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -572,9 +574,11 @@ struct Model::Impl {
     float* tp_route2 = nullptr;      // (a staggered chunk's second half's routing, and its counter)
     unsigned* tp_froute2 = nullptr;
     const uint8_t* tok_embd = nullptr;   // (host: the file's rows, decoded a token at a time - tok_row)
+    const Tensor* tok_tensor = nullptr;
     int tok_type = -1;
     size_t tok_ld = 0;
     const uint8_t* eg_table = nullptr;   // (host: the Engram table's F8 rows)
+    const Tensor* eg_tensor = nullptr;
     size_t eg_bytes = 0;
     std::thread eg_populator;            // (its pages mapped in the background)
     int ring = 0;
@@ -625,10 +629,38 @@ struct Model::Impl {
     // BF16 s a row in a file beside it (hy4.txt's engram_scales); the rows' values are then the release's own.  Read
     // from the disk a looked-up row at a time, as the table
     const uint8_t* eg_scale = nullptr;
+    std::string eg_scale_path;
+    size_t eg_scale_bytes = 0, eg_scale_map_bytes = 0;
+    AnonBuf eg_ram_buf, eg_scale_ram_buf, tok_ram_buf;
     float* h_egs = nullptr;              // pinned [modules][Tc][cols]
     std::FILE* eg_dump = nullptr;        // (HY4_EG_DUMP=<file>, tests: every looked-up row - see engram_row)
     std::mutex eg_dump_mu;
     int* h_pos = nullptr;                // pinned [3][Tc]: pos, lo, nk
+
+    void start_eg_populator() {
+        const char* ep = std::getenv("HY4_EG_POPULATE");
+        if (!(ep && std::atoi(ep) != 0) || eg_table == nullptr || eg_bytes == 0 || eg_populator.joinable()) return;
+        // its pages mapped into this process in the background (MADV_POPULATE_READ, else a read a page): a
+        // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
+        // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
+        // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
+        eg_populator = std::thread([this] {
+#if defined(__linux__)
+            (void) nice(10);
+            const size_t pg = 4096, chunk = (size_t) 256 << 20;
+            uint8_t* a = (uint8_t*) ((uintptr_t) eg_table & ~(uintptr_t) (pg - 1));
+            uint8_t* end = (uint8_t*) eg_table + eg_bytes;
+            for (uint8_t* c = a; c < end && !placer_stop.load(); c += chunk) {
+                const size_t n = (size_t) std::min<ptrdiff_t>((ptrdiff_t) chunk, end - c);
+#if defined(MADV_POPULATE_READ)
+                if (madvise(c, n, MADV_POPULATE_READ) == 0) continue;
+#endif
+                volatile uint8_t sink = 0;
+                for (size_t b = 0; b < n; b += pg) sink ^= c[b];
+            }
+#endif
+        });
+    }
 
     ~Impl() {
         if (mtp_crew) mtp_crew->wait();
@@ -653,6 +685,12 @@ struct Model::Impl {
                          100.0 * (double) lc.q4x.load() / std::max(1.0, (double) lc.entries.load()));
         }
         if (eg_populator.joinable()) eg_populator.join();
+        eg_ram_buf.release();
+        eg_scale_ram_buf.release();
+        tok_ram_buf.release();
+        eg_table = nullptr;
+        eg_scale = nullptr;
+        tok_embd = nullptr;
         for (auto& gp : G) {
             cudaSetDevice(gp.dev);
             for (void* p : gp.allocs) cudaFree(p);
@@ -2797,6 +2835,7 @@ struct Model::Impl {
         // the host's parts: the token embeddings and the Engram table, read in place
         const Tensor* te = need("token_embd.weight", err);
         if (!te) return false;
+        tok_tensor = te;
         tok_type = type_id(te->type);
         tok_ld = row_bytes(tok_type, g.n_embd);
         if (!tok_type_ok(tok_type) || tok_ld == 0 || te->n(0) != g.n_embd || te->n(1) < g.n_vocab ||
@@ -2805,6 +2844,13 @@ struct Model::Impl {
             return false;
         }
         tok_embd = pk.data(*te);
+        const int eg_ram_mode = resolve_engram_ram_mode(o.engram_ram);
+        auto push_eg_disk_info = [&] {
+            char buf[200];
+            std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, the table read from the disk a row at a time; "
+                          "norm eps %.9g; row scales %s", pk.eg.modules, (double) eg_eps, eg_scale ? "on" : "none");
+            info.push_back(buf);
+        };
         if (pk.eg.modules > 0) {
             const Tensor* tt = need("per_layer_token_embd.weight", err);
             if (!tt) return false;
@@ -2812,6 +2858,7 @@ struct Model::Impl {
                 err = "per_layer_token_embd: " + tt->type + " (F8_E4M3 rows of the Engram head dim expected)";
                 return false;
             }
+            eg_tensor = tt;
             eg_table = pk.data(*tt);
             eg_bytes = tt->bytes;
             if (pk.has("engram_eps")) eg_eps = (float) pk.num("engram_eps");
@@ -2830,37 +2877,15 @@ struct Model::Impl {
                     err = sp + ": not the Engram table's row scales (BF16, one a row)";
                     return false;
                 }
+                eg_scale_path = sp;
+                eg_scale_bytes = (size_t) tt->n(1) * 2;
+                eg_scale_map_bytes = sz;
                 CK(cudaMallocHost(&h_egs, sizeof(float) * (size_t) pk.eg.modules * Tc * pk.eg.cols()));
             }
             if (const char* ed = std::getenv("HY4_EG_DUMP")) eg_dump = std::fopen(ed, "wb");
-            {
-                char buf[200];
-                std::snprintf(buf, sizeof buf, "INFO Engram: %d layers, the table read from the disk a row at a time; "
-                              "norm eps %.9g; row scales %s", pk.eg.modules, (double) eg_eps, eg_scale ? "on" : "none");
-                info.push_back(buf);
-            }
-            // its pages mapped into this process in the background (MADV_POPULATE_READ, else a read a page): a
-            // window's lookups land on random pages of tens of GB, and each first touch is a page fault - faults that
-            // queue on the process's memory map.  Off unless asked (HY4_EG_POPULATE=1): the table stays on the disk and
-            // a looked-up row's page is read at its first use - Maya never pulls an n-gram table into RAM by itself
-            const char* ep = std::getenv("HY4_EG_POPULATE");
-            if (ep && std::atoi(ep) != 0) {
-                eg_populator = std::thread([this] {
-#if defined(__linux__)
-                    (void) nice(10);
-                    const size_t pg = 4096, chunk = (size_t) 256 << 20;
-                    uint8_t* a = (uint8_t*) ((uintptr_t) eg_table & ~(uintptr_t) (pg - 1));
-                    uint8_t* end = (uint8_t*) eg_table + eg_bytes;
-                    for (uint8_t* c = a; c < end && !placer_stop.load(); c += chunk) {
-                        const size_t n = (size_t) std::min<ptrdiff_t>((ptrdiff_t) chunk, end - c);
-#if defined(MADV_POPULATE_READ)
-                        if (madvise(c, n, MADV_POPULATE_READ) == 0) continue;
-#endif
-                        volatile uint8_t sink = 0;
-                        for (size_t b = 0; b < n; b += pg) sink ^= c[b];
-                    }
-#endif
-                });
+            if (eg_ram_mode == kEgRamOff) {
+                push_eg_disk_info();
+                start_eg_populator();
             }
         }
         // every GPU's layers, a thread a GPU (tensor parallel: every member's slices)
@@ -3147,6 +3172,83 @@ struct Model::Impl {
                 info.push_back(vb);
             }
         }
+        if (pk.eg.modules > 0 && eg_tensor != nullptr && eg_ram_mode > kEgRamOff) {
+            // Sequential Engram (+ row scales + token_embd) load runs only after GPU layers & vision finish
+            // so HDD reads never contend with trunk weight loading, and n_partial is known.
+            if (n_partial == 0) {
+                for (size_t i = 0; i < pk.map.size(); ++i) {
+                    if (pk.map[i] && pk.map_bytes[i] > 0 && pk.files[i].find("mmproj") == std::string::npos)
+                        mm3::os::drop_mapped(pk.map[i], pk.map_bytes[i]);
+                }
+            }
+            const uint64_t need_bytes = (uint64_t) eg_bytes + (uint64_t) eg_scale_bytes +
+                                        (tok_tensor ? (uint64_t) tok_tensor->bytes : 0);
+            double headroom_gb = 4.0;
+            if (const char* hg = std::getenv("HY4_EG_RAM_HEADROOM_GB")) headroom_gb = std::atof(hg);
+            const char* ef = std::getenv("HY4_EG_RAM_FORCE");
+            const bool force_ram = (ef != nullptr && std::atoi(ef) != 0);
+            const uint64_t avail_ram = mm3::os::ram_avail();
+            std::string ram_note;
+            if (!check_engram_ram_budget(need_bytes, avail_ram, headroom_gb, force_ram, ram_note)) {
+                info.push_back("NOTE Engram RAM skipped (" + ram_note + ") - staying on disk mmap");
+                push_eg_disk_info();
+                start_eg_populator();
+            } else {
+                const bool want_lock = (eg_ram_mode == kEgRamLock);
+                double t_eg = 0.0, t_s = 0.0, t_tok = 0.0;
+                std::string eg_note, s_note, tok_note;
+                if (!load_range_to_ram(pk.file_path(eg_tensor->file), eg_tensor->off, eg_bytes, eg_table,
+                                       want_lock, eg_ram_buf, "Engram", eg_note, &t_eg)) {
+                    info.push_back("NOTE Engram RAM load failed (" + eg_note + ") - staying on disk mmap");
+                    push_eg_disk_info();
+                    start_eg_populator();
+                } else {
+                    eg_table = eg_ram_buf.ptr;
+                    if (!eg_note.empty()) info.push_back("NOTE Engram RAM: " + eg_note);
+                    uint64_t total_loaded = eg_bytes;
+                    double total_t = t_eg;
+                    bool scale_in_ram = false;
+                    if (eg_scale != nullptr && eg_scale_bytes > 0) {
+                        const uint8_t* orig_scale = eg_scale;
+                        if (load_range_to_ram(eg_scale_path, 0, eg_scale_bytes, orig_scale, want_lock,
+                                              eg_scale_ram_buf, "engram_scales", s_note, &t_s)) {
+                            mm3::os::drop_mapped(orig_scale, eg_scale_map_bytes);
+                            eg_scale = eg_scale_ram_buf.ptr;
+                            total_loaded += eg_scale_bytes;
+                            total_t += t_s;
+                            scale_in_ram = true;
+                            if (!s_note.empty()) info.push_back("NOTE engram_scales RAM: " + s_note);
+                        } else {
+                            info.push_back("NOTE engram_scales RAM load failed (" + s_note + ") - keeping disk mmap");
+                        }
+                    }
+                    bool tok_in_ram = false;
+                    if (tok_tensor != nullptr && tok_tensor->bytes > 0) {
+                        if (load_range_to_ram(pk.file_path(tok_tensor->file), tok_tensor->off,
+                                              (size_t) tok_tensor->bytes, tok_embd, want_lock, tok_ram_buf,
+                                              "token_embd", tok_note, &t_tok)) {
+                            tok_embd = tok_ram_buf.ptr;
+                            total_loaded += tok_tensor->bytes;
+                            total_t += t_tok;
+                            tok_in_ram = true;
+                            if (!tok_note.empty()) info.push_back("NOTE token_embd RAM: " + tok_note);
+                        } else {
+                            info.push_back("NOTE token_embd RAM load failed (" + tok_note + ") - keeping disk mmap");
+                        }
+                    }
+                    char buf[384];
+                    std::snprintf(buf, sizeof buf,
+                                  "INFO Engram: %d layers, %.2f GB resident in anonymous RAM%s (loaded in %.1f s, "
+                                  "%.0f MB/s; token_embd %s, row scales %s; norm eps %.9g; HY4_EG_RAM=0 for disk mmap)",
+                                  pk.eg.modules, (double) total_loaded / 1e9, eg_ram_buf.locked ? " [mlocked]" : "",
+                                  total_t, ((double) total_loaded / 1e6) / std::max(1e-6, total_t),
+                                  tok_in_ram ? "RAM" : "disk",
+                                  eg_scale ? (scale_in_ram ? "RAM" : "disk") : "none",
+                                  (double) eg_eps);
+                    info.push_back(buf);
+                }
+            }
+        }
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
         // AMD under Windows: the load's legacy-stream work (the counters' and the indexer pools' cudaMemset) finished
         // before any of the non-blocking streams' - nothing orders the two, and Windows' HIP submits queued work only
@@ -3225,6 +3327,18 @@ struct Model::Impl {
         const char* e = std::getenv("HY4_LT");
         return e == nullptr || std::atoi(e) != 0;
     }();
+    const bool lt_env_set = std::getenv("HY4_LT") != nullptr;
+    bool lt_allowed(const Gpu& gp) const {
+        if (!lt_on) return false;
+#if defined(STRATA_USE_HIP)
+        // On gfx103x without explicit HY4_LT=1, skip hipBLASLt when FP16-out prompt GEMMs handle the path
+        // (avoids 64 MiB/GPU unused hipBLASLt workspace allocation and heuristic probes on RDNA2).
+        if (!lt_env_set && k::prompt_f16_enabled(gp.dev)) return false;
+#else
+        (void) gp;
+#endif
+        return true;
+    }
     void prof_report() {
         double all = 0;
         for (const auto& [k2, v] : prof_acc)
@@ -3365,6 +3479,26 @@ struct Model::Impl {
         }
         return iq::mv(jobs.data(), (int) jobs.size(), gp.s);
     }
+    bool hgemm_f16_f32(Gpu& gp, bool transA, int m, int n, int k,
+                       float alpha, const uint16_t* A, int lda, const uint16_t* B, int ldb,
+                       float* C, int ldc) {
+        const float beta = 0.0f;
+        const auto opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+#if defined(STRATA_USE_HIP)
+        if (m > 0 && n > 0 && ldc >= m && ldc <= INT_MAX / 2 && k::prompt_f16_enabled(gp.dev)) {
+            const cublasStatus_t st = cublasGemmEx(gp.blas, opA, CUBLAS_OP_N, m, n, k, &alpha, A, CUDA_R_16F, lda,
+                                                   B, CUDA_R_16F, ldb, &beta, C, CUDA_R_16F, 2 * ldc,
+                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            if (st == CUBLAS_STATUS_SUCCESS) {
+                k::widen_rows_f16(C, m, (size_t) ldc, n, gp.s);
+                return true;
+            }
+        }
+#endif
+        return cublasGemmEx(gp.blas, opA, CUBLAS_OP_N, m, n, k, &alpha, A, CUDA_R_16F, lda,
+                            B, CUDA_R_16F, ldb, &beta, C, CUDA_R_32F, ldc,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+    }
     bool gemm(Gpu& gp, const Mat& M, const float* x, size_t ldx, int T, float* y, size_t ldy, float alpha) {
         const float beta = 0.0f;
         if (M.type == kF32) {
@@ -3381,13 +3515,13 @@ struct Model::Impl {
         if (M.type == kBF16 || M.type == kF16 || !iq::mv_supported(M.type)) return false;
         k::to_f16(x, ldx, T, M.k, gp.xh16, (size_t) M.k, gp.s);
         const int band = (int) std::max<size_t>(1, gp.wband_n / (size_t) M.k);
+        const bool use_lt = lt_allowed(gp);
         for (int r0 = 0; r0 < M.n; r0 += band) {
             const int nb = std::min(band, M.n - r0);
             if (!iq::f16_rows(M.type, M.w + (size_t) r0 * M.ld, M.k, nb, gp.wband, M.k, gp.s)) return false;
-            if (lt_on && alpha == 1.0f && lt::gemm(gp.s, gp.wband, nb, M.k, gp.xh16, M.k, T, y + r0, (int) ldy)) continue;
-            if (cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, nb, T, M.k, &alpha, gp.wband, CUDA_R_16F, M.k, gp.xh16,
-                             CUDA_R_16F, M.k, &beta, y + r0, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            if (use_lt && alpha == 1.0f && lt::gemm(gp.s, gp.wband, nb, M.k, gp.xh16, M.k, T, y + r0, (int) ldy)) continue;
+            if (!hgemm_f16_f32(gp, true, nb, T, M.k, alpha, gp.wband, M.k, gp.xh16, M.k,
+                               y + r0, (int) ldy))
                 return false;
         }
         return true;
@@ -3401,13 +3535,26 @@ struct Model::Impl {
             if (!iq::f16_rows(M.type, M.w, M.k, M.n * H, gp.wband, M.k, gp.s)) return false;
             k::to_f16(x, ldt, T, (int) (ldh * (H - 1) + M.k), gp.xh16, ldt, gp.s);
             const float one = 1.0f, zero = 0.0f;
-            if (lt_on) {   // (AMD: a head a product - false at the first head: the BLAS's batched GEMM for them all)
+            if (lt_allowed(gp)) {   // (AMD: a head a product - false at the first head: the BLAS's batched GEMM for them all)
                 int h = 0;
                 while (h < H && lt::gemm(gp.s, gp.wband + (size_t) h * per, M.n, M.k, gp.xh16 + (size_t) h * ldh, (int) ldt,
                                          T, y + (size_t) h * ldyh, (int) ldyt))
                     ++h;
                 if (h == H) return true;
             }
+#if defined(STRATA_USE_HIP)
+            if (k::prompt_f16_enabled(gp.dev) && M.n > 0 && T > 0 && H > 0 &&
+                ldyh >= (size_t) M.n && ldyt >= (size_t) H * ldyh && ldyt <= (size_t) (INT_MAX / 2)) {
+                const cublasStatus_t st = cublasGemmStridedBatchedEx(
+                    gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &one, gp.wband, CUDA_R_16F, M.k, (long long) per,
+                    gp.xh16, CUDA_R_16F, (int) ldt, (long long) ldh, &zero, y, CUDA_R_16F, (int) (2 * ldyt),
+                    (long long) (2 * ldyh), H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                if (st == CUBLAS_STATUS_SUCCESS) {
+                    k::widen_heads_f16(y, M.n, ldyt, ldyh, T, H, gp.s);
+                    return true;
+                }
+            }
+#endif
             return cublasGemmStridedBatchedEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, M.n, T, M.k, &one, gp.wband,
                                               CUDA_R_16F, M.k, (long long) per, gp.xh16, CUDA_R_16F, (int) ldt,
                                               (long long) ldh, &zero, y, CUDA_R_32F, (int) ldyt, (long long) ldyh, H,
@@ -3488,13 +3635,12 @@ struct Model::Impl {
         }
         k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
         const int ldS = (nkr + 7) / 8 * 8;
-        const float one = 1.0f, zero = 0.0f;
+        const float one = 1.0f;
         const int Tp = W + 1;   // (the profile's names: a prompt step)
+        const bool use_lt = lt_allowed(gp);
         part(gp, "attn: the keys and queries as FP16", Tp);
-        if (!(lt_on && lt::gemm_loose(gp.s, K, nkr, KR, gp.xh16, KR, ts * H, gp.sS, ldS)) &&
-            cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, nkr, ts * H, KR, &one, K, CUDA_R_16F, KR, gp.xh16,
-                         CUDA_R_16F, KR, &zero, gp.sS, CUDA_R_32F, ldS, CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        if (!(use_lt && lt::gemm_loose(gp.s, K, nkr, KR, gp.xh16, KR, ts * H, gp.sS, ldS)) &&
+            !hgemm_f16_f32(gp, true, nkr, ts * H, KR, one, K, KR, gp.xh16, KR, gp.sS, ldS))
             return false;
         part(gp, "attn: scores GEMM", Tp);
         if (!l.swa && !all)
@@ -3504,10 +3650,9 @@ struct Model::Impl {
                         gp.sP, ldS, gp.s);
         part(gp, "attn: mask and softmax", Tp);
         const bool ok =
-            (lt_on && lt::gemm_n(gp.s, K, KR, KL, nkr, gp.sP, ldS, ts * H, gp.o + (size_t) t0 * H * KL, KL, true)) ||
-            cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, nkr, &one, K, CUDA_R_16F, KR, gp.sP, CUDA_R_16F,
-                         ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+            (use_lt && lt::gemm_n(gp.s, K, KR, KL, nkr, gp.sP, ldS, ts * H, gp.o + (size_t) t0 * H * KL, KL, true)) ||
+            hgemm_f16_f32(gp, false, KL, ts * H, nkr, one, K, KR, gp.sP, ldS,
+                          gp.o + (size_t) t0 * H * KL, KL);
         part(gp, "attn: values GEMM", Tp);
         return ok;
     }
@@ -3546,18 +3691,15 @@ struct Model::Impl {
         if (kv_q8) k::kv_deq(l.kv, l.res, KL, g.rope, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1, l.hs());
         else k::kv_gather(l.kv, l.res, KR, 0, rows, gp.kbuf, gp.s, list, KP, (int) k1, l.hs());
         k::to_f16(gp.qcat + (size_t) t0 * H * KR, KR, ts * H, KR, gp.xh16, KR, gp.s);
-        const float one = 1.0f, zero = 0.0f;
-        if (cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, ts * H, KR, &one, gp.kbuf, CUDA_R_16F, KR, gp.xh16,
-                         CUDA_R_16F, KR, &zero, gp.sS, CUDA_R_32F, ldS, CUBLAS_COMPUTE_32F,
-                         CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        const float one = 1.0f;
+        if (!hgemm_f16_f32(gp, true, rows, ts * H, KR, one, gp.kbuf, KR, gp.xh16, KR, gp.sS, ldS))
             return false;
         k::dsa_mask_list(gp.keys + (size_t) t0 * maxk, maxk, gp.knk + t0, ts, col, KP, rows, gp.dmask, (size_t) dense_max,
                          gp.s);
         k::attn_softmax(gp.sS, ldS, ts, H, rows, 0, gp.pos + t0, -1, gp.dmask, (size_t) dense_max, scale, l.sinks, gp.sP,
                         ldS, gp.s);
-        return cublasGemmEx(gp.blas, CUBLAS_OP_N, CUBLAS_OP_N, KL, ts * H, rows, &one, gp.kbuf, CUDA_R_16F, KR, gp.sP,
-                            CUDA_R_16F, ldS, &zero, gp.o + (size_t) t0 * H * KL, CUDA_R_32F, KL, CUBLAS_COMPUTE_32F,
-                            CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+        return hgemm_f16_f32(gp, false, KL, ts * H, rows, one, gp.kbuf, KR, gp.sP, ldS,
+                             gp.o + (size_t) t0 * H * KL, KL);
     }
 
     // A prompt sub-batch's indexer scores (tokens t0 .. t0 + ts - 1 against the pools [0, n_pool)) as GEMMs over slabs
@@ -3574,9 +3716,8 @@ struct Model::Impl {
             const int n = std::min(cap, n_pool - g0), ld = (n + 7) / 8 * 8;
             const bool ok =
                 ix_gemm == 16
-                    ? cublasGemmEx(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, D, &one, pk16 + (size_t) g0 * D,
-                                   CUDA_R_16F, D, gp.xh16, CUDA_R_16F, D, &zero, gp.sS, CUDA_R_32F, ld,
-                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS
+                    ? hgemm_f16_f32(gp, true, n, rows, D, one, pk16 + (size_t) g0 * D, D, gp.xh16, D,
+                                    gp.sS, ld)
                     : cublasSgemm(gp.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, D, &one, l.pooled + (size_t) g0 * D, D, q,
                                   D, &zero, gp.sS, ld) == CUBLAS_STATUS_SUCCESS;
             if (!ok) return false;

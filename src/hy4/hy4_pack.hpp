@@ -246,6 +246,11 @@ struct Pack {
         auto it = t.find(n);
         return it == t.end() ? nullptr : &it->second;
     }
+    std::string file_path(int i) const {
+        if (i < 0 || i >= (int) files.size()) return {};
+        const std::string& fn = files[(size_t) i];
+        return !fn.empty() && fn[0] == '/' ? fn : model_dir + "/" + fn;
+    }
     const uint8_t* data(const Tensor& x) const { return map[(size_t) x.file] + x.off; }
 };
 

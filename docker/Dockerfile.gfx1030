@@ -6,9 +6,10 @@
 #
 # Stage 1 (builder): ubuntu:24.04 + AMD TheRock ROCm 7 wheels (.venv) -> compiles:
 #   - build-hip/maya                (GLM-5.3-Flash HIP engine, gfx1030, STRATA_PORTABLE=ON)
+#   - build-hip/maya-hy4            (Hy4-Flash HIP engine, gfx1030, STRATA_PORTABLE=ON)
 #   - build-vision/bin/maya-vision  (GLM-5.3-Flash HIP gfx1030 + CPU portable AVX2 vision encoder)
 #   - build-vision-cpu/bin/maya-vision (CPU-only portable AVX2 vision encoder, zero ROCm deps)
-#   - GLM HIP parity & benchmark tests -> /opt/maya/tests/
+#   - GLM & Hy4 HIP parity/bench/plan tests -> /opt/maya/tests/
 #   Verifies Haswell AVX2 host portability (zmm == 0 in ggml-cpu/vision/non-dispatched objects)
 #   and gfx1030 AMDGPU offload code object + native ISA (v_dot4_i32_i8) before staging.
 #
@@ -182,6 +183,7 @@ RUN --mount=type=cache,id=project-maya-gfx1030-ccache,target=/root/.cache/ccache
     ccache --zero-stats >/dev/null || true; \
     /opt/build-venv/bin/cmake --build /build-hip --target \
         maya \
+        maya-hy4 \
         hip_intrinsics \
         hip_glm_handoff \
         hip_prefill_mmq_parity \
@@ -191,6 +193,10 @@ RUN --mount=type=cache,id=project-maya-gfx1030-ccache,target=/root/.cache/ccache
         glm_attn_bench \
         glm_layer_parity \
         glm_model_test \
+        hy4_plan_test \
+        hy4_engram_ram_test \
+        hy4_kernels_test \
+        hy4_experts_test \
         -j "$jobs"; \
     ccache --show-stats || true
 
@@ -342,6 +348,42 @@ for ln in r_maya.stdout.splitlines():
     if re.search(r"\bzmm\d+\b", ln) and (cur_sym == "main" or cur_sym.startswith("ggml_")):
         raise AssertionError(f"FAIL: linked /build-hip/maya has zmm in {cur_sym}")
 host_lines.append("maya (linked binary): main and all ggml_* symbols zmm=0 (ok)")
+
+hy4_objs = sorted(pathlib.Path("/build-hip/CMakeFiles/maya-hy4.dir").rglob("*.o"))
+assert hy4_objs, "No object files found under maya-hy4.dir"
+for obj in hy4_objs:
+    if obj.name == "ds4_iq_cpu.cpp.o":
+        bad = check_symbol_scoped_zmm(obj, r"avx512|512|iqx|signs4|sign_bytes|fold|scales4|step_scales|lookup|iq1m|tab4|tab8")
+        assert not bad, "FAIL: unguarded zmm in maya-hy4/ds4_iq_cpu.cpp.o:\n" + "\n".join(bad)
+        host_lines.append(f"maya-hy4/{obj.name}: symbol-scoped AVX-512 only (ok)")
+    elif obj.name == "ds4_gguf_cpu.cpp.o":
+        bad = check_symbol_scoped_zmm(obj, r"avx512|512|mx_avx512")
+        assert not bad, "FAIL: unguarded zmm in maya-hy4/ds4_gguf_cpu.cpp.o:\n" + "\n".join(bad)
+        host_lines.append(f"maya-hy4/{obj.name}: symbol-scoped AVX-512 only (ok)")
+    else:
+        n = count_zmm(obj)
+        host_lines.append(f"maya-hy4/{obj.name}: zmm={n}")
+        assert n == 0, f"FAIL: non-AVX512 TU {obj} contains {n} zmm instructions"
+
+r_hy4 = subprocess.run(["objdump", "-d", "/build-hip/maya-hy4"], capture_output=True, text=True, check=True)
+cur_sym = ""
+for ln in r_hy4.stdout.splitlines():
+    m = re.match(r"^[0-9a-f]+\s+<([^>]+)>:", ln)
+    if m:
+        cur_sym = m.group(1)
+        continue
+    if re.search(r"\bzmm\d+\b", ln) and (cur_sym == "main" or cur_sym.startswith("ggml_")):
+        raise AssertionError(f"FAIL: linked /build-hip/maya-hy4 has zmm in {cur_sym}")
+host_lines.append("maya-hy4 (linked binary): main and all ggml_* symbols zmm=0 (ok)")
+
+subprocess.run(["/build-hip/hy4_plan_test"], check=True)
+host_lines.append("hy4_plan_test: passed (ok)")
+
+n_ram_test_zmm = count_zmm(pathlib.Path("/build-hip/hy4_engram_ram_test"))
+assert n_ram_test_zmm == 0, f"FAIL: hy4_engram_ram_test contains {n_ram_test_zmm} zmm instructions"
+subprocess.run(["/build-hip/hy4_engram_ram_test"], check=True)
+host_lines.append("hy4_engram_ram_test: zmm=0, passed (ok)")
+
 pathlib.Path("/out/host-isa-check.txt").write_text("\n".join(host_lines) + "\n", encoding="utf-8")
 print("=== Host ISA Portability Check PASSED ===")
 print("\n".join(host_lines))
@@ -423,6 +465,9 @@ with tempfile.TemporaryDirectory() as tmpd:
     for obj_rel in (
         "CMakeFiles/strata_kernels.dir/src/kernels/cuda/glm_fast.cu.o",
         "CMakeFiles/strata_kernels.dir/src/kernels/cuda/glm_batch.cu.o",
+        "CMakeFiles/maya-hy4.dir/src/ds4/ds4_iq.cu.o",
+        "CMakeFiles/maya-hy4.dir/src/hy4/hy4_kernels.cu.o",
+        "CMakeFiles/maya-hy4.dir/src/hy4/hy4_vision.cu.o",
     ):
         obj = pathlib.Path("/build-hip") / obj_rel
         assert obj.is_file(), f"Missing HIP object: {obj}"
@@ -456,17 +501,20 @@ with tempfile.TemporaryDirectory() as tmpd:
             if spills:
                 max_spill_vgpr = max(spills)
             for kblock in re.split(r"\n\s*-\s+\.", notes):
-                if any(h in kblock for h in ("mv_rdna", "mla_attn_fdot2", "dsa_score_fdot2", "widen_rows_f16", "dw_rdna")):
+                if any(h in kblock for h in ("mv_rdna", "mla_attn_fdot2", "dsa_score_fdot2", "widen_rows_f16", "widen_heads_f16", "dw_rdna")):
                     sc = [int(x) for x in re.findall(r"(?:private|scratch)_segment_fixed_size:\s*(\d+)", kblock)]
                     if sc:
                         hot_scratch = max(hot_scratch, max(sc))
+        is_glm_core = obj.name in ("glm_fast.cu.o", "glm_batch.cu.o")
         summary = (
             f"{obj.name} [{gfx_tgt}]: bytes={hsaco.stat().st_size} "
             + " ".join(f"{k}={v}" for k, v in counts.items())
-            + f" spill_vgpr_count={max_spill_vgpr} scratch_segment_fixed_size={hot_scratch} swar_vsubss4=0"
+            + f" spill_vgpr_count={max_spill_vgpr} scratch_segment_fixed_size={hot_scratch}"
+            + (" swar_vsubss4=0" if is_glm_core else "")
         )
         gpu_lines.append(summary)
-        assert max_spill_vgpr == 0, f"FAIL: non-zero VGPR spill (spill_vgpr_count={max_spill_vgpr}) in {obj.name}: {summary}"
+        if is_glm_core:
+            assert max_spill_vgpr == 0, f"FAIL: non-zero VGPR spill (spill_vgpr_count={max_spill_vgpr}) in {obj.name}: {summary}"
         if obj.name == "glm_fast.cu.o":
             for req in ("v_dot4_i32_i8", "v_permlanex16_b32", "row_xmask", "s_sleep"):
                 assert counts[req] > 0, f"Expected {req} > 0 in gfx1030 glm_fast.cu.o: {summary}"
@@ -480,6 +528,13 @@ with tempfile.TemporaryDirectory() as tmpd:
                 assert any(re.search(r"v_dot2c?_f32_f16", b) for b in matches), (
                     f"Expected v_dot2(c)_f32_f16 in gfx1030 {kname}: {summary}"
                 )
+        elif obj.name == "ds4_iq.cu.o":
+            assert counts["v_dot4_i32_i8"] > 0, f"Expected v_dot4_i32_i8 > 0 in gfx1030 ds4_iq.cu.o: {summary}"
+        elif obj.name == "hy4_kernels.cu.o":
+            fn_blocks = re.split(r"(?=^[0-9a-f]+\s+<[^>]+>:)", dis, flags=re.M)
+            for kname in ("widen_rows_f16", "widen_heads_f16"):
+                matches = [b for b in fn_blocks if re.match(rf"^[0-9a-f]+\s+<[^>]*{kname}[^>]*>:", b)]
+                assert matches, f"Missing {kname} symbol in gfx1030 hy4_kernels.cu.o"
 
 pathlib.Path("/out/gfx1030-isa-check.txt").write_text("\n".join(gpu_lines) + "\n", encoding="utf-8")
 print("=== gfx1030 Offload ISA Check PASSED ===")
@@ -487,6 +542,7 @@ print("\n".join(gpu_lines))
 
 # 4. Stage compiled binaries into /out/
 shutil.copy2("/build-hip/maya", "/out/bin/maya")
+shutil.copy2("/build-hip/maya-hy4", "/out/bin/maya-hy4")
 shutil.copy2("/build-vision/bin/maya-vision", "/out/vision/maya-vision")
 shutil.copy2("/build-vision-cpu/bin/maya-vision", "/out/vision-cpu/maya-vision")
 for t in (
@@ -499,6 +555,10 @@ for t in (
     "glm_attn_bench",
     "glm_layer_parity",
     "glm_model_test",
+    "hy4_plan_test",
+    "hy4_engram_ram_test",
+    "hy4_kernels_test",
+    "hy4_experts_test",
 ):
     shutil.copy2(f"/build-hip/{t}", f"/out/tests/{t}")
 print("Staged all engine, vision, and test binaries to /out/")
@@ -664,8 +724,9 @@ RUN --mount=type=cache,id=project-maya-gfx1030-pip,target=/root/.cache/pip \
     && /opt/maya/.venv/bin/pip install -r /opt/maya/image/py-packages.txt \
     && /opt/maya/.venv/bin/pip freeze > /opt/maya/image/pip-freeze.txt
 
-# Install compiled GLM engine, portable CPU/HIP vision encoders, HIP parity/bench tests, and build reports
+# Install compiled GLM & Hy4 engines, portable CPU/HIP vision encoders, HIP parity/bench tests, and build reports
 COPY --from=builder /out/bin/maya /opt/maya/build-hip/maya
+COPY --from=builder /out/bin/maya-hy4 /opt/maya/build-hip/maya-hy4
 COPY --from=builder /out/vision/maya-vision /opt/maya/build-vision/bin/maya-vision
 COPY --from=builder /out/vision-cpu/maya-vision /opt/maya/build-vision-cpu/bin/maya-vision
 COPY --from=builder /out/tests/ /opt/maya/tests/
@@ -708,7 +769,7 @@ eng_meta = {
     "llama": llama,
     "lib_dirs": ["/opt/rocm/lib"],
     "date": now,
-    "targets": ["maya"],
+    "targets": ["maya", "maya-hy4"],
 }
 maya.STAMP.write_text(json.dumps(eng_meta, indent=1), encoding="utf-8")
 
@@ -724,9 +785,10 @@ maya.VSTAMP.write_text(json.dumps(vis_meta, indent=1), encoding="utf-8")
 
 # Simulate maya.py build_step / refresh_engine / vision_step up-to-date checks
 assert maya.EXE.is_file(), f"Missing {maya.EXE}"
+assert maya.HY4_EXE.is_file(), f"Missing {maya.HY4_EXE}"
 assert maya.VEXE.is_file(), f"Missing {maya.VEXE}"
 assert eng_meta["backend"] == "hip" and eng_meta["src"] == S.source_hash(S.ENGINE_SOURCES)
-assert "maya" in eng_meta["targets"] and "gfx1030" in eng_meta["archs"]
+assert "maya" in eng_meta["targets"] and "maya-hy4" in eng_meta["targets"] and "gfx1030" in eng_meta["archs"]
 assert vis_meta["src"] == S.source_hash(("tools/vision",)) and "gfx1030" in vis_meta["archs"]
 print(f"Pre-stamped MAYA-BUILD.json OK: engine src={eng_src} archs={archs}; vision src={vis_src}")
 PY
@@ -736,6 +798,7 @@ PY
 RUN set -euo pipefail; \
     for bin in \
         /opt/maya/build-hip/maya \
+        /opt/maya/build-hip/maya-hy4 \
         /opt/maya/build-vision/bin/maya-vision \
         /opt/maya/build-vision-cpu/bin/maya-vision \
         /opt/maya/tests/*; do \
@@ -753,6 +816,9 @@ RUN set -euo pipefail; \
     sh -n /opt/maya/docker/entrypoint-gfx1030.sh; \
     /opt/maya/.venv/bin/python /opt/maya/serve/server.py --help >/dev/null; \
     /opt/maya/.venv/bin/python /opt/maya/tools/iq_pack.py --help >/dev/null; \
+    /opt/maya/.venv/bin/python /opt/maya/tools/hy4/pack_gguf.py --help >/dev/null; \
+    /opt/maya/tests/hy4_plan_test; \
+    /opt/maya/tests/hy4_engram_ram_test; \
     cd /opt/maya && /opt/maya/.venv/bin/python -c 'import sys; sys.path.insert(0, "tools"); import _paths; _paths.add_gguf_py(); import gguf'; \
     test -s /opt/maya/data/expert-profile-glm.bin; \
     test -s /opt/maya/data/glm5-synth.gguf; \

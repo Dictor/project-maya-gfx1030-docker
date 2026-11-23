@@ -962,6 +962,64 @@ void test_kv_streaming() {
         cudaFree(d);
 }
 
+void test_widen_f16() {
+    {
+        const int r0 = 37, cols = 300, ldc = 512, rows = 9;
+        const auto src = randn((size_t) rows * ldc, 3.0f);
+        std::vector<float> init((size_t) rows * ldc);
+        std::vector<float> expect((size_t) rows * ldc);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < ldc; ++c) {
+                const float sentinel = -123.5f - (float) ((r * ldc + c) % 97);
+                init[(size_t) r * ldc + c] = sentinel;
+                expect[(size_t) r * ldc + c] = sentinel;
+            }
+            uint16_t* h = (uint16_t*) (init.data() + (size_t) r * ldc + r0);
+            for (int c = 0; c < cols; ++c) {
+                const __half hv = __float2half_rn(src[(size_t) r * ldc + c]);
+                std::memcpy(h + c, &hv, 2);
+                expect[(size_t) r * ldc + r0 + c] = h2f(hv);
+            }
+        }
+        float* dy = dev(init);
+        hy4::k::widen_rows_f16(dy + r0, cols, (size_t) ldc, rows, 0);
+        const auto got = host(dy, init.size());
+        cudaFree(dy);
+        const bool same = got == expect;
+        std::printf("  widen_rows_f16 (r0=%d, cols=%d, ldc=%d): %s\n", r0, cols, ldc, same ? "exact" : "DIFFERS");
+        CHECK(same);
+    }
+    {
+        const int T = 5, H = 4, cols = 512, ldyh = 576, ldyt = H * ldyh;
+        const auto src = randn((size_t) T * ldyt, 3.0f);
+        std::vector<float> init((size_t) T * ldyt);
+        std::vector<float> expect((size_t) T * ldyt);
+        for (int t = 0; t < T; ++t) {
+            for (int h_idx = 0; h_idx < H; ++h_idx) {
+                const size_t base = (size_t) t * ldyt + (size_t) h_idx * ldyh;
+                for (int c = 0; c < ldyh; ++c) {
+                    const float sentinel = 42.25f + (float) ((t * 17 + h_idx * 31 + c) % 53);
+                    init[base + c] = sentinel;
+                    expect[base + c] = sentinel;
+                }
+                uint16_t* hp = (uint16_t*) (init.data() + base);
+                for (int c = 0; c < cols; ++c) {
+                    const __half hv = __float2half_rn(src[base + c]);
+                    std::memcpy(hp + c, &hv, 2);
+                    expect[base + c] = h2f(hv);
+                }
+            }
+        }
+        float* dy = dev(init);
+        hy4::k::widen_heads_f16(dy, cols, (size_t) ldyt, (size_t) ldyh, T, H, 0);
+        const auto got = host(dy, init.size());
+        cudaFree(dy);
+        const bool same = got == expect;
+        std::printf("  widen_heads_f16 (T=%d, H=%d, cols=%d/%d): %s\n", T, H, cols, ldyh, same ? "exact" : "DIFFERS");
+        CHECK(same);
+    }
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -975,6 +1033,7 @@ int main() {
     test_indexer();
     test_engram();
     test_row_top();
+    test_widen_f16();
     CHECK(hy4::k::errors() == 0);
     std::printf("hy4_kernels_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

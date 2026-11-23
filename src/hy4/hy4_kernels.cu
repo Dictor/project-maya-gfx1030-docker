@@ -14,6 +14,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace hy4::k {
 
@@ -1328,6 +1329,36 @@ inline bool f16_rows_form(const void* src, size_t lds, const void* dst, size_t l
     return false;
 #endif
 }
+// FP16 -> FP32 in-place row widening for FP16-output prompt GEMMs: reads halves from the back in 256-value blocks.
+__global__ void __launch_bounds__(256) widen_rows_f16_kernel(float* y0, int cols, size_t ldc, int rows) {
+    for (int r = (int) blockIdx.x; r < rows; r += (int) gridDim.x) {
+        float* y = y0 + (size_t) r * ldc;
+        const uint16_t* h = (const uint16_t*) y;
+        const int nb = (cols + 255) / 256;
+        for (int b = nb - 1; b >= 0; --b) {
+            const int c = b * 256 + (int) threadIdx.x;
+            const float v = c < cols ? __half2float(__ushort_as_half(h[c])) : 0.0f;
+            __syncthreads();
+            if (c < cols) y[c] = v;
+            __syncthreads();
+        }
+    }
+}
+__global__ void __launch_bounds__(256) widen_heads_f16_kernel(float* y0, int cols, size_t ldyt, size_t ldyh, int T) {
+    const int h_idx = (int) blockIdx.y;
+    for (int t = (int) blockIdx.x; t < T; t += (int) gridDim.x) {
+        float* y = y0 + (size_t) t * ldyt + (size_t) h_idx * ldyh;
+        const uint16_t* h = (const uint16_t*) y;
+        const int nb = (cols + 255) / 256;
+        for (int b = nb - 1; b >= 0; --b) {
+            const int c = b * 256 + (int) threadIdx.x;
+            const float v = c < cols ? __half2float(__ushort_as_half(h[c])) : 0.0f;
+            __syncthreads();
+            if (c < cols) y[c] = v;
+            __syncthreads();
+        }
+    }
+}
 // one block: the counts, their scan, the scatter (the order within an expert does not change a row's sums)
 __global__ void __launch_bounds__(1024) moe_sort_kernel(const int* __restrict__ ids, int n_ent, int n_exp,
                                                         int* __restrict__ bounds, int* __restrict__ tok,
@@ -2251,6 +2282,48 @@ void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t
     }
     to_f16_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(src, lds, n, (__half*) dst, ldd, total);
     check("to_f16");
+}
+void widen_rows_f16(float* dst, int cols, size_t ldc, int rows, cudaStream_t s) {
+    if (cols <= 0 || rows <= 0) return;
+    widen_rows_f16_kernel<<<(unsigned) std::min(rows, 65535), 256, 0, s>>>(dst, cols, ldc, rows);
+    check("widen_rows_f16");
+}
+void widen_heads_f16(float* dst, int cols, size_t ldyt, size_t ldyh, int T, int H, cudaStream_t s) {
+    if (cols <= 0 || T <= 0 || H <= 0) return;
+    const dim3 g((unsigned) std::min(T, 65535), (unsigned) H);
+    widen_heads_f16_kernel<<<g, 256, 0, s>>>(dst, cols, ldyt, ldyh, T);
+    check("widen_heads_f16");
+}
+bool prompt_f16_enabled(int dev) {
+#if defined(STRATA_USE_HIP)
+    static const int env_mode = [] {
+        const char* v = std::getenv("HY4_PROMPT_F16");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    if (env_mode == 0) return false;
+    if (dev < 0 || dev >= 64) return env_mode == 1;
+    static std::atomic<signed char> known[64]{};   // 0: unknown, 1: no, 2: yes
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp prop{};
+        const bool got_prop = cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+        const bool is_gfx103 = got_prop && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0;
+        const bool on = env_mode == 1 || is_gfx103;
+        v = on ? 2 : 1;
+        signed char expected = 0;
+        if (known[dev].compare_exchange_strong(expected, (signed char) v, std::memory_order_relaxed) && on) {
+            std::fprintf(stderr,
+                         "hy4 prefill: GPU %d (%s): FP16-out prompt GEMMs on (%s; not bit-identical, HY4_PROMPT_F16=0 to disable)\n",
+                         dev, got_prop ? prop.gcnArchName : "unknown",
+                         env_mode == 1 ? "HY4_PROMPT_F16=1" : "RDNA 2 default");
+        }
+    }
+    return v == 2;
+#else
+    (void) dev;
+    return false;
+#endif
 }
 void moe_sort(const int* ids, int T, int n_used, int n_exp, int* bounds, int* tok, int* row_of, cudaStream_t s,
               const int* slot, float* w, int n_slots) {

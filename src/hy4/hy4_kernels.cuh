@@ -185,6 +185,13 @@ void dsa_mask_list(const int* keys, int ldk, const int* nk, int T, const int* co
                    size_t ldm, cudaStream_t s);
 /// The prompt path.  dst[r][i] = F16(src[r * lds + i]), i < n
 void to_f16(const float* src, size_t lds, int rows, int n, uint16_t* dst, size_t ldd, cudaStream_t s);
+/// In-place FP16 -> FP32 widening for FP16-output prompt GEMMs (each row's first `cols` halves in `dst + r * ldc`
+/// widened from the back to float).
+void widen_rows_f16(float* dst, int cols, size_t ldc, int rows, cudaStream_t s);
+/// Strided-batched variant for [T][H][cols] head outputs (`dst + t * ldyt + h * ldyh`).
+void widen_heads_f16(float* dst, int cols, size_t ldyt, size_t ldyh, int T, int H, cudaStream_t s);
+/// Whether FP16-output prompt GEMMs are enabled on HIP device `dev` (HY4_PROMPT_F16=1/0; unset: default ON on gfx103x).
+bool prompt_f16_enabled(int dev);
 /// dst[i] = the F32 of BF16 src[i] (exact), n values
 void bf16_to_f32(const uint16_t* src, float* dst, size_t n, cudaStream_t s);
 /// A chunk's expert entries sorted by expert for ds4_iq's sets: entry e = t n_used + j of ids; bounds[x .. x + 1] the

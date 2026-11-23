@@ -2,7 +2,7 @@
 //
 //   maya-hy4 --pack <model>/maya-hy4 --serve [--gpus 0,1,...] [--max-context N] [--chunk N] [--eos id,id,...]
 //            [--mtp | --dfly2 [--draft N] [--draft-floor P]] [--vram-experts F] [--cpu-threads N] [--profile F] [--profile-out F]
-//            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8]
+//            [--tp N|auto] [--main-gpu I] [--vision on|off] [--kv auto|f16|q8] [--engram-ram off|on|lock]
 //            [--kv-streaming on|off|auto] [--kv-resident N]
 //
 // --kv: the latent cache's rows - F16, or q8: the latent's 512 values int8 in blocks of 32 with an F16 scale, the
@@ -81,6 +81,7 @@
 
 #include "hy4_kernels.cuh"
 #include "hy4_lane.hpp"
+#include "hy4_engram_ram.hpp"
 #include "hy4_model.hpp"
 #include "hy4_pack.hpp"
 #include "mm3_os.hpp"
@@ -1213,6 +1214,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.kv = v == "auto" ? -1 : v == "q8" ? 1 : 0;
+        }
+        else if (a == "--engram-ram") {
+            const std::string v = next();
+            const int mode = hy4::parse_engram_ram_mode(v.c_str());
+            if (mode < 0) {
+                std::fprintf(stderr, "--engram-ram: off, on or lock\n");
+                return 2;
+            }
+            o.engram_ram = mode;
         }
         else if (a == "--encode-image") enc_rgb = next();
         else if (a == "--size") enc_size = next();

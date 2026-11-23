@@ -56,6 +56,11 @@ export MAYA_GLM_EMB_RAM="${MAYA_GLM_EMB_RAM:-1}"
 export MAYA_GLM_DENSE_MMQ="${MAYA_GLM_DENSE_MMQ:-1}"
 export MAYA_GLM_BF16_F16="${MAYA_GLM_BF16_F16:-1}"
 
+# Hy4-Flash (maya-hy4) RDNA2 (gfx1030) defaults (overridable via -e)
+export HY4_PROMPT_F16="${HY4_PROMPT_F16:-1}"
+export HY4_EG_RAM="${HY4_EG_RAM:-0}"
+export HY4_EG_POPULATE="${HY4_EG_POPULATE:-0}"
+
 PYBIN="/opt/maya/.venv/bin/python"
 SERVER="/opt/maya/serve/server.py"
 HOST="${MAYA_HOST:-${HOST:-0.0.0.0}}"
@@ -124,7 +129,7 @@ if [ -n "${MAYA_CONFIG:-}" ]; then
 elif [ -n "${MAYA_PACK:-}" ] || [ -n "${MAYA_GGUF:-}" ] || [ -n "${MAYA_GGUF_DIR:-}" ]; then
   mkdir -p "$DATA_DIR"
   CFG="$("$PYBIN" - <<'PYEOF'
-import json, os, pathlib, re, shutil, subprocess, sys
+import importlib.util, json, os, pathlib, re, shutil, subprocess, sys
 
 sys.path.insert(0, "/opt/maya/tools")
 import maya_quants as Q
@@ -133,6 +138,250 @@ data_dir = pathlib.Path(os.environ.get("MAYA_DATA") or "/data")
 pack_env = (os.environ.get("MAYA_PACK") or "").strip()
 gguf_env = (os.environ.get("MAYA_GGUF") or "").strip()
 gguf_dir_env = (os.environ.get("MAYA_GGUF_DIR") or "").strip()
+engine_env = (os.environ.get("MAYA_ENGINE") or "").strip().lower()
+
+_hy4_pack_mod = None
+def _hy4_pack():
+    global _hy4_pack_mod
+    if _hy4_pack_mod is None:
+        spec = importlib.util.spec_from_file_location("hy4_pack_gguf", "/opt/maya/tools/hy4/pack_gguf.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _hy4_pack_mod = mod
+    return _hy4_pack_mod
+
+def inspect_gguf(path: pathlib.Path):
+    try:
+        g = _hy4_pack().Gguf(path)
+        return g.kv.get("general.architecture"), g.kv.get("general.type"), g.kv.get("split.index")
+    except (Exception, SystemExit):
+        return None, None, None
+
+def slug_for(path: pathlib.Path) -> str:
+    stem = re.sub(r"-00001-of-\d+$", "", path.stem if path.suffix else path.name, flags=re.I)
+    return re.sub(r"[^a-z0-9._-]+", "-", stem.lower()).strip("-") or "maya-model"
+
+def detect_family() -> str:
+    if engine_env in ("hy4", "glm"):
+        return engine_env
+    if pack_env:
+        p = pathlib.Path(pack_env)
+        if (p / "hy4.txt").is_file() or (p / "maya-hy4" / "hy4.txt").is_file():
+            return "hy4"
+        if (p / "index.txt").is_file():
+            return "glm"
+    if gguf_env:
+        p = pathlib.Path(gguf_env)
+        if p.is_file():
+            arch, _, _ = inspect_gguf(p)
+            if arch == "hy_v4_flash":
+                return "hy4"
+    if gguf_dir_env:
+        d = pathlib.Path(gguf_dir_env)
+        if d.is_dir():
+            for f in sorted(d.glob("*.gguf")):
+                if f.is_file():
+                    arch, _, _ = inspect_gguf(f)
+                    if arch == "hy_v4_flash":
+                        return "hy4"
+    return "glm"
+
+def link_into(src: pathlib.Path, dst_dir: pathlib.Path, required_desc: str = "file"):
+    link_path = dst_dir / src.name
+    if link_path.is_symlink():
+        if os.readlink(link_path) != str(src):
+            try:
+                link_path.unlink()
+                os.symlink(str(src), str(link_path))
+            except OSError as exc:
+                sys.exit(f"[maya-gfx1030] ERROR: cannot update {required_desc} symlink {link_path} -> {src}: {exc}")
+    elif not link_path.exists():
+        try:
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            os.symlink(str(src), str(link_path))
+        except OSError as exc:
+            if not (pack_env and (dst_dir / src.name).is_file()):
+                sys.exit(f"[maya-gfx1030] ERROR: cannot place {required_desc} {link_path} -> {src}: {exc}")
+
+gpus_raw = (os.environ.get("MAYA_GPUS") or "0,1").strip()
+gpus = [int(x.strip()) for x in gpus_raw.split(",") if x.strip()]
+ctx = int(os.environ.get("MAYA_CONTEXT") or "32768")
+kv_fmt = (os.environ.get("MAYA_KV") or "").strip()
+port = int(os.environ.get("MAYA_PORT") or os.environ.get("PORT") or "8080")
+host = (os.environ.get("MAYA_HOST") or os.environ.get("HOST") or "0.0.0.0").strip()
+
+family = detect_family()
+
+if family == "hy4":
+    src_dir = None
+    if gguf_dir_env:
+        d = pathlib.Path(gguf_dir_env)
+        if not d.is_dir():
+            sys.exit(f"[maya-gfx1030] ERROR: MAYA_GGUF_DIR='{d}' is not a directory.")
+        src_dir = d
+    elif gguf_env:
+        p = pathlib.Path(gguf_env)
+        if not p.is_file():
+            sys.exit(f"[maya-gfx1030] ERROR: MAYA_GGUF='{p}' does not exist.")
+        src_dir = p.parent
+
+    if pack_env:
+        p = pathlib.Path(pack_env)
+        if (p / "maya-hy4" / "hy4.txt").is_file() or (not (p / "hy4.txt").is_file() and src_dir is not None and p.name != "maya-hy4"):
+            model_dir = p
+            pack_dir = p / "maya-hy4"
+        else:
+            pack_dir = p
+            model_dir = p.parent
+        tag = slug_for(model_dir if pack_dir.name == "maya-hy4" and model_dir.name else pack_dir)
+    elif src_dir is not None:
+        trunk = None
+        for f in sorted(src_dir.glob("*.gguf")):
+            if not f.is_file():
+                continue
+            arch, kind, split_idx = inspect_gguf(f)
+            if arch == "hy_v4_flash" and kind in (None, "model") and "engram" not in f.name.lower():
+                if split_idx == 0 or "-00001-of-" in f.name or trunk is None:
+                    trunk = f
+                    if split_idx == 0 or "-00001-of-" in f.name:
+                        break
+        tag = slug_for(trunk if trunk is not None else src_dir)
+        model_dir = data_dir / "pack" / tag
+        pack_dir = model_dir / "maya-hy4"
+    else:
+        sys.exit("[maya-gfx1030] ERROR: set MAYA_CONFIG, MAYA_PACK, MAYA_GGUF, or MAYA_GGUF_DIR.")
+
+    ancestor = model_dir
+    while not ancestor.exists() and ancestor != ancestor.parent:
+        ancestor = ancestor.parent
+    can_write_model_dir = os.access(ancestor, os.W_OK)
+    if can_write_model_dir:
+        model_dir.mkdir(parents=True, exist_ok=True)
+    if src_dir is not None and (can_write_model_dir or not pack_env):
+        for f in sorted(src_dir.iterdir()):
+            if f.is_file() and (f.suffix in (".gguf", ".dfly2") or "scales" in f.name.lower()):
+                link_into(f, model_dir, "hy4 file")
+    for extra_var in ("MAYA_HY4_ENGRAM", "MAYA_HY4_MTP", "MAYA_HY4_MMPROJ", "MAYA_HY4_DRAFTER"):
+        val = (os.environ.get(extra_var) or "").strip()
+        if val:
+            ep = pathlib.Path(val)
+            if not ep.is_file():
+                sys.exit(f"[maya-gfx1030] ERROR: {extra_var}='{ep}' does not exist.")
+            if can_write_model_dir or not pack_env:
+                link_into(ep, model_dir, extra_var)
+
+    need_hy4 = [
+        pack_dir / "hy4.txt",
+        pack_dir / "tensors.txt",
+        pack_dir / "tokenizer" / "vocab.json",
+    ]
+    if not all(p.is_file() for p in need_hy4):
+        if src_dir is None and not any(model_dir.glob("*.gguf")):
+            sys.exit(f"[maya-gfx1030] ERROR: incomplete hy4 pack at '{pack_dir}' and no MAYA_GGUF/MAYA_GGUF_DIR provided.")
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[maya-gfx1030] Indexing Hy4-Flash pack into {pack_dir} from {model_dir} ...", file=sys.stderr, flush=True)
+        subprocess.run(
+            [
+                "/opt/maya/.venv/bin/python",
+                "/opt/maya/tools/hy4/pack_gguf.py",
+                "--model", str(model_dir),
+                "--out", str(pack_dir),
+            ],
+            check=True,
+            stdout=sys.stderr,
+        )
+
+    hy4_meta = {}
+    for line in (pack_dir / "hy4.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+        k, _, v = line.strip().partition(" ")
+        if k:
+            hy4_meta[k] = v.strip()
+
+    has_mtp = int(float(hy4_meta.get("n_mtp") or "0")) >= 1
+    has_dfly2 = int(float(hy4_meta.get("dfly_layers") or "0")) >= 1
+    has_vision = "vision.dim" in hy4_meta
+
+    hy4_tp = (os.environ.get("MAYA_HY4_TP") or "auto").strip()
+    hy4_reserve = (os.environ.get("MAYA_HY4_RESERVE_GB") or "0.7").strip()
+    hy4_kv_stream = (os.environ.get("MAYA_HY4_KV_STREAMING") or "auto").strip().lower()
+    if hy4_kv_stream not in ("auto", "on", "off"):
+        sys.exit(f"[maya-gfx1030] ERROR: MAYA_HY4_KV_STREAMING='{hy4_kv_stream}' must be auto, on, or off.")
+    hy4_draft = (os.environ.get("MAYA_HY4_DRAFT") or "auto").strip().lower()
+    hy4_vision = (os.environ.get("MAYA_HY4_VISION") or "auto").strip().lower()
+
+    args = [
+        "--pack", str(pack_dir),
+        "--max-context", str(ctx),
+        "--tp", hy4_tp,
+        "--reserve-gb", hy4_reserve,
+        "--kv-streaming", hy4_kv_stream,
+    ]
+    if kv_fmt:
+        if kv_fmt.lower() in ("auto", "f16", "q8"):
+            args += ["--kv", kv_fmt.lower()]
+        else:
+            print(f"[maya-gfx1030] WARNING: ignoring GLM-only MAYA_KV='{kv_fmt}' for Hy4-Flash (supported: auto, f16, q8).",
+                  file=sys.stderr, flush=True)
+
+    if hy4_draft in ("mtp",) or (hy4_draft == "auto" and has_mtp):
+        args.append("--mtp")
+    elif hy4_draft in ("dfly2",) or (hy4_draft == "auto" and not has_mtp and has_dfly2 and len(gpus) <= 1):
+        args.append("--dfly2")
+    elif hy4_draft not in ("auto", "off", "none", "0", "false"):
+        sys.exit(f"[maya-gfx1030] ERROR: MAYA_HY4_DRAFT='{hy4_draft}' must be auto, mtp, dfly2, or off.")
+
+    if has_vision and hy4_vision in ("off", "0", "false", "no"):
+        args += ["--vision", "off"]
+
+    for env_k, flag in (
+        ("MAYA_HY4_CHUNK", "--chunk"),
+        ("MAYA_HY4_CPU_THREADS", "--cpu-threads"),
+        ("MAYA_HY4_VRAM_EXPERTS", "--vram-experts"),
+    ):
+        val = (os.environ.get(env_k) or "").strip()
+        if val:
+            args += [flag, val]
+
+    hy4_eg_ram_cfg = (os.environ.get("MAYA_HY4_ENGRAM_RAM") or "").strip().lower()
+    if hy4_eg_ram_cfg:
+        if hy4_eg_ram_cfg in ("0", "off", "false", "no"):
+            args += ["--engram-ram", "off"]
+        elif hy4_eg_ram_cfg in ("1", "on", "true", "yes", "ram"):
+            args += ["--engram-ram", "on"]
+        elif hy4_eg_ram_cfg in ("2", "lock", "mlock"):
+            args += ["--engram-ram", "lock"]
+        else:
+            sys.exit(f"[maya-gfx1030] ERROR: MAYA_HY4_ENGRAM_RAM='{hy4_eg_ram_cfg}' must be off, on, or lock.")
+
+    learned_profile = pack_dir / "expert-profile.bin"
+    if learned_profile.is_file():
+        args += ["--profile", str(learned_profile)]
+    if os.access(pack_dir, os.W_OK):
+        args += ["--profile-out", str(learned_profile)]
+
+    sampling, effort = Q.MODEL_DEFAULTS["hy4"]
+    cfg = {
+        "exe": "/opt/maya/build-hip/maya-hy4",
+        "backend": "hip",
+        "args": args,
+        "cwd": "/opt/maya",
+        "tokenizer": str(pack_dir / "tokenizer"),
+        "model_name": "hy4-flash",
+        "gpu": gpus,
+        "sampling": dict(sampling),
+        "reasoning_effort": effort,
+        "lib_dirs": ["/opt/rocm/lib"],
+        "host": host,
+        "port": port,
+        "log": str(data_dir / f"maya-{tag}-hip.log"),
+        "installer": {"family": "hy4"},
+        # Keep env empty so container -e HY4_* overrides remain active without JSON shadowing
+        "env": {},
+    }
+    cfg_path = data_dir / f"maya-{tag}-hip.json"
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    print(str(cfg_path))
+    sys.exit(0)
 
 def find_first_gguf() -> pathlib.Path | None:
     if gguf_env:
@@ -170,10 +419,6 @@ def resolve_shards(first: pathlib.Path) -> list[pathlib.Path]:
     if missing:
         sys.exit(f"[maya-gfx1030] ERROR: missing model shard(s): {', '.join(missing)}")
     return shards
-
-def slug_for(path: pathlib.Path) -> str:
-    stem = re.sub(r"-00001-of-\d+$", "", path.stem, flags=re.I)
-    return re.sub(r"[^a-z0-9._-]+", "-", stem.lower()).strip("-") or "glm5-flash"
 
 gguf_first = find_first_gguf()
 if pack_env:
@@ -242,14 +487,8 @@ tmpl_src = pathlib.Path("/opt/maya/serve/glm5_chat_template.jinja")
 if not tmpl_dst.is_file() and tmpl_src.is_file() and os.access(tmpl_dst.parent, os.W_OK):
     shutil.copyfile(tmpl_src, tmpl_dst)
 
-gpus_raw = (os.environ.get("MAYA_GPUS") or "0,1").strip()
-gpus = [int(x.strip()) for x in gpus_raw.split(",") if x.strip()]
-ctx = int(os.environ.get("MAYA_CONTEXT") or "32768")
 kv_stream = (os.environ.get("MAYA_KV_STREAMING") or "on").strip()
-kv_fmt = (os.environ.get("MAYA_KV") or "").strip()
 layer_split = (os.environ.get("MAYA_LAYER_SPLIT") or "auto").strip()
-port = int(os.environ.get("MAYA_PORT") or os.environ.get("PORT") or "8080")
-host = (os.environ.get("MAYA_HOST") or os.environ.get("HOST") or "0.0.0.0").strip()
 
 args = [
     "--glm-pack", str(pack_dir),
@@ -333,16 +572,22 @@ if [ -z "$CFG" ]; then
   cat >&2 <<'EOF'
 [maya-gfx1030] No model config or GGUF source specified.
   Examples:
-    - Existing config: -e MAYA_CONFIG=/data/maya-maya-s-hip.json
-    - Auto-pack GGUF:  -e MAYA_GGUF_DIR=/models/Maya-S-v2-IQ2_XXS -v /mnt/diskX/models:/models:ro -v /mnt/user/appdata/maya:/data
-    - Direct server:   docker run ... <image> /opt/maya/.venv/bin/python /opt/maya/serve/server.py --engine maya --config /data/cfg.json --host 0.0.0.0 --port 8080
-    - Run HIP tests:   docker run ... <image> /opt/maya/tests/hip_intrinsics
+    - Existing config:       -e MAYA_CONFIG=/data/maya-maya-s-hip.json
+    - Auto-pack GLM GGUF:    -e MAYA_GGUF_DIR=/models/Maya-S-v2-IQ2_XXS -v /mnt/diskX/models:/models:ro -v /mnt/user/appdata/maya:/data
+    - Auto-pack Hy4 GGUF:    -e MAYA_GGUF_DIR=/models/Hy4-Flash-Maya-S -v /mnt/diskX/models:/models:ro -v /mnt/user/appdata/maya:/data
+    - Direct server:         docker run ... <image> /opt/maya/.venv/bin/python /opt/maya/serve/server.py --engine maya --config /data/cfg.json --host 0.0.0.0 --port 8080
+    - Run HIP tests:         docker run ... <image> /opt/maya/tests/hip_intrinsics
 EOF
   exec "$PYBIN" "$SERVER" --help
 fi
 
-echo "[maya-gfx1030] Starting Project Maya (GLM-5.3-Flash, gfx1030) with config: $CFG"
-echo "[maya-gfx1030] Defaults: RESERVE_MB=$MAYA_GLM_RESERVE_MB PIN_PIECE_MB=$MAYA_GLM_PIN_PIECE_MB RAM_RESIDENT=$MAYA_GLM_RAM_RESIDENT EMB_RAM=$MAYA_GLM_EMB_RAM PREFILL_MIN_CHUNKS=$MAYA_GLM_PREFILL_MIN_CHUNKS PREFILL_SUB=$MAYA_GLM_PREFILL_SUB PREFILL_MB=$MAYA_GLM_PREFILL_MB PF_CE=$MAYA_GLM_PF_CE PROMPT_F16=$MAYA_GLM_PROMPT_F16 MLA_FDOT2=$MAYA_GLM_MLA_FDOT2 MV_RDNA=$MAYA_GLM_MV_RDNA DENSE_MMQ=$MAYA_GLM_DENSE_MMQ BF16_F16=$MAYA_GLM_BF16_F16"
+if grep -q 'maya-hy4' "$CFG"; then
+  echo "[maya-gfx1030] Starting Project Maya (Hy4-Flash, gfx1030) with config: $CFG"
+  echo "[maya-gfx1030] Hy4 Defaults: HY4_PROMPT_F16=$HY4_PROMPT_F16 HY4_EG_RAM=$HY4_EG_RAM HY4_EG_POPULATE=$HY4_EG_POPULATE"
+else
+  echo "[maya-gfx1030] Starting Project Maya (GLM-5.3-Flash, gfx1030) with config: $CFG"
+  echo "[maya-gfx1030] Defaults: RESERVE_MB=$MAYA_GLM_RESERVE_MB PIN_PIECE_MB=$MAYA_GLM_PIN_PIECE_MB RAM_RESIDENT=$MAYA_GLM_RAM_RESIDENT EMB_RAM=$MAYA_GLM_EMB_RAM PREFILL_MIN_CHUNKS=$MAYA_GLM_PREFILL_MIN_CHUNKS PREFILL_SUB=$MAYA_GLM_PREFILL_SUB PREFILL_MB=$MAYA_GLM_PREFILL_MB PF_CE=$MAYA_GLM_PF_CE PROMPT_F16=$MAYA_GLM_PROMPT_F16 MLA_FDOT2=$MAYA_GLM_MLA_FDOT2 MV_RDNA=$MAYA_GLM_MV_RDNA DENSE_MMQ=$MAYA_GLM_DENSE_MMQ BF16_F16=$MAYA_GLM_BF16_F16"
+fi
 
 set -- --engine maya --config "$CFG" --host "$HOST" --port "$PORT"
 if [ -n "${MAYA_GPUS:-}" ]; then
@@ -350,5 +595,9 @@ if [ -n "${MAYA_GPUS:-}" ]; then
 fi
 if [ -n "${MAYA_API_KEY:-}" ]; then
   set -- "$@" --api-key "$MAYA_API_KEY"
+fi
+if [ "${MAYA_DRY_RUN:-0}" = "1" ]; then
+  echo "[maya-gfx1030] DRY_RUN config=$CFG"
+  exit 0
 fi
 exec "$PYBIN" "$SERVER" "$@"

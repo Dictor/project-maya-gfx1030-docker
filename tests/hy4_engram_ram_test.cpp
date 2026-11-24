@@ -118,6 +118,74 @@ int main() {
     lock_buf.release();
     (void) std::remove(tmp_path.c_str());
 
+    // 6. load_spans_to_ram: multi-file sorting, contiguous pread coalescing, non-contiguous gaps & keep_writable
+    const size_t f0_size = size_t{9} * 1024 * 1024 + 4096;
+    const size_t f1_size = size_t{5} * 1024 * 1024 + 8192;
+    std::vector<uint8_t> d0(f0_size), d1(f1_size);
+    for (size_t i = 0; i < f0_size; ++i) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        d0[i] = (uint8_t) (rng >> 56);
+    }
+    for (size_t i = 0; i < f1_size; ++i) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        d1[i] = (uint8_t) (rng >> 56);
+    }
+#if !defined(_WIN32)
+    const std::string p0 = "/tmp/hy4_spans_0_" + std::to_string((long long) ::getpid()) + ".bin";
+    const std::string p1 = "/tmp/hy4_spans_1_" + std::to_string((long long) ::getpid()) + ".bin";
+#else
+    const std::string p0 = "hy4_spans_0.bin";
+    const std::string p1 = "hy4_spans_1.bin";
+#endif
+    {
+        std::FILE* f = std::fopen(p0.c_str(), "wb");
+        CHECK(f != nullptr && std::fwrite(d0.data(), 1, d0.size(), f) == d0.size() && std::fclose(f) == 0);
+    }
+    {
+        std::FILE* f = std::fopen(p1.c_str(), "wb");
+        CHECK(f != nullptr && std::fwrite(d1.data(), 1, d1.size(), f) == d1.size() && std::fclose(f) == 0);
+    }
+    size_t m0_bytes = 0, m1_bytes = 0;
+    const uint8_t* m0 = mm3::os::map_file(p0, m0_bytes);
+    const uint8_t* m1 = mm3::os::map_file(p1, m1_bytes);
+    CHECK(m0 != nullptr && m1 != nullptr);
+
+    // Out-of-order spans with both contiguous runs (must coalesce) and gaps across both files.
+    const size_t sp_a_off = 3333, sp_a_len = 2 * 1024 * 1024 + 555;
+    const size_t sp_b_off = sp_a_off + sp_a_len, sp_b_len = 3 * 1024 * 1024 + 111;   // contiguous after sp_a
+    const size_t sp_c_off = sp_b_off + sp_b_len + 123456, sp_c_len = 1500000;      // gap after sp_b
+    const size_t sp_d_off = 4096, sp_d_len = 4 * 1024 * 1024 + 777;                // in file 1
+    std::vector<hy4::RamSpan> spans = {
+        {1, sp_d_off, sp_d_len, 0, m1 + sp_d_off, 2, 0, 5},
+        {0, sp_c_off, sp_c_len, 0, m0 + sp_c_off, 1, 2, 9},
+        {0, sp_b_off, sp_b_len, 0, m0 + sp_b_off, 0, 1, 3},
+        {0, sp_a_off, sp_a_len, 0, m0 + sp_a_off, 0, 0, 3},
+    };
+    hy4::AnonBuf span_buf;
+    double span_elapsed = -1.0;
+    CHECK(hy4::load_spans_to_ram({p0, p1}, spans, false, false, span_buf, "test_spans", note, &span_elapsed));
+    CHECK(span_buf.ptr != nullptr);
+    CHECK(span_buf.bytes == sp_a_len + sp_b_len + sp_c_len + sp_d_len);
+    CHECK(span_elapsed >= 0.0);
+#if !defined(_WIN32)
+    CHECK(span_buf.used_pread);
+#endif
+    for (const hy4::RamSpan& sp : spans) {
+        const std::vector<uint8_t>& src_vec = (sp.file == 0) ? d0 : d1;
+        CHECK(std::memcmp(span_buf.ptr + sp.dst_off, src_vec.data() + sp.file_off, sp.bytes) == 0);
+    }
+    span_buf.release();
+
+    // Writable buffer test (used when HY4_HOT=1 swaps evicted VRAM experts back into RAM)
+    CHECK(hy4::load_spans_to_ram({p0, p1}, spans, false, true, span_buf, "test_spans_rw", note));
+    CHECK(span_buf.ptr != nullptr);
+    ((uint8_t*) span_buf.ptr)[0] ^= 0xff;
+    span_buf.release();
+    CHECK(span_buf.ptr == nullptr && span_buf.bytes == 0);
+
+    (void) std::remove(p0.c_str());
+    (void) std::remove(p1.c_str());
+
     std::fprintf(stderr, "hy4_engram_ram_test: ok\n");
     return 0;
 }

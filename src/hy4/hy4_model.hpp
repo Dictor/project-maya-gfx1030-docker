@@ -57,6 +57,7 @@ struct Options {
                                   // the prompt buffers while it is read (made longer by what they lack of it, if anything)
     bool vision_auto = true;      // (not asked for by name: a pack without one runs text only, no error)
     int engram_ram = -1;          // -1: read HY4_EG_RAM env (default off); 0: disk mmap; 1: anonymous RAM; 2: anonymous RAM + mlock
+    int lane_ram = -1;            // -1: read HY4_LANE_RAM env (default off); 0: disk mmap; 1: anonymous RAM; 2: anonymous RAM + mlock
     bool verbose = false;
 };
 

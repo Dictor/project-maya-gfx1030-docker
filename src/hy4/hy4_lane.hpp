@@ -79,6 +79,17 @@ struct CpuExperts {
     float limit = 0.0f;
     std::shared_ptr<Q4xSet> q4x;         // (null: no copies for this layer)
     size_t q4x_gu = 0, q4x_d = 0;        // the form's bytes of an expert's gate (= up) matrix, its down matrix
+    // Optional per-expert pointers into anonymous RAM (HY4_LANE_RAM=1); nullptr falls back to file mmap.
+    std::vector<const uint8_t*> ram_gate, ram_up, ram_down;
+    const uint8_t* gate_ptr(int e) const {
+        return (!ram_gate.empty() && ram_gate[(size_t) e] != nullptr) ? ram_gate[(size_t) e] : gate + (size_t) e * g_stride;
+    }
+    const uint8_t* up_ptr(int e) const {
+        return (!ram_up.empty() && ram_up[(size_t) e] != nullptr) ? ram_up[(size_t) e] : up + (size_t) e * g_stride;
+    }
+    const uint8_t* down_ptr(int e) const {
+        return (!ram_down.empty() && ram_down[(size_t) e] != nullptr) ? ram_down[(size_t) e] : down + (size_t) e * d_stride;
+    }
     /// whether this layer's experts can be re-coded (both types IQ2_XXS, this CPU running the rows); sets q4x_gu / q4x_d
     bool q4x_can();
     /// expert e re-coded into new memory and published (false: q4x_can is not, or no memory)

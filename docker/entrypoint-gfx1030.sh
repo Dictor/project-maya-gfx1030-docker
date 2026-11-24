@@ -59,6 +59,8 @@ export MAYA_GLM_BF16_F16="${MAYA_GLM_BF16_F16:-1}"
 # Hy4-Flash (maya-hy4) RDNA2 (gfx1030) defaults (overridable via -e)
 export HY4_PROMPT_F16="${HY4_PROMPT_F16:-1}"
 export HY4_EG_RAM="${HY4_EG_RAM:-0}"
+export HY4_LANE_RAM="${HY4_LANE_RAM:-1}"
+export HY4_LOAD_SEQ="${HY4_LOAD_SEQ:-1}"
 export HY4_EG_POPULATE="${HY4_EG_POPULATE:-0}"
 
 PYBIN="/opt/maya/.venv/bin/python"
@@ -261,6 +263,11 @@ if family == "hy4":
         for f in sorted(src_dir.iterdir()):
             if f.is_file() and (f.suffix in (".gguf", ".dfly2") or "scales" in f.name.lower()):
                 link_into(f, model_dir, "hy4 file")
+        raw_gguf_files = sorted(src_dir.glob("*.gguf_file"))
+        if raw_gguf_files:
+            names = ", ".join(f.name for f in raw_gguf_files)
+            print(f"[maya-gfx1030] NOTE: found '.gguf_file' file(s) ({names}); rename extension to '.gguf' for Hy4 indexing.",
+                  file=sys.stderr, flush=True)
     for extra_var in ("MAYA_HY4_ENGRAM", "MAYA_HY4_MTP", "MAYA_HY4_MMPROJ", "MAYA_HY4_DRAFTER"):
         val = (os.environ.get(extra_var) or "").strip()
         if val:
@@ -275,11 +282,40 @@ if family == "hy4":
         pack_dir / "tensors.txt",
         pack_dir / "tokenizer" / "vocab.json",
     ]
-    if not all(p.is_file() for p in need_hy4):
+    need_reindex = not all(p.is_file() for p in need_hy4)
+    reindex_reasons = []
+    if not need_reindex and model_dir.is_dir():
+        indexed_names = set()
+        for line in (pack_dir / "tensors.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) == 3 and parts[0] == "file":
+                indexed_names.add(pathlib.Path(parts[2]).name)
+        for name in sorted(indexed_names):
+            if not (model_dir / name).is_file():
+                reindex_reasons.append(f"removed {name}")
+        for f in sorted(model_dir.iterdir()):
+            if f.suffix not in (".gguf", ".dfly2") or not f.is_file():
+                continue
+            if f.name not in indexed_names:
+                arch, kind, _ = inspect_gguf(f)
+                if arch in ("hy_v4_flash", "clip", "hy_v4_flash_dfly") or kind in ("mtp", "mmproj", "drafter"):
+                    reindex_reasons.append(f"added {f.name}")
+        scales_in_dir = sorted(p.name for p in model_dir.glob("*.engram-scales.bf16") if p.is_file())
+        indexed_scales = ""
+        for line in (pack_dir / "hy4.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("engram_scales "):
+                indexed_scales = line.split(None, 1)[1].strip()
+                break
+        if len(scales_in_dir) == 1 and scales_in_dir[0] != indexed_scales:
+            reindex_reasons.append(f"engram_scales {scales_in_dir[0]}")
+        if reindex_reasons and os.access(pack_dir, os.W_OK):
+            need_reindex = True
+    if need_reindex:
         if src_dir is None and not any(model_dir.glob("*.gguf")):
             sys.exit(f"[maya-gfx1030] ERROR: incomplete hy4 pack at '{pack_dir}' and no MAYA_GGUF/MAYA_GGUF_DIR provided.")
         pack_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[maya-gfx1030] Indexing Hy4-Flash pack into {pack_dir} from {model_dir} ...", file=sys.stderr, flush=True)
+        reason_str = f" ({', '.join(reindex_reasons)})" if reindex_reasons else ""
+        print(f"[maya-gfx1030] Indexing Hy4-Flash pack into {pack_dir} from {model_dir}{reason_str} ...", file=sys.stderr, flush=True)
         subprocess.run(
             [
                 "/opt/maya/.venv/bin/python",
@@ -352,6 +388,17 @@ if family == "hy4":
             args += ["--engram-ram", "lock"]
         else:
             sys.exit(f"[maya-gfx1030] ERROR: MAYA_HY4_ENGRAM_RAM='{hy4_eg_ram_cfg}' must be off, on, or lock.")
+
+    hy4_lane_ram_cfg = (os.environ.get("MAYA_HY4_LANE_RAM") or "").strip().lower()
+    if hy4_lane_ram_cfg:
+        if hy4_lane_ram_cfg in ("0", "off", "false", "no"):
+            args += ["--lane-ram", "off"]
+        elif hy4_lane_ram_cfg in ("1", "on", "true", "yes", "ram"):
+            args += ["--lane-ram", "on"]
+        elif hy4_lane_ram_cfg in ("2", "lock", "mlock"):
+            args += ["--lane-ram", "lock"]
+        else:
+            sys.exit(f"[maya-gfx1030] ERROR: MAYA_HY4_LANE_RAM='{hy4_lane_ram_cfg}' must be off, on, or lock.")
 
     learned_profile = pack_dir / "expert-profile.bin"
     if learned_profile.is_file():
@@ -583,7 +630,7 @@ fi
 
 if grep -q 'maya-hy4' "$CFG"; then
   echo "[maya-gfx1030] Starting Project Maya (Hy4-Flash, gfx1030) with config: $CFG"
-  echo "[maya-gfx1030] Hy4 Defaults: HY4_PROMPT_F16=$HY4_PROMPT_F16 HY4_EG_RAM=$HY4_EG_RAM HY4_EG_POPULATE=$HY4_EG_POPULATE"
+  echo "[maya-gfx1030] Hy4 Defaults: HY4_PROMPT_F16=$HY4_PROMPT_F16 HY4_EG_RAM=$HY4_EG_RAM HY4_LANE_RAM=$HY4_LANE_RAM HY4_LOAD_SEQ=$HY4_LOAD_SEQ HY4_EG_POPULATE=$HY4_EG_POPULATE"
 else
   echo "[maya-gfx1030] Starting Project Maya (GLM-5.3-Flash, gfx1030) with config: $CFG"
   echo "[maya-gfx1030] Defaults: RESERVE_MB=$MAYA_GLM_RESERVE_MB PIN_PIECE_MB=$MAYA_GLM_PIN_PIECE_MB RAM_RESIDENT=$MAYA_GLM_RAM_RESIDENT EMB_RAM=$MAYA_GLM_EMB_RAM PREFILL_MIN_CHUNKS=$MAYA_GLM_PREFILL_MIN_CHUNKS PREFILL_SUB=$MAYA_GLM_PREFILL_SUB PREFILL_MB=$MAYA_GLM_PREFILL_MB PF_CE=$MAYA_GLM_PF_CE PROMPT_F16=$MAYA_GLM_PROMPT_F16 MLA_FDOT2=$MAYA_GLM_MLA_FDOT2 MV_RDNA=$MAYA_GLM_MV_RDNA DENSE_MMQ=$MAYA_GLM_DENSE_MMQ BF16_F16=$MAYA_GLM_BF16_F16"

@@ -262,6 +262,7 @@ struct Layer {
     std::vector<int> slot_of;    // each expert's slot (-1: the CPU lane's), and on the device
     int* slot_d = nullptr;
     CpuExperts cex;              // the CPU lane's view of the layer's experts (the file's tensors)
+    const Tensor *t_gate = nullptr, *t_up = nullptr, *t_down = nullptr;   // (pack tensors for sequential RAM load)
     int ffe = 0;                 // an expert's width here (a tensor-parallel member's slice: its share of n_ff_exp)
     int tpm = -1;                // the tensor-parallel member whose slice this is (-1: the whole layer)
     bool partial() const { return tpm < 0 && !dense && !mtp && n_res < (int) slot_of.size(); }
@@ -631,7 +632,12 @@ struct Model::Impl {
     const uint8_t* eg_scale = nullptr;
     std::string eg_scale_path;
     size_t eg_scale_bytes = 0, eg_scale_map_bytes = 0;
-    AnonBuf eg_ram_buf, eg_scale_ram_buf, tok_ram_buf;
+    AnonBuf eg_ram_buf, eg_scale_ram_buf, tok_ram_buf, lane_ram_buf;
+    bool lane_ram_writable = false;
+    static bool load_seq_on() {
+        const char* e = std::getenv("HY4_LOAD_SEQ");
+        return e != nullptr && std::atoi(e) != 0;
+    }
     float* h_egs = nullptr;              // pinned [modules][Tc][cols]
     std::FILE* eg_dump = nullptr;        // (HY4_EG_DUMP=<file>, tests: every looked-up row - see engram_row)
     std::mutex eg_dump_mu;
@@ -688,6 +694,12 @@ struct Model::Impl {
         eg_ram_buf.release();
         eg_scale_ram_buf.release();
         tok_ram_buf.release();
+        lane_ram_buf.release();
+        for (Layer& l : L) {
+            l.cex.ram_gate.clear();
+            l.cex.ram_up.clear();
+            l.cex.ram_down.clear();
+        }
         eg_table = nullptr;
         eg_scale = nullptr;
         tok_embd = nullptr;
@@ -1834,8 +1846,51 @@ struct Model::Impl {
     // the members' layers (a thread a member), their scratch, the head GPU's scratch, the pinned buffers and threads
     bool load_tp(std::string& err) {
         std::vector<std::string> errs((size_t) tp);
-        std::vector<std::thread> th;
         head_m.assign(head_tp ? (size_t) tp : 0, HeadPart());
+        if (load_seq_on()) {
+            const double t_seq = now_s();
+            for (size_t h = 0; h < hel.size(); ++h) hel[h].L.assign(1, std::vector<Layer>((size_t) g.n_layer));
+            for (int il = 0; il < g.n_layer; ++il) {
+                for (int j = 0; j < tp; ++j)
+                    if (!load_layer(TL[(size_t) j][(size_t) il], errs[(size_t) j], j, tp, U)) {
+                        err = errs[(size_t) j];
+                        return false;
+                    }
+                if (il >= g.n_dense_lead) {
+                    for (size_t h = 0; h < hel.size(); ++h) {
+                        Helper& hp = hel[h];
+                        Layer& l = hp.L[0][(size_t) il];
+                        l.il = il;
+                        l.gpu = hp.gi;
+                        if (!helper_layer(l, hp.unit0, hp.w, err)) return false;
+                    }
+                }
+                if ((il + 1) % 8 == 0 || il + 1 == g.n_layer)
+                    std::fprintf(stderr, "maya-hy4: sequential TP load: %d/%d layers (%.1f s)\n",
+                                 il + 1, g.n_layer, now_s() - t_seq);
+            }
+            for (int j = 0; j < tp; ++j) {
+                if (!scratch(G[(size_t) mem[(size_t) j]], err)) return false;
+                if (head_tp) {
+                    Gpu& gp = G[(size_t) mem[(size_t) j]];
+                    HeadPart& hp = head_m[(size_t) j];
+                    const int r0 = j * head_rows, r1 = r0 + head_rows;
+                    if (!mat_part(gp, "output.weight", hp.w, err, g.n_embd, g.n_vocab, 1, r0, r1, 0, g.n_embd, 0, 1) ||
+                        !f32(gp, "output_norm.weight", hp.norm, err, g.n_embd) ||
+                        !hc_fn(gp, "output_hc_fn.weight", hp.fn, err, g.hc) ||
+                        !f32(gp, "output_hc_base.weight", hp.base, err, g.hc) ||
+                        !f32(gp, "output_hc_scale.weight", hp.scale, err, 1) ||
+                        !gp.alloc(gp.logits, (size_t) W * head_rows, err))
+                        return false;
+                }
+            }
+            char sbuf[160];
+            std::snprintf(sbuf, sizeof sbuf, "INFO HY4_LOAD_SEQ=1: TP GPU layers loaded sequentially in %.1f s",
+                          now_s() - t_seq);
+            info.push_back(sbuf);
+            return true;
+        }
+        std::vector<std::thread> th;
         for (int j = 0; j < tp; ++j)
             th.emplace_back([&, j] {
                 for (Layer& l : TL[(size_t) j])
@@ -2276,6 +2331,9 @@ struct Model::Impl {
                 return false;
             CK(cudaMemcpy(l.slot_d, l.slot_of.data(), sizeof(int) * g.n_expert, cudaMemcpyHostToDevice));
             const uint8_t *sg = pk.data(*tg), *su = pk.data(*tu), *sd = pk.data(*td);
+            l.t_gate = tg;
+            l.t_up = tu;
+            l.t_down = td;
             if (l.partial()) {   // (the CPU lane reads the others where they lie)
                 if (!l.cex.init(l.tg, l.td, lat, ff, err)) {
                     err = p + ": the CPU lane does not take these experts: " + err;
@@ -2286,24 +2344,32 @@ struct Model::Impl {
                 l.cex.down = sd;
                 l.cex.limit = g.limit[(size_t) il];
             }
-            // an expert's three parts side by side in one blob (one copy a role; a pinned staging buffer a GPU would be
-            // faster - the load reads the file at the page cache's pace anyway); the MTP block's BF16 ones rounded
+            // Read gate, up, and down tensors sequentially by role (vs interleaving 3 distant offsets per expert)
+            // so HDD reads stay linear across each tensor.
             const size_t sgb = round ? (size_t) lat * ff * 2 : gb, sdb = round ? (size_t) ff * lat * 2 : db;
             std::vector<uint8_t> host(l.blob * 64);
             for (int s0 = 0; s0 < l.n_res; s0 += 64) {   // (slot s0 + i holds expert res[s0 + i])
                 const int ne = std::min(64, l.n_res - s0);
-                for (int i = 0; i < ne; ++i) {
-                    uint8_t* b = host.data() + (size_t) i * l.blob;
-                    const size_t e = (size_t) res[(size_t) (s0 + i)];
-                    if (round) {
-                        bf16_to_q8_0((const uint16_t*) (sg + e * sgb), (size_t) ff, lat, b + l.tr[0]);
-                        bf16_to_q8_0((const uint16_t*) (su + e * sgb), (size_t) ff, lat, b + l.tr[1]);
-                        bf16_to_q8_0((const uint16_t*) (sd + e * sdb), (size_t) lat, ff, b + l.tr[2]);
-                        continue;
-                    }
-                    std::memcpy(b + l.tr[0], sg + e * gb, gb);
-                    std::memcpy(b + l.tr[1], su + e * gb, gb);
-                    std::memcpy(b + l.tr[2], sd + e * db, db);
+                if (round) {
+                    for (int i = 0; i < ne; ++i)
+                        bf16_to_q8_0((const uint16_t*) (sg + (size_t) res[(size_t) (s0 + i)] * sgb), (size_t) ff, lat,
+                                     host.data() + (size_t) i * l.blob + l.tr[0]);
+                    for (int i = 0; i < ne; ++i)
+                        bf16_to_q8_0((const uint16_t*) (su + (size_t) res[(size_t) (s0 + i)] * sgb), (size_t) ff, lat,
+                                     host.data() + (size_t) i * l.blob + l.tr[1]);
+                    for (int i = 0; i < ne; ++i)
+                        bf16_to_q8_0((const uint16_t*) (sd + (size_t) res[(size_t) (s0 + i)] * sdb), (size_t) lat, ff,
+                                     host.data() + (size_t) i * l.blob + l.tr[2]);
+                } else {
+                    for (int i = 0; i < ne; ++i)
+                        std::memcpy(host.data() + (size_t) i * l.blob + l.tr[0],
+                                    sg + (size_t) res[(size_t) (s0 + i)] * gb, gb);
+                    for (int i = 0; i < ne; ++i)
+                        std::memcpy(host.data() + (size_t) i * l.blob + l.tr[1],
+                                    su + (size_t) res[(size_t) (s0 + i)] * gb, gb);
+                    for (int i = 0; i < ne; ++i)
+                        std::memcpy(host.data() + (size_t) i * l.blob + l.tr[2],
+                                    sd + (size_t) res[(size_t) (s0 + i)] * db, db);
                 }
                 CK(cudaMemcpy(l.experts + (size_t) s0 * l.blob, host.data(), l.blob * (size_t) ne,
                               cudaMemcpyHostToDevice));
@@ -2893,19 +2959,33 @@ struct Model::Impl {
             if (!load_tp(err)) return false;
         } else {
             for (int il = 0; il < g.n_layer; ++il) L[(size_t) il].il = il;
-            std::vector<std::string> errs(G.size());
-            std::vector<std::thread> th;
-            for (size_t gi = 0; gi < G.size(); ++gi)
-                th.emplace_back([&, gi] {
-                    for (auto& l : L)
-                        if (l.gpu == (int) gi && !load_layer(l, errs[gi])) return;
-                });
-            for (auto& t : th) t.join();
-            for (auto& e : errs)
-                if (!e.empty()) {
-                    err = e;
-                    return false;
+            if (load_seq_on()) {
+                const double t_seq = now_s();
+                for (int il = 0; il < g.n_layer; ++il) {
+                    if (!load_layer(L[(size_t) il], err)) return false;
+                    if ((il + 1) % 8 == 0 || il + 1 == g.n_layer)
+                        std::fprintf(stderr, "maya-hy4: sequential GPU load: %d/%d layers (%.1f s)\n",
+                                     il + 1, g.n_layer, now_s() - t_seq);
                 }
+                char sbuf[160];
+                std::snprintf(sbuf, sizeof sbuf, "INFO HY4_LOAD_SEQ=1: GPU layers loaded sequentially in %.1f s",
+                              now_s() - t_seq);
+                info.push_back(sbuf);
+            } else {
+                std::vector<std::string> errs(G.size());
+                std::vector<std::thread> th;
+                for (size_t gi = 0; gi < G.size(); ++gi)
+                    th.emplace_back([&, gi] {
+                        for (auto& l : L)
+                            if (l.gpu == (int) gi && !load_layer(l, errs[gi])) return;
+                    });
+                for (auto& t : th) t.join();
+                for (auto& e : errs)
+                    if (!e.empty()) {
+                        err = e;
+                        return false;
+                    }
+            }
             // each GPU's scratch, after its layers as before - with its staging slots (a GPU with layers whose
             // experts are not all in VRAM: kStage of the largest blob) at its end, one allocation
             size_t blob = 0;
@@ -3062,7 +3142,82 @@ struct Model::Impl {
                               !prof_in.empty() ? "the profile" : "their order, no scores yet", hot.every, hot.max_swaps);
                 info.push_back(buf);
             }
-            if (lane->nodes() > 1) {
+            bool lane_ram_loaded = false;
+            const int lane_ram_mode = resolve_ram_mode(o.lane_ram, "HY4_LANE_RAM");
+            if (lane_ram_mode > kEgRamOff) {
+                std::vector<RamSpan> spans;
+                int n_cpu_exp = 0;
+                uint64_t need_lane = 0;
+                for (Layer& l : L) {
+                    if (!l.partial() || !l.t_gate || !l.t_up || !l.t_down) continue;
+                    for (int e = 0; e < g.n_expert; ++e) {
+                        if (l.slot_of[(size_t) e] >= 0) continue;
+                        ++n_cpu_exp;
+                        spans.push_back({l.t_gate->file, l.t_gate->off + (uint64_t) e * l.cex.g_stride,
+                                         l.cex.g_stride, 0, l.cex.gate + (size_t) e * l.cex.g_stride, l.il, 0, e});
+                        spans.push_back({l.t_up->file, l.t_up->off + (uint64_t) e * l.cex.g_stride,
+                                         l.cex.g_stride, 0, l.cex.up + (size_t) e * l.cex.g_stride, l.il, 1, e});
+                        spans.push_back({l.t_down->file, l.t_down->off + (uint64_t) e * l.cex.d_stride,
+                                         l.cex.d_stride, 0, l.cex.down + (size_t) e * l.cex.d_stride, l.il, 2, e});
+                        need_lane += 2 * l.cex.g_stride + l.cex.d_stride;
+                    }
+                }
+                if (need_lane > 0) {
+                    double headroom_gb = 4.0;
+                    if (const char* hg = std::getenv("HY4_LANE_RAM_HEADROOM_GB")) headroom_gb = std::atof(hg);
+                    const char* lf = std::getenv("HY4_LANE_RAM_FORCE");
+                    const bool force_lane = (lf != nullptr && std::atoi(lf) != 0);
+                    const uint64_t avail_ram = mm3::os::ram_avail();
+                    std::string ram_note;
+                    if (!check_engram_ram_budget(need_lane, avail_ram, headroom_gb, force_lane, ram_note)) {
+                        info.push_back("NOTE CPU lane RAM skipped (" + ram_note + ") - staying on disk mmap");
+                    } else {
+                        std::vector<std::string> fpaths(pk.files.size());
+                        for (size_t i = 0; i < pk.files.size(); ++i) fpaths[i] = pk.file_path((int) i);
+                        const bool want_lock = (lane_ram_mode == kEgRamLock);
+                        const bool keep_writable = hot.on;
+                        double t_lane = 0.0;
+                        std::string lane_note;
+                        if (!load_spans_to_ram(fpaths, spans, want_lock, keep_writable, lane_ram_buf,
+                                               "CPU experts", lane_note, &t_lane)) {
+                            info.push_back("NOTE CPU lane RAM load failed (" + lane_note + ") - staying on disk mmap");
+                        } else {
+                            lane_ram_loaded = true;
+                            lane_ram_writable = keep_writable;
+                            for (Layer& l : L) {
+                                if (!l.partial()) continue;
+                                l.cex.ram_gate.assign((size_t) g.n_expert, nullptr);
+                                l.cex.ram_up.assign((size_t) g.n_expert, nullptr);
+                                l.cex.ram_down.assign((size_t) g.n_expert, nullptr);
+                            }
+                            for (const RamSpan& sp : spans) {
+                                Layer& l = L[(size_t) sp.tag_layer];
+                                const uint8_t* p = lane_ram_buf.ptr + sp.dst_off;
+                                if (sp.tag_role == 0) l.cex.ram_gate[(size_t) sp.tag_expert] = p;
+                                else if (sp.tag_role == 1) l.cex.ram_up[(size_t) sp.tag_expert] = p;
+                                else l.cex.ram_down[(size_t) sp.tag_expert] = p;
+                            }
+                            for (size_t i = 0; i < pk.map.size(); ++i) {
+                                const bool is_eg_file = (eg_tensor != nullptr && (int) i == eg_tensor->file);
+                                if (pk.map[i] && pk.map_bytes[i] > 0 && !is_eg_file &&
+                                    pk.files[i].find("mmproj") == std::string::npos)
+                                    mm3::os::drop_mapped(pk.map[i], pk.map_bytes[i]);
+                            }
+                            if (!lane_note.empty()) info.push_back("NOTE CPU lane RAM: " + lane_note);
+                            char lbuf[320];
+                            std::snprintf(lbuf, sizeof lbuf,
+                                          "INFO CPU lane: %d off-VRAM experts (%.2f GB) resident in anonymous RAM%s "
+                                          "(loaded in %.1f s, %.0f MB/s; HY4_LANE_RAM=0 for disk mmap)",
+                                          n_cpu_exp, (double) need_lane / 1e9, lane_ram_buf.locked ? " [mlocked]" : "",
+                                          t_lane, ((double) need_lane / 1e6) / std::max(1e-6, t_lane));
+                            info.push_back(lbuf);
+                        }
+                    }
+                }
+            }
+            if (lane_ram_loaded) {
+                // Skip NUMA page moves / HY4_LANE_WARM file page faults since off-VRAM experts already reside in RAM.
+            } else if (lane->nodes() > 1) {
                 const int nodes = lane->nodes();
                 placing.store(true);
                 placer = std::thread([this, nodes] {
@@ -4393,6 +4548,9 @@ struct Model::Impl {
                     if (L[(size_t) s.il].gpu == (int) gi) mine.push_back(&s);
                 if (mine.empty()) continue;
                 CK(cudaSetDevice(gp.dev));
+                const bool sync_evict = lane_ram_writable && !q4x_builder.joinable();
+                if (sync_evict) CK(cudaStreamSynchronize(gp.s));
+                std::vector<uint8_t> evict_buf;
                 for (size_t b0 = 0; b0 < mine.size(); b0 += kStage) {
                     const size_t nb = std::min<size_t>(kStage, mine.size() - b0);
                     std::vector<int> touched;
@@ -4401,13 +4559,32 @@ struct Model::Impl {
                         Layer& l = L[(size_t) s.il];
                         uint8_t* b = h_stage + i * stage_blob;
                         const size_t e = (size_t) s.in;
-                        std::memcpy(b + l.tr[0], l.cex.gate + e * l.cex.g_stride, l.cex.g_stride);
-                        std::memcpy(b + l.tr[1], l.cex.up + e * l.cex.g_stride, l.cex.g_stride);
-                        std::memcpy(b + l.tr[2], l.cex.down + e * l.cex.d_stride, l.cex.d_stride);
+                        const size_t nbytes = l.tr[2] + l.cex.d_stride;
+                        const uint8_t* rg = l.cex.gate_ptr((int) e);
+                        const uint8_t* ru = l.cex.up_ptr((int) e);
+                        const uint8_t* rd = l.cex.down_ptr((int) e);
+                        std::memcpy(b + l.tr[0], rg, l.cex.g_stride);
+                        std::memcpy(b + l.tr[1], ru, l.cex.g_stride);
+                        std::memcpy(b + l.tr[2], rd, l.cex.d_stride);
                         const int slot = l.slot_of[(size_t) s.out];
+                        if (sync_evict && !l.cex.ram_gate.empty() && l.cex.ram_gate[e] != nullptr) {
+                            // Preserve the evicted VRAM expert inside s.in's vacated anonymous RAM slice.
+                            if (evict_buf.size() < nbytes) evict_buf.resize(nbytes);
+                            CK(cudaMemcpy(evict_buf.data(), l.experts + (size_t) slot * l.blob, nbytes,
+                                          cudaMemcpyDeviceToHost));
+                            std::memcpy((uint8_t*) l.cex.ram_gate[e], evict_buf.data() + l.tr[0], l.cex.g_stride);
+                            std::memcpy((uint8_t*) l.cex.ram_up[e], evict_buf.data() + l.tr[1], l.cex.g_stride);
+                            std::memcpy((uint8_t*) l.cex.ram_down[e], evict_buf.data() + l.tr[2], l.cex.d_stride);
+                            l.cex.ram_gate[(size_t) s.out] = l.cex.ram_gate[e];
+                            l.cex.ram_up[(size_t) s.out] = l.cex.ram_up[e];
+                            l.cex.ram_down[(size_t) s.out] = l.cex.ram_down[e];
+                            l.cex.ram_gate[e] = nullptr;
+                            l.cex.ram_up[e] = nullptr;
+                            l.cex.ram_down[e] = nullptr;
+                        }
                         l.slot_of[(size_t) s.out] = -1;
                         l.slot_of[e] = slot;
-                        CK(cudaMemcpyAsync(l.experts + (size_t) slot * l.blob, b, l.tr[2] + l.cex.d_stride,
+                        CK(cudaMemcpyAsync(l.experts + (size_t) slot * l.blob, b, nbytes,
                                            cudaMemcpyHostToDevice, gp.s));
                         if (std::find(touched.begin(), touched.end(), s.il) == touched.end()) touched.push_back(s.il);
                     }
@@ -4533,8 +4710,7 @@ struct Model::Impl {
             lane->parallel_for(np * 3, [&](int it) {
                 const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
                 uint8_t* dst = h_stage + (size_t) i * l.blob + l.tr[role];
-                const uint8_t* src = role == 0 ? cx.gate + (size_t) e * gb : role == 1 ? cx.up + (size_t) e * gb
-                                                                                       : cx.down + (size_t) e * db;
+                const uint8_t* src = role == 0 ? cx.gate_ptr(e) : role == 1 ? cx.up_ptr(e) : cx.down_ptr(e);
                 std::memcpy(dst, src, role == 2 ? db : gb);
             });
             st.stream_ms += (now_s() - tc) * 1e3;

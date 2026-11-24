@@ -336,9 +336,9 @@ bool CpuExperts::q4x_make(int e) {
     std::unique_ptr<uint8_t[]> m(new (std::nothrow) uint8_t[2 * q4x_gu + q4x_d + 32]);
     if (!m) return false;
     uint8_t* b = (uint8_t*) (((uintptr_t) m.get() + 31) & ~(uintptr_t) 31);   // (32-byte rows)
-    iqc::iq_cpu_q4x_convert(gate + (size_t) e * g_stride, f.gu_row, f.n_ff, f.n_embd, b);
-    iqc::iq_cpu_q4x_convert(up + (size_t) e * g_stride, f.gu_row, f.n_ff, f.n_embd, b + q4x_gu);
-    iqc::iq_cpu_q4x_convert(down + (size_t) e * d_stride, f.d_row, f.n_embd, f.n_ff, b + 2 * q4x_gu);
+    iqc::iq_cpu_q4x_convert(gate_ptr(e), f.gu_row, f.n_ff, f.n_embd, b);
+    iqc::iq_cpu_q4x_convert(up_ptr(e), f.gu_row, f.n_ff, f.n_embd, b + q4x_gu);
+    iqc::iq_cpu_q4x_convert(down_ptr(e), f.d_row, f.n_embd, f.n_ff, b + 2 * q4x_gu);
     q4x->owned.push_back(std::move(m));
     q4x->p[(size_t) e].store(b, std::memory_order_release);
     return true;
@@ -385,9 +385,9 @@ void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int no
     for (int e : experts) {
         if (stop.load(std::memory_order_relaxed)) return;
         const int want = e % nodes;
-        const uint8_t* g = ex.gate + (size_t) e * ex.g_stride;
-        const uint8_t* u = ex.up + (size_t) e * ex.g_stride;
-        const uint8_t* d = ex.down + (size_t) e * ex.d_stride;
+        const uint8_t* g = ex.gate_ptr(e);
+        const uint8_t* u = ex.up_ptr(e);
+        const uint8_t* d = ex.down_ptr(e);
         if (Lane::node_of_page(g) == want && Lane::node_of_page(d) == want) continue;   // (there already)
         volatile uint8_t sink = 0;   // (mapped into this process first: move_pages takes mapped pages)
         for (size_t b = 0; b < ex.g_stride; b += 4096) sink ^= g[b] ^ u[b];
@@ -402,9 +402,9 @@ void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const s
     volatile uint8_t sink = 0;
     for (int e : experts) {
         if (stop.load(std::memory_order_relaxed)) return;
-        const uint8_t* g = ex.gate + (size_t) e * ex.g_stride;
-        const uint8_t* u = ex.up + (size_t) e * ex.g_stride;
-        const uint8_t* d = ex.down + (size_t) e * ex.d_stride;
+        const uint8_t* g = ex.gate_ptr(e);
+        const uint8_t* u = ex.up_ptr(e);
+        const uint8_t* d = ex.down_ptr(e);
         for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ g[b] ^ u[b];
         for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ d[b];
     }
@@ -562,7 +562,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         if (gr.q4)
             iqc::iq_cpu_q4x_gate_up(f, gr.q4, gr.q4 + ex.q4x_gu, act, gr.c, ff, r0, r1, ex.limit);
         else
-            iqc::iq_cpu_gate_up(f, ex.gate + (size_t) gr.e * ex.g_stride, ex.up + (size_t) gr.e * ex.g_stride, act,
+            iqc::iq_cpu_gate_up(f, ex.gate_ptr(gr.e), ex.up_ptr(gr.e), act,
                                 gr.c, ff, r0, r1, ex.limit);
     }, gu_node.empty() ? nullptr : &gu_node);
     // each entry's h quantized once (each down item quantized its entries' h before: 12 times over in a decode)
@@ -588,7 +588,7 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         if (gr.q4)
             iqc::iq_cpu_q4x_down(f, gr.q4 + 2 * ex.q4x_gu, hq, gr.c, y, r0, r1);
         else
-            iqc::iq_cpu_down(f, ex.down + (size_t) gr.e * ex.d_stride, hq, gr.c, y, r0, r1);
+            iqc::iq_cpu_down(f, ex.down_ptr(gr.e), hq, gr.c, y, r0, r1);
     }, dn_node.empty() ? nullptr : &dn_node);
     const double tp3 = clk();
     // each token's weighted sum, in its entries' order
@@ -633,8 +633,11 @@ bool q4x_probe(Lane& lane, const CpuExperts& ex0, int n_expert, double& ms_file,
     ex.q4x = std::make_shared<Q4xSet>(n_expert);
     volatile uint8_t sink = 0;
     for (int e : pick) {
-        for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ ex.gate[(size_t) e * ex.g_stride + b] ^ ex.up[(size_t) e * ex.g_stride + b];
-        for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ ex.down[(size_t) e * ex.d_stride + b];
+        const uint8_t* gp = ex.gate_ptr(e);
+        const uint8_t* up = ex.up_ptr(e);
+        const uint8_t* dp = ex.down_ptr(e);
+        for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ gp[b] ^ up[b];
+        for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ dp[b];
         if (!ex.q4x_make(e)) return false;
     }
     const int E = ex.f.n_embd;

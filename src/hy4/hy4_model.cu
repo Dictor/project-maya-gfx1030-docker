@@ -225,6 +225,11 @@ bool prompt_pipe_enabled() {
     return e == nullptr || *e == 0 || std::atoi(e) != 0;
 }
 
+bool pipe_balance_enabled() {
+    const char* e = std::getenv("HY4_PIPE_BALANCE");
+    return e == nullptr || *e == 0 || std::atoi(e) != 0;
+}
+
 #if defined(STRATA_USE_HIP) && defined(MAYA_DS4_IQ_MMQ)
 bool hy4_expert_mmq_enabled(int dev) {
     static const int env_set = [] {
@@ -247,6 +252,33 @@ bool hy4_expert_mmq_enabled(int dev) {
         if ((logged_mask.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
             std::fprintf(stderr,
                          "hy4: CUDA%d (%s): expert MMQ int8 %s (HY4_EXPERT_MMQ=%d; HY4_EXPERT_MMQ=0 for FP32 tiles)\n",
+                         dev, arch_name.empty() ? "hip" : arch_name.c_str(), on ? "on" : "off", on ? 1 : 0);
+        }
+    }
+    return on;
+}
+
+bool hy4_dense_mmq_enabled(int dev) {
+    static const int env_set = [] {
+        const char* e = std::getenv("HY4_DENSE_MMQ");
+        return (e && *e) ? (std::atoi(e) != 0 ? 1 : 0) : -1;
+    }();
+    bool on = false;
+    std::string arch_name;
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
+        arch_name = p.gcnArchName;
+        on = (env_set >= 0) ? (env_set == 1) : (std::strncmp(p.gcnArchName, "gfx103", 6) == 0);
+    } else {
+        (void) cudaGetLastError();
+        on = (env_set == 1);
+    }
+    static std::atomic<uint32_t> logged_mask{0};
+    if (dev >= 0 && dev < 32) {
+        const uint32_t bit = 1u << dev;
+        if ((logged_mask.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+            std::fprintf(stderr,
+                         "hy4: CUDA%d (%s): dense MMQ int8 %s (HY4_DENSE_MMQ=%d; HY4_DENSE_MMQ=0 for FP16 GEMM)\n",
                          dev, arch_name.empty() ? "hip" : arch_name.c_str(), on ? "on" : "off", on ? 1 : 0);
         }
     }
@@ -1711,6 +1743,44 @@ struct Model::Impl {
         }
         place(rho, true);
         head_gpu = main_gi;
+        if (devs.size() == 2 && o.layer_split.empty() && prompt_pipe_enabled() && pipe_balance_enabled()) {
+            std::vector<int> lg((size_t) g.n_layer);
+            for (int il = 0; il < g.n_layer; ++il) lg[(size_t) il] = L[(size_t) il].gpu;
+            const PipePlan gp_plan = pipe_plan(lg, 2);
+            if (gp_plan.ok) {
+                std::vector<double> db((size_t) g.n_layer), eb((size_t) g.n_layer), lc((size_t) g.n_layer, 1.0);
+                std::vector<bool> is_d((size_t) g.n_layer, false);
+                int64_t greedy_res = 0;
+                for (int il = 0; il < g.n_layer; ++il) {
+                    const bool d = il < g.n_dense_lead;
+                    is_d[(size_t) il] = d;
+                    db[(size_t) il] = (double) dense_bytes(il);
+                    eb[(size_t) il] = d ? 0.0 : (double) expert_bytes(il);
+                    greedy_res += d ? 0 : L[(size_t) il].n_res;
+                    if (!g.swa[(size_t) il]) lc[(size_t) il] += 1.5;
+                    if (pk.eg.modules > 0 && pk.eg.module_of(il) >= 0) lc[(size_t) il] += 0.3;
+                }
+                const BalancedSplit bs = balanced_pipe_split(db, eb, lc, is_d, g.n_expert, free_b[0], free_b[1], cap,
+                                                             head_gpu == 0 ? 1.0 : 0.0, head_gpu == 1 ? 1.0 : 0.0,
+                                                             gp_plan.split, greedy_res);
+                if (bs.ok && bs.split != gp_plan.split) {
+                    int ix0 = 0, ix1 = 0;
+                    for (int il = 0; il < g.n_layer; ++il) {
+                        const bool s0 = il < bs.split;
+                        L[(size_t) il].gpu = s0 ? 0 : 1;
+                        L[(size_t) il].n_res = is_d[(size_t) il] ? 0 : (s0 ? bs.n0 : bs.n1);
+                        if (!g.swa[(size_t) il]) (s0 ? ix0 : ix1)++;
+                    }
+                    char bbuf[280];
+                    std::snprintf(bbuf, sizeof bbuf,
+                                  "INFO HY4_PIPE_BALANCE=1: balanced 2-GPU split GPU0:0-%d (ix=%d, %d/%d experts) / "
+                                  "GPU1:%d-%d (ix=%d, %d/%d experts; greedy was 0-%d/%d-%d)",
+                                  bs.split - 1, ix0, bs.n0, g.n_expert, bs.split, g.n_layer - 1, ix1, bs.n1, g.n_expert,
+                                  gp_plan.split - 1, gp_plan.split, g.n_layer - 1);
+                    info.push_back(bbuf);
+                }
+            }
+        }
         return true;
     }
 
@@ -2855,8 +2925,20 @@ struct Model::Impl {
                 }
 #if defined(STRATA_USE_HIP)
                 tensor_cores = false;   // (AMD: measured slower past kDenseBase on a 16K prompt - the span stays)
-#endif
+                bool gfx103_all = !G.empty();
+                for (Gpu& gp : G) {
+                    cudaDeviceProp pi{};
+                    if (cudaGetDeviceProperties(&pi, gp.dev) == cudaSuccess)
+                        gfx103_all = gfx103_all && std::strncmp(pi.gcnArchName, "gfx103", 6) == 0;
+                    else {
+                        (void) cudaGetLastError();
+                        gfx103_all = false;
+                    }
+                }
+                ix_gemm = gfx103_all ? 16 : 0;
+#else
                 ix_gemm = tensor_cores ? 16 : 0;
+#endif
                 if (const char* ie = std::getenv("HY4_IX_GEMM")) {
                     const int m = std::atoi(ie);
                     ix_gemm = m == 16 || m == 32 ? m : 0;
@@ -3740,6 +3822,11 @@ struct Model::Impl {
                                (int) ldx, &beta, y, (int) ldy) == CUBLAS_STATUS_SUCCESS;
         }
         if (M.type == kBF16 || M.type == kF16 || !iq::mv_supported(M.type)) return false;
+#if defined(STRATA_USE_HIP) && defined(MAYA_DS4_IQ_MMQ)
+        if (alpha == 1.0f && T >= 32 && M.ld == iq::row_bytes(M.type, M.k) && hy4_dense_mmq_enabled(gp.dev) &&
+            iq::dense_mmq(M.type, M.w, M.n, M.k, x, ldx, T, y, ldy, gp.s))
+            return true;
+#endif
         k::to_f16(x, ldx, T, M.k, gp.xh16, (size_t) M.k, gp.s);
         const int band = (int) std::max<size_t>(1, gp.wband_n / (size_t) M.k);
         const bool use_lt = lt_allowed(gp);

@@ -132,6 +132,10 @@ private:
     void* previous_;
     size_t previous_bytes_;
 };
+/// Quantized dense matrix GEMM via strata::prefill::mmq (int8 v_dot4_i32_i8 on RDNA 2): y[rows][n] = x[rows][k] * w^T.
+/// Returns false when unsupported, capturing, or scratch allocation fails (caller falls back to FP16 GEMM).
+bool dense_mmq(int type, const uint8_t* w, int n, int k, const float* x, size_t ldx, int rows, float* y, size_t ldy,
+               cudaStream_t s);
 #endif
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);

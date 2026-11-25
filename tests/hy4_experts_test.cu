@@ -683,6 +683,79 @@ void run_mmq_case(int tg, int td, int n_exp, int T, int E, int F, float limit, s
     cudaFree(h16);
     cudaStreamDestroy(s);
 }
+
+void run_dense_mmq_case(int type, int n, int k, int rows, std::mt19937& rng) {
+    const size_t rb = iq::row_bytes(type, k);
+    std::vector<uint8_t> w(rb * n);
+    std::normal_distribution<float> nd(0.0f, 0.05f);
+    for (int r = 0; r < n; ++r) {
+        uint8_t* row = w.data() + (size_t) r * rb;
+        if (type == iq::kQ8_0) {
+            std::vector<float> fw(k);
+            for (float& v : fw) v = nd(rng);
+            quant_q8_0(fw.data(), k, row);
+        } else {
+            random_k(type, k, row, rng);
+        }
+    }
+    std::vector<float> x((size_t) rows * k);
+    std::normal_distribution<float> nx(0.0f, 1.0f);
+    for (float& v : x) v = nx(rng);
+    uint8_t* dw;
+    float *dx, *dy, *dy_ref;
+    int8_t* xq;
+    float* xd;
+    CU(cudaMalloc(&dw, w.size()));
+    CU(cudaMalloc(&dx, sizeof(float) * x.size()));
+    CU(cudaMalloc(&dy, sizeof(float) * rows * n));
+    CU(cudaMalloc(&dy_ref, sizeof(float) * rows * n));
+    CU(cudaMalloc(&xq, (size_t) rows * k));
+    CU(cudaMalloc(&xd, sizeof(float) * rows * (k / 32)));
+    CU(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(dx, x.data(), sizeof(float) * x.size(), cudaMemcpyHostToDevice));
+    cudaStream_t s;
+    CU(cudaStreamCreate(&s));
+
+    for (int r0 = 0; r0 < rows; r0 += 16) {
+        const int nc = std::min(16, rows - r0);
+        hy4::k::q8_rows(dx + (size_t) r0 * k, k, nc, k, xq, xd, s);
+        iq::MvJob j;
+        j.w = dw;
+        j.ld = rb;
+        j.type = type;
+        j.k = k;
+        j.n = n;
+        j.ncol = nc;
+        j.xq = xq;
+        j.xd = xd;
+        j.y = dy_ref + (size_t) r0 * n;
+        j.ycs = n;
+        CHECK(iq::mv(&j, 1, s));
+    }
+    CHECK(iq::dense_mmq(type, dw, n, k, dx, (size_t) k, rows, dy, (size_t) n, s));
+    CU(cudaStreamSynchronize(s));
+
+    std::vector<float> ref((size_t) rows * n), got((size_t) rows * n);
+    CU(cudaMemcpy(ref.data(), dy_ref, sizeof(float) * ref.size(), cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(got.data(), dy, sizeof(float) * got.size(), cudaMemcpyDeviceToHost));
+    double d2 = 0, r2 = 0, g2 = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        d2 += (double) (got[i] - ref[i]) * (got[i] - ref[i]);
+        r2 += (double) ref[i] * ref[i];
+        g2 += (double) got[i] * got[i];
+    }
+    const double rel = std::sqrt(d2 / std::max(r2, 1e-30));
+    std::printf("  dense_mmq %s [%d x %d] rows=%d: rel %.2e\n", iq::name(type), n, k, rows, rel);
+    CHECK(r2 > 1e-6 && g2 > 1e-6 && rel < 2.0e-2);
+
+    cudaFree(dw);
+    cudaFree(dx);
+    cudaFree(dy);
+    cudaFree(dy_ref);
+    cudaFree(xq);
+    cudaFree(xd);
+    cudaStreamDestroy(s);
+}
 #endif
 
 int main() {
@@ -742,6 +815,9 @@ int main() {
     run_mmq_case(iq::kIQ2_XXS, iq::kIQ2_XXS, 24, 128, 1024, 768, 0.0f, rng);
     run_mmq_case(iq::kQ4_K, iq::kQ6_K, 24, 128, 1024, 1024, 10.0f, rng);
     run_mmq_case(iq::kIQ3_XXS, iq::kIQ3_XXS, 24, 2304, 1024, 1024, 0.0f, rng);   // > 8192 rows -> multi-batch
+    for (int ty : {iq::kQ4_K, iq::kQ6_K, iq::kQ8_0, iq::kIQ3_XXS, iq::kIQ4_XS})
+        run_dense_mmq_case(ty, 512, 1024, 96, rng);
+    run_dense_mmq_case(iq::kQ4_K, 256, 2048, 600, rng);   // exercises dense_mmq row chunking
 #endif
     std::printf("hy4_experts_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

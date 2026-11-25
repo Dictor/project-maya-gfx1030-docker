@@ -616,6 +616,166 @@ constexpr int kRowW = 288;   // words a row (kv_lora 512 + rope 64, F16)
 // HB: the heads a block (a warp each; grid y ceil(H / HB)) - every head's sums the same whichever HB, only the tiles a
 // key is read into: 8 (NVIDIA), 32 on AMD (a gathered key read once for 32 heads rather than 4 times: the indexed
 // layers' prompt attention past the dense span and the decode steps' attention are bound by those reads on a Radeon)
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
+typedef _Float16 hy4_fdot2_h2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float hy4_fdot2(uint32_t a, uint32_t b, float c) {
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(hy4_fdot2_h2, a), __builtin_bit_cast(hy4_fdot2_h2, b), c, false);
+}
+__device__ __forceinline__ uint32_t hy4_pack_h2_rn(float a, float b) {
+    const hy4_fdot2_h2 v = {(_Float16) a, (_Float16) b};
+    return __builtin_bit_cast(uint32_t, v);
+}
+#else
+__device__ __forceinline__ float hy4_fdot2(uint32_t a, uint32_t b, float c) {
+    const float a0 = __half2float(__ushort_as_half((uint16_t) (a & 0xffffu)));
+    const float a1 = __half2float(__ushort_as_half((uint16_t) (a >> 16)));
+    const float b0 = __half2float(__ushort_as_half((uint16_t) (b & 0xffffu)));
+    const float b1 = __half2float(__ushort_as_half((uint16_t) (b >> 16)));
+    return fmaf(a1, b1, fmaf(a0, b0, c));
+}
+__device__ __forceinline__ uint32_t hy4_pack_h2_rn(float a, float b) {
+    return (uint32_t) __half_as_ushort(__float2half_rn(a)) |
+           ((uint32_t) __half_as_ushort(__float2half_rn(b)) << 16);
+}
+#endif
+
+// Prompt-path RDNA 2 MLA attention using v_dot2_f32_f16 (fdot2) + 16B uint4 tile loads (used for T > kMaxWin only,
+// leaving decode T <= kMaxWin bit-identical on the FP32 kernel below).
+template <bool Q8, int HB = 32>
+__global__ void __launch_bounds__(32 * HB) attn_fdot2_kernel(
+        const float* __restrict__ q, int H, const void* __restrict__ cache_v, int ring,
+        const int* __restrict__ keys, int ldk, const int* __restrict__ lo, const int* __restrict__ nk,
+        float scale, int nchunk, int kc, float* __restrict__ ws, int rb) {
+    __shared__ __align__(16) uint32_t tile[kTile][kRowW];
+    __shared__ int rows[kTile];
+    __shared__ float sc[Q8 ? kTile : 1][16];
+    const int c = blockIdx.x, t = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int h = blockIdx.y * HB + w;
+    const int n = nk[t], k0 = c * kc, k1 = min(n, k0 + kc);
+    uint32_t qh2[9];
+    float q_scale = scale;
+    if (h < H) {
+        const float* qh = q + ((size_t) t * H + h) * (2 * kRowW);
+        float ra[9], rb_q[9], mx = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 9; ++i) {
+            const float2 v = *(const float2*) (qh + 2 * (lane + 32 * i));
+            ra[i] = v.x;
+            rb_q[i] = v.y;
+            mx = fmaxf(mx, fmaxf(fabsf(v.x), fabsf(v.y)));
+        }
+        mx = warp_max(mx);
+        int ex = 0;
+        if (mx > 0.0f && isfinite(mx)) {
+            frexpf(mx, &ex);
+            ex = max(-60, min(60, 14 - ex));
+        }
+        const float f = ldexpf(1.0f, ex);
+        q_scale = scale * ldexpf(1.0f, -ex);
+#pragma unroll
+        for (int i = 0; i < 9; ++i) qh2[i] = hy4_pack_h2_rn(ra[i] * f, rb_q[i] * f);
+    }
+    float m = -INFINITY, l = 0.0f, acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+    for (int kt = k0; kt < k1; kt += kTile) {
+        const int nt = min(kTile, k1 - kt);
+        __syncthreads();
+        if ((int) threadIdx.x < nt) {
+            const int p = keys ? keys[(size_t) t * ldk + kt + threadIdx.x] : lo[t] + kt + (int) threadIdx.x;
+            rows[threadIdx.x] = ring > 0 ? p % ring : p;
+        }
+        __syncthreads();
+        if (Q8) {
+            if ((int) threadIdx.x < 2 * nt) {
+                const int r = threadIdx.x >> 1, hf = threadIdx.x & 1;
+                const uint4 u = *(const uint4*) ((const uint8_t*) cache_v + (size_t) rows[r] * rb + 512 + 16 * hf);
+                const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int qd = 0; qd < 4; ++qd) {
+                    sc[r][hf * 8 + 2 * qd] = __half2float(__ushort_as_half((unsigned short) (wd[qd] & 0xffffu)));
+                    sc[r][hf * 8 + 2 * qd + 1] = __half2float(__ushort_as_half((unsigned short) (wd[qd] >> 16)));
+                }
+            }
+            __syncthreads();
+            for (int it = threadIdx.x; it < nt * 40; it += blockDim.x) {
+                const int r = it / 40, ci = it - r * 40;
+                const uint8_t* rp = (const uint8_t*) cache_v + (size_t) rows[r] * rb;
+                if (ci < 32) {
+                    const uint4 u = *(const uint4*) (rp + 16 * ci);
+                    const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+                    const float d = sc[r][ci >> 1];
+#pragma unroll
+                    for (int qd = 0; qd < 4; ++qd) {
+                        const float a0 = (float) (signed char) (wd[qd] & 0xffu);
+                        const float a1 = (float) (signed char) ((wd[qd] >> 8) & 0xffu);
+                        const float a2 = (float) (signed char) ((wd[qd] >> 16) & 0xffu);
+                        const float a3 = (float) (signed char) (wd[qd] >> 24);
+                        tile[r][8 * ci + 2 * qd] = hy4_pack_h2_rn(d * a0, d * a1);
+                        tile[r][8 * ci + 2 * qd + 1] = hy4_pack_h2_rn(d * a2, d * a3);
+                    }
+                } else {
+                    ((uint4*) tile[r])[64 + (ci - 32)] = *(const uint4*) (rp + 544 + 16 * (ci - 32));
+                }
+            }
+        } else {
+            for (int it = threadIdx.x; it < nt * 72; it += blockDim.x) {
+                const int r = it / 72, ci = it - r * 72;
+                ((uint4*) tile[r])[ci] = ((const uint4*) cache_v)[(size_t) rows[r] * 72 + ci];
+            }
+        }
+        __syncthreads();
+        if (h >= H) continue;
+        for (int j = 0; j < nt; j += 2) {
+            const bool has1 = (j + 1) < nt;
+            float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 9; ++i) {
+                const uint32_t kv0 = tile[j][lane + 32 * i];
+                s0 = hy4_fdot2(qh2[i], kv0, s0);
+                if (has1) {
+                    const uint32_t kv1 = tile[j + 1][lane + 32 * i];
+                    s1 = hy4_fdot2(qh2[i], kv1, s1);
+                }
+            }
+            s0 = warp_sum(s0) * q_scale;
+            s1 = has1 ? warp_sum(s1) * q_scale : -INFINITY;
+            const float mn = fmaxf(m, fmaxf(s0, s1));
+            if (mn != m) {
+                const float corr = expf(m - mn);
+                l *= corr;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) acc[i] *= corr;
+                m = mn;
+            }
+            const float p0 = expf(s0 - mn);
+            const float p1 = has1 ? expf(s1 - mn) : 0.0f;
+            l += p0 + p1;
+            const uint32_t p01 = hy4_pack_h2_rn(p0, p1);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t va = tile[j][lane + 32 * i];
+                const uint32_t vb = has1 ? tile[j + 1][lane + 32 * i] : 0u;
+                const uint32_t v0 = __byte_perm(va, vb, 0x5410u);
+                const uint32_t v1 = __byte_perm(va, vb, 0x7632u);
+                acc[2 * i] = hy4_fdot2(p01, v0, acc[2 * i]);
+                acc[2 * i + 1] = hy4_fdot2(p01, v1, acc[2 * i + 1]);
+            }
+        }
+    }
+    if (h >= H) return;
+    float* o = ws + (((size_t) t * H + h) * nchunk + c) * (512 + 2);
+    if (lane == 0) {
+        o[0] = m;
+        o[1] = l;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        o[2 + 2 * (lane + 32 * i)] = acc[2 * i];
+        o[2 + 2 * (lane + 32 * i) + 1] = acc[2 * i + 1];
+    }
+}
+
 template <bool Q8, int HB = 8>
 __global__ void __launch_bounds__(32 * HB) attn_kernel(const float* __restrict__ q, int H, const void* __restrict__ cache_v,
                                                        int ring, const int* __restrict__ keys, int ldk,
@@ -1391,28 +1551,70 @@ __global__ void __launch_bounds__(1024) moe_sort_kernel(const int* __restrict__ 
             continue;
         }
         const int r = atomicAdd(&cnt[s], 1);
+#if defined(STRATA_USE_HIP)
+        tok[r] = i;   // parallel second pass (moe_sort_order_kernel) sorts entries per expert cleanly across all CUs
+#else
         tok[r] = i / n_used;
         row_of[i] = r;
-    }
-#if defined(STRATA_USE_HIP)
-    // AMD: the scatter's order within an expert is the order its threads' atomics land in, which differs from one
-    // run to the next there - and the expert kernels' sums of a row depend a little on the rows beside it (their
-    // tiles), so two starts gave two answers.  Each expert's rows put in token order (a token routes to an expert
-    // once: its rank among the expert's tokens is its row) - the same rows every run
-    __syncthreads();
-    for (int i = threadIdx.x; i < n_ent; i += blockDim.x) {
-        const int s = slot ? slot[ids[i]] : ids[i];
-        if (s < 0) continue;
-        const int t = i / n_used, b0 = bounds[s], b1 = cnt[s];   // (cnt: each expert's end after the scatter)
-        int rank = 0;
-        for (int r = b0; r < b1; ++r) rank += tok[r] < t ? 1 : 0;
-        row_of[i] = b0 + rank;
-    }
-    __syncthreads();
-    for (int i = threadIdx.x; i < n_ent; i += blockDim.x)
-        if (row_of[i] >= 0) tok[row_of[i]] = i / n_used;
 #endif
+    }
 }
+#if defined(STRATA_USE_HIP)
+// Parallel per-expert sort on HIP: replaces single-CU O(N^2) loop while preserving deterministic ascending entry order.
+__global__ void __launch_bounds__(256) moe_sort_order_kernel(const int* __restrict__ bounds, int* __restrict__ tok,
+                                                              int* __restrict__ row_of, int n_used) {
+    __shared__ int sh[4096];
+    const int e = (int) blockIdx.x;
+    const int b0 = bounds[e], b1 = bounds[e + 1], c = b1 - b0;
+    if (c <= 0) return;
+    if (c == 1) {
+        if (threadIdx.x == 0) {
+            const int idx = tok[b0];
+            tok[b0] = idx / n_used;
+            row_of[idx] = b0;
+        }
+        return;
+    }
+    if (c <= 4096) {
+        int P = 1;
+        while (P < c) P <<= 1;
+        for (int r = (int) threadIdx.x; r < P; r += (int) blockDim.x) sh[r] = r < c ? tok[b0 + r] : 0x7fffffff;
+        __syncthreads();
+        for (int k = 2; k <= P; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                for (int idx = (int) threadIdx.x; idx < P; idx += (int) blockDim.x) {
+                    const int ixj = idx ^ j;
+                    if (ixj > idx) {
+                        const int a = sh[idx], b = sh[ixj];
+                        const bool asc = (idx & k) == 0;
+                        if (asc ? (a > b) : (a < b)) {
+                            sh[idx] = b;
+                            sh[ixj] = a;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        for (int r = (int) threadIdx.x; r < c; r += (int) blockDim.x) {
+            const int idx = sh[r];
+            tok[b0 + r] = idx / n_used;
+            row_of[idx] = b0 + r;
+        }
+        return;
+    }
+    for (int r = (int) threadIdx.x; r < c; r += (int) blockDim.x) {
+        const int idx = tok[b0 + r];
+        int rank = 0;
+        for (int q = 0; q < c; ++q) rank += tok[b0 + q] < idx ? 1 : 0;
+        row_of[idx] = b0 + rank;
+    }
+}
+__global__ void moe_sort_write_tok_kernel(const int* __restrict__ row_of, int* __restrict__ tok, int n_ent, int n_used) {
+    const int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (i < n_ent && row_of[i] >= 0) tok[row_of[i]] = i / n_used;
+}
+#endif
 __global__ void moe_combine_kernel(const float* __restrict__ y, const int* __restrict__ row_of,
                                    const float* __restrict__ w, int n_used, int n, float* __restrict__ out, int acc) {
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1986,6 +2188,40 @@ int attn_heads_a_block() {
     return 8;
 #endif
 }
+bool attn_fdot2_enabled() {
+#if defined(STRATA_USE_HIP)
+    static const int env_mode = [] {
+        const char* v = std::getenv("HY4_ATTN_FDOT2");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    if (env_mode == 0) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return env_mode == 1;
+    }
+    if (dev < 0 || dev >= 64) return env_mode == 1;
+    static std::atomic<signed char> known[64]{};
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp prop{};
+        const bool got_prop = cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+        const bool is_gfx103 = got_prop && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0;
+        const bool on = env_mode == 1 || is_gfx103;
+        v = on ? 2 : 1;
+        signed char expected = 0;
+        if (known[dev].compare_exchange_strong(expected, (signed char) v, std::memory_order_relaxed) && on) {
+            std::fprintf(stderr,
+                         "hy4: CUDA%d (%s): prompt MLA attention v_dot2_f32_f16 on (HY4_ATTN_FDOT2=1; HY4_ATTN_FDOT2=0 for F32)\n",
+                         dev, got_prop ? prop.gcnArchName : "unknown");
+        }
+    }
+    return v == 2;
+#else
+    return false;
+#endif
+}
 }  // namespace
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
@@ -2001,10 +2237,18 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
     const int hb = attn_heads_a_block();
     // (8 heads a block - NVIDIA, or HY4_ATTN_HB=8 on AMD: attn2_kernel, attn_kernel's sums in fewer loads; HY4_ATTN_OLD:
-    //  attn_kernel, as before.  16 / 32 - AMD: attn_kernel over that many heads.  The same bits every way)
+    //  attn_kernel, as before.  16 / 32 - AMD: attn_kernel or attn_fdot2_kernel over that many heads.)
     static const bool old = std::getenv("HY4_ATTN_OLD") != nullptr;
     const dim3 grid((unsigned) nchunk, (unsigned) ((H + hb - 1) / hb), (unsigned) T);
-    if (hb == 32) {
+    if (T > kMaxWin && (hb == 32 || hb == 16) && attn_fdot2_enabled()) {
+        if (hb == 32) {
+            if (q8) attn_fdot2_kernel<true, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+            else attn_fdot2_kernel<false, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+        } else {
+            if (q8) attn_fdot2_kernel<true, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
+            else attn_fdot2_kernel<false, 16><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, 0);
+        }
+    } else if (hb == 32) {
         if (q8) attn_kernel<true, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
         else attn_kernel<false, 32><<<grid, 1024, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, nchunk, kc, ws, rb);
     } else if (hb == 16) {
@@ -2332,7 +2576,16 @@ void moe_sort(const int* ids, int T, int n_used, int n_exp, int* bounds, int* to
         g_err.fetch_add(1);
         return;
     }
-    moe_sort_kernel<<<1, 1024, 0, s>>>(ids, T * n_used, slot ? n_slots : n_exp, bounds, tok, row_of, n_used, slot, w);
+    const int ne = slot ? n_slots : n_exp;
+    moe_sort_kernel<<<1, 1024, 0, s>>>(ids, T * n_used, ne, bounds, tok, row_of, n_used, slot, w);
+#if defined(STRATA_USE_HIP)
+    if (ne > 0 && T > 0) {
+        moe_sort_order_kernel<<<(unsigned) ne, 256, 0, s>>>(bounds, tok, row_of, n_used);
+        if (T > 4096)
+            moe_sort_write_tok_kernel<<<(unsigned) ((T * n_used + 255) / 256), 256, 0, s>>>(row_of, tok, T * n_used,
+                                                                                              n_used);
+    }
+#endif
     check("moe_sort");
 }
 void moe_combine(const float* y, const int* row_of, const float* w, int T, int n_used, int n, float* out,

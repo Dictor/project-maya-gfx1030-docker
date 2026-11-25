@@ -364,6 +364,85 @@ void test_attention() {
         cudaFree(q8f);
         cudaFree(deq);
     }
+    {   // prompt MLA attention (T > kMaxWin, exercises attn_fdot2_kernel on HIP gfx103x for F16 and Q8 caches)
+        const int TP = 20, HP = 16, nP = 64, ldkP = 48;
+        auto qP = randn((size_t) TP * HP * KR, 0.1f);
+        auto kvP = randn((size_t) nP * KR);
+        auto wP = randn(KL, 0.2f);
+        auto sinkP = randn(HP, 0.5f);
+        std::vector<int> posP(nP);
+        for (int i = 0; i < nP; ++i) posP[(size_t) i] = i;
+        float *dqP = dev(qP), *dkvP = dev(kvP), *dwP = dev(wP), *dsP = dev(sinkP), *outP, *wsP;
+        int* dposP = dev(posP);
+        cudaMalloc(&outP, sizeof(float) * TP * HP * KL);
+        cudaMalloc(&wsP, sizeof(float) * hy4::k::attn_ws_floats(TP, HP, KL, ldkP));
+        std::vector<int> klP((size_t) TP * ldkP, 0), nkP(TP, 32);
+        std::vector<std::vector<int>> keysP(TP);
+        std::uniform_int_distribution<int> pickP(0, nP - 1);
+        for (int t = 0; t < TP; ++t) {
+            std::vector<int> v;
+            for (int k = 0; k < 31; ++k) v.push_back(pickP(rng));
+            v.push_back(t);
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+            nkP[(size_t) t] = (int) v.size();
+            for (size_t k = 0; k < v.size(); ++k) klP[(size_t) t * ldkP + k] = v[k];
+            keysP[(size_t) t] = v;
+        }
+        int *dkP = dev(klP), *dnkP = dev(nkP);
+        for (int q8 = 0; q8 < 2; ++q8) {
+            const size_t rb = q8 ? hy4::k::kv_q8_row_bytes(KL, R) : (size_t) KR * 2;
+            uint16_t *cP, *dP;
+            cudaMalloc(&cP, rb * nP);
+            cudaMalloc(&dP, sizeof(uint16_t) * nP * KR);
+            hy4::k::kv_store(dkvP, nP, KL, R, dwP, eps, dposP, base, cP, 0, 0, q8 != 0);
+            if (q8) hy4::k::kv_deq(cP, 0, KL, R, 0, nP, dP, 0);
+            else cudaMemcpy(dP, cP, sizeof(uint16_t) * nP * KR, cudaMemcpyDeviceToDevice);
+            std::vector<uint16_t> rh = host(dP, (size_t) nP * KR);
+            std::vector<double> rref((size_t) nP * KR);
+            for (size_t i = 0; i < rh.size(); ++i) {
+                __half hv;
+                std::memcpy(&hv, &rh[i], 2);
+                rref[i] = h2f(hv);
+            }
+            hy4::k::attention(dqP, TP, HP, KL, R, cP, 0, dkP, ldkP, nullptr, dnkP, ldkP, scale, dsP, wsP, outP, 0, q8 != 0);
+            std::vector<double> oref((size_t) TP * HP * KL, 0.0);
+            for (int t = 0; t < TP; ++t)
+                for (int h = 0; h < HP; ++h) {
+                    const float* qh = qP.data() + ((size_t) t * HP + h) * KR;
+                    std::vector<double> sc;
+                    for (int p : keysP[(size_t) t]) {
+                        const double* rr = rref.data() + (size_t) p * KR;
+                        double d = 0;
+                        for (int j = 0; j < KR; ++j) d += qh[j] * rr[j];
+                        sc.push_back(d * scale);
+                    }
+                    double m = sinkP[(size_t) h];
+                    for (double v : sc) m = std::max(m, v);
+                    double den = std::exp(sinkP[(size_t) h] - m);
+                    for (double v : sc) den += std::exp(v - m);
+                    for (size_t k = 0; k < sc.size(); ++k) {
+                        const double pk = std::exp(sc[k] - m) / den;
+                        const double* rr = rref.data() + (size_t) keysP[(size_t) t][k] * KR;
+                        for (int j = 0; j < KL; ++j) oref[((size_t) t * HP + h) * KL + j] += pk * rr[j];
+                    }
+                }
+            const double ep = rel(host(outP, (size_t) TP * HP * KL), oref);
+            std::printf("  attention prompt (%s, T=%d): rel %.2e\n", q8 ? "q8" : "f16", TP, ep);
+            CHECK(ep < 3e-3);
+            cudaFree(cP);
+            cudaFree(dP);
+        }
+        cudaFree(dqP);
+        cudaFree(dkvP);
+        cudaFree(dwP);
+        cudaFree(dsP);
+        cudaFree(dposP);
+        cudaFree(outP);
+        cudaFree(wsP);
+        cudaFree(dkP);
+        cudaFree(dnkP);
+    }
     cudaFree(cache);
     cudaFree(dkv);
     cudaFree(dw);
@@ -1020,6 +1099,67 @@ void test_widen_f16() {
     }
 }
 
+void test_moe_sort() {
+    const int T = 4096, NU = 16, NE = 256, NS = 160;
+    std::uniform_int_distribution<int> pick(0, NE - 1);
+    std::vector<int> ids((size_t) T * NU), slot((size_t) NE, -1);
+    std::vector<float> w((size_t) T * NU);
+    for (int t = 0; t < T; ++t) {
+        for (int j = 0; j < NU; ++j) {
+            int e;
+            bool dup;
+            do {
+                e = pick(rng);
+                dup = false;
+                for (int q = 0; q < j; ++q) dup |= ids[(size_t) t * NU + q] == e;
+            } while (dup);
+            ids[(size_t) t * NU + j] = e;
+            w[(size_t) t * NU + j] = 0.1f + 0.05f * (float) j;
+        }
+    }
+    for (int e = 0; e < NS; ++e) slot[(size_t) e] = e;
+    int *dids = dev(ids), *dslot = dev(slot), *dbounds, *dtok, *drow;
+    float* dw = dev(w);
+    cudaMalloc(&dbounds, sizeof(int) * (NE + 1));
+    cudaMalloc(&dtok, sizeof(int) * T * NU);
+    cudaMalloc(&drow, sizeof(int) * T * NU);
+
+    // Full expert set
+    hy4::k::moe_sort(dids, T, NU, NE, dbounds, dtok, drow, 0);
+    auto b_full = host(dbounds, (size_t) NE + 1);
+    auto tok_full = host(dtok, (size_t) T * NU);
+    auto row_full = host(drow, (size_t) T * NU);
+    CHECK(b_full[0] == 0 && b_full[(size_t) NE] == T * NU);
+    for (int e = 0; e < NE; ++e) {
+        for (int r = b_full[(size_t) e] + 1; r < b_full[(size_t) e + 1]; ++r)
+            CHECK(tok_full[(size_t) (r - 1)] < tok_full[(size_t) r]);
+    }
+    for (int i = 0; i < T * NU; ++i) CHECK(row_full[(size_t) i] >= 0 && tok_full[(size_t) row_full[(size_t) i]] == i / NU);
+
+    // Partial slot mask + weight zeroing
+    hy4::k::moe_sort(dids, T, NU, NE, dbounds, dtok, drow, 0, dslot, dw, NS);
+    auto b_part = host(dbounds, (size_t) NS + 1);
+    auto tok_part = host(dtok, (size_t) b_part[(size_t) NS]);
+    auto row_part = host(drow, (size_t) T * NU);
+    auto w_part = host(dw, (size_t) T * NU);
+    int expected_part = 0;
+    for (int i = 0; i < T * NU; ++i) {
+        if (slot[(size_t) ids[(size_t) i]] < 0) {
+            CHECK(row_part[(size_t) i] == -1 && w_part[(size_t) i] == 0.0f);
+        } else {
+            ++expected_part;
+            CHECK(row_part[(size_t) i] >= 0 && tok_part[(size_t) row_part[(size_t) i]] == i / NU);
+        }
+    }
+    CHECK(b_part[(size_t) NS] == expected_part);
+    for (int s = 0; s < NS; ++s)
+        for (int r = b_part[(size_t) s] + 1; r < b_part[(size_t) s + 1]; ++r)
+            CHECK(tok_part[(size_t) (r - 1)] < tok_part[(size_t) r]);
+    std::printf("  moe_sort (T=%d, full=%d, partial=%d): ok\n", T, T * NU, expected_part);
+
+    for (void* p : {(void*) dids, (void*) dslot, (void*) dbounds, (void*) dtok, (void*) drow, (void*) dw}) cudaFree(p);
+}
+
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -1034,6 +1174,7 @@ int main() {
     test_engram();
     test_row_top();
     test_widen_f16();
+    test_moe_sort();
     CHECK(hy4::k::errors() == 0);
     std::printf("hy4_kernels_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;

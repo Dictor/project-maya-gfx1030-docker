@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -226,6 +227,73 @@ inline std::vector<PipeChunk> pipe_chunks(int n, int Tc) {
         done += T;
     }
     return out;
+}
+
+/// 2-GPU balanced layer split for pipelined prompt prefill: chooses split s in [1, n_layer) with per-GPU resident
+/// expert counts n0 / n1 maximizing pipeline balance (min max(cost0, cost1)) while preserving >= 98% of total VRAM experts.
+struct BalancedSplit {
+    bool ok = false;
+    int split = 0;
+    int n0 = 0;
+    int n1 = 0;
+};
+inline BalancedSplit balanced_pipe_split(const std::vector<double>& dense_b, const std::vector<double>& exp_b,
+                                         const std::vector<double>& cost, const std::vector<bool>& is_dense,
+                                         int n_expert, double free0, double free1, double cap, double head_cost0,
+                                         double head_cost1, int greedy_split, int64_t greedy_res) {
+    BalancedSplit best;
+    const int nL = (int) dense_b.size();
+    if (nL < 2 || n_expert <= 0 || greedy_split <= 0 || greedy_split >= nL) return best;
+    auto side_cost = [&](int a, int b, double hc) {
+        double c = hc;
+        for (int i = a; i < b; ++i) c += cost[(size_t) i];
+        return c;
+    };
+    const double greedy_max = std::max(side_cost(0, greedy_split, head_cost0),
+                                       side_cost(greedy_split, nL, head_cost1));
+    double best_max = greedy_max;
+    int64_t best_res = greedy_res;
+    const int max_n = std::min(n_expert, (int) std::floor(std::max(0.0, std::min(1.0, cap)) * n_expert));
+    auto fit_side = [&](int a, int b, double free_b, int& out_n, int64_t& out_res) -> bool {
+        double dsum = 0.0, esum = 0.0;
+        int n_moe = 0;
+        for (int i = a; i < b; ++i) {
+            dsum += dense_b[(size_t) i];
+            if (!is_dense[(size_t) i]) {
+                esum += exp_b[(size_t) i];
+                ++n_moe;
+            }
+        }
+        if (dsum > free_b) return false;
+        if (n_moe == 0 || esum <= 0.0) {
+            out_n = 0;
+            out_res = 0;
+            return true;
+        }
+        const int n = std::min(max_n, (int) std::floor((free_b - dsum) / esum));
+        if (n < 0) return false;
+        out_n = n;
+        out_res = (int64_t) n_moe * n;
+        return true;
+    };
+    const int64_t min_res = (int64_t) std::floor(0.98 * (double) greedy_res);
+    for (int s = 1; s < nL; ++s) {
+        int n0 = 0, n1 = 0;
+        int64_t r0 = 0, r1 = 0;
+        if (!fit_side(0, s, free0, n0, r0) || !fit_side(s, nL, free1, n1, r1)) continue;
+        const int64_t tot_res = r0 + r1;
+        if (tot_res < min_res) continue;
+        const double mx = std::max(side_cost(0, s, head_cost0), side_cost(s, nL, head_cost1));
+        if (mx < best_max - 1e-6 || (std::fabs(mx - best_max) <= 1e-6 && tot_res > best_res)) {
+            best.ok = true;
+            best.split = s;
+            best.n0 = n0;
+            best.n1 = n1;
+            best_max = mx;
+            best_res = tot_res;
+        }
+    }
+    return best;
 }
 
 }  // namespace hy4

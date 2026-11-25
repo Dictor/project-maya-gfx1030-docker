@@ -2141,6 +2141,39 @@ struct MmqScratch {
         cap_ids = new_ids;
         return true;
     }
+    bool ensure_dense(int rows, int k) {
+        if (rows <= 0 || k <= 0) return false;
+        if (!ready) {
+            cudaEvent_t created = nullptr;
+            if (!mmq_resource_ok(cudaEventCreateWithFlags(&created, cudaEventDisableTiming))) return false;
+            ready = created;
+        }
+        const size_t q8 = strata::prefill::mmq::q8_bytes(rows, k);
+        const int need_ids = rows + (int) strata::prefill::mmq::IDS_PAD;
+        if (q8 > cap_xq) {
+            void* next = nullptr;
+            if (!mmq_alloc(&next, q8)) return false;
+            if (xq) (void) cudaFree(xq);
+            xq = next;
+            cap_xq = q8;
+        }
+        if (b == nullptr || cap_ne < 1) {
+            int* next = nullptr;
+            if (!mmq_alloc((void**) &next, 2 * sizeof(int))) return false;
+            if (b) (void) cudaFree(b);
+            b = next;
+            cap_ne = 1;
+        }
+        if (ids == nullptr || need_ids > cap_ids) {
+            int* next = nullptr;
+            if (!mmq_alloc((void**) &next, (size_t) need_ids * sizeof(int))) return false;
+            if (ids) (void) cudaFree(ids);
+            ids = next;
+            cap_ids = need_ids;
+        }
+        if (!ctx) ctx = new strata::prefill::mmq::Context();
+        return true;
+    }
     void release() {
         if (xq) (void) cudaFree(xq);
         if (gu) (void) cudaFree(gu);
@@ -2171,6 +2204,13 @@ __global__ void mmq_shift_bounds(const int* src, int* dst, int n, int row0) {
 __global__ void mmq_iota(int* dst, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = i;
+}
+
+__global__ void mmq_set_pair(int* dst, int rows) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        dst[0] = 0;
+        dst[1] = rows;
+    }
 }
 
 __global__ void mmq_half_float(const uint16_t* __restrict__ h, float* __restrict__ f, int rows, int cols, int ld) {
@@ -2367,6 +2407,58 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
 
 }  // namespace
 
+bool dense_mmq(int type, const uint8_t* w, int n, int k, const float* x, size_t ldx, int rows, float* y, size_t ldy,
+               cudaStream_t s) {
+    if (rows < 32 || n <= 0 || k <= 0 || w == nullptr || x == nullptr || y == nullptr ||
+        ldx < (size_t) k || (ldx % 4) != 0 || ldy < (size_t) n ||
+        k % block_values(type) != 0 || k % 32 != 0 ||
+        !strata::prefill::mmq::built() || !strata::prefill::mmq::supported(type))
+        return false;
+    int device = 0;
+    cudaStreamCaptureStatus capture;
+    mmq_check(cudaGetDevice(&device), "device query");
+    mmq_check(cudaStreamIsCapturing(s, &capture), "capture query");
+    if (capture != cudaStreamCaptureStatusNone) return false;
+    const size_t pad_k = (size_t) ((k + 511) / 512 * 512);
+    const size_t row_q8 = std::max<size_t>(1, (pad_k / 128) * strata::prefill::mmq::q8_block_bytes());
+    const int step_cap = std::min(rows, std::max(512, (int) ((24ull << 20) / row_q8)));
+    MmqScratch& sc = mmq_scratch(device, s);
+    if (!sc.ensure_dense(step_cap, k)) return false;
+    if (sc.recorded) mmq_check(cudaStreamWaitEvent(s, sc.ready, 0), "scratch wait");
+    const int need_ids = step_cap + (int) strata::prefill::mmq::IDS_PAD;
+    mmq_iota<<<(need_ids + 255) / 256, 256, 0, s>>>(sc.ids, need_ids);
+    mmq_check(cudaGetLastError(), "launch");
+    const size_t w_bytes = strata::prefill::mmq::matrix_bytes(type, n, k);
+    for (int r0 = 0; r0 < rows; r0 += step_cap) {
+        const int cur = std::min(step_cap, rows - r0);
+        mmq_set_pair<<<1, 1, 0, s>>>(sc.b, cur);
+        mmq_check(cudaGetLastError(), "launch");
+        strata::prefill::mmq::quantize(x + (size_t) r0 * ldx, nullptr, sc.xq, type, k, (int64_t) ldx, cur, (void*) s);
+        strata::prefill::mmq::Product p{};
+        p.w = w;
+        p.type = type;
+        p.w_rows = n;
+        p.w_cols = k;
+        p.expert_bytes = w_bytes;
+        p.n = 1;
+        p.xq = sc.xq;
+        p.bounds = sc.b;
+        p.ids = sc.ids;
+        p.total_rows = cur;
+        p.max_rows = type == kIQ2_S ? std::max(cur, 32) : cur;
+        p.dst = y + (size_t) r0 * ldy;
+        p.ld_dst = (int64_t) ldy;
+        sc.ctx->run(p, (void*) s);
+    }
+    mmq_check(cudaEventRecord(sc.ready, s), "scratch completion");
+    sc.recorded = true;
+    return true;
+}
+
+#elif defined(STRATA_USE_HIP)
+bool dense_mmq(int, const uint8_t*, int, int, const float*, size_t, int, float*, size_t, cudaStream_t) {
+    return false;
+}
 #endif
 
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)

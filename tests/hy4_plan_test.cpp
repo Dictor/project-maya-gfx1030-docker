@@ -402,6 +402,33 @@ int main() {
         CHECK(c64k.size() == 16 && sum == 64713 && c64k.back().len == 4096);
         CHECK(c64k[c64k.size() - 2].len == (64713 - 4096) % 4096);
     }
+    // 2-GPU balanced pipeline layer split (per-GPU expert density adjustment)
+    {
+        const int nL = 42, nExp = 512;
+        std::vector<double> dense_b(nL, 0.25), exp_b(nL, 0.0028), cost(nL, 1.0);
+        std::vector<bool> is_dense(nL, false);
+        is_dense[0] = true;
+        exp_b[0] = 0.0;
+        for (int il = 0; il < nL; ++il) {
+            if (il % 4 == 2) {
+                dense_b[(size_t) il] = 0.45;
+                cost[(size_t) il] += 1.5;   // indexed layer cost
+            }
+            if (il == 1 || il == 11 || il == 21 || il == 31) cost[(size_t) il] += 0.3;
+        }
+        const int64_t greedy_res = 41LL * 336;
+        hy4::BalancedSplit bs = hy4::balanced_pipe_split(dense_b, exp_b, cost, is_dense, nExp, 26.0, 29.8, 1.0,
+                                                         1.0, 0.0, 18, greedy_res);
+        CHECK(bs.ok && bs.split > 18 && bs.split <= 21);
+        int64_t tot_res = 0;
+        for (int il = 0; il < nL; ++il)
+            if (!is_dense[(size_t) il]) tot_res += (il < bs.split ? bs.n0 : bs.n1);
+        CHECK(tot_res >= (int64_t) std::floor(0.98 * (double) greedy_res));
+        // If GPU0 lacks room for balanced split's dense bytes, stays not ok / keeps greedy
+        hy4::BalancedSplit tight = hy4::balanced_pipe_split(dense_b, exp_b, cost, is_dense, nExp, 6.0, 29.8, 1.0,
+                                                            1.0, 0.0, 18, greedy_res);
+        CHECK(!tight.ok);
+    }
     std::puts("hy4_plan_test: ok");
     return 0;
 }

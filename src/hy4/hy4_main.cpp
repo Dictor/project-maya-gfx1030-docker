@@ -739,22 +739,43 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         }
         bool ok = true, cancel = false;
         const int C = std::max(1, m.chunk());
-        for (size_t a = from; a < r.ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) C, r.ids.size() - a);
-            const bool last = a + (size_t) T == r.ids.size();
-            if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
-                ok = false;
-                break;
-            }
-            state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
-            a += (size_t) T;
-            const double ms = now() * 1e3 - t0;
-            std::printf("PP %zu %zu %.1f %.1f %zu\n", a, r.ids.size(), ms, ms > 0 ? 1000.0 * (double) (a - from) / ms : 0.0,
-                        from);
-            std::fflush(stdout);
-            if (in.stop.load() && !last) {
-                cancel = true;
-                break;
+        const size_t rem = r.ids.size() - from;
+        if (rem > (size_t) C) {
+            size_t prev_rel = 0;
+            auto on_chunk = [&](int done_rel) -> bool {
+                const size_t cur_rel = (size_t) done_rel;
+                if (cur_rel > prev_rel) {
+                    state.insert(state.end(), r.ids.begin() + (long) (from + prev_rel),
+                                 r.ids.begin() + (long) (from + cur_rel));
+                    prev_rel = cur_rel;
+                }
+                const size_t a = from + cur_rel;
+                const double ms = now() * 1e3 - t0;
+                std::printf("PP %zu %zu %.1f %.1f %zu\n", a, r.ids.size(), ms,
+                            ms > 0 ? 1000.0 * (double) cur_rel / ms : 0.0, from);
+                std::fflush(stdout);
+                return !(in.stop.load() && a < r.ids.size());
+            };
+            ok = m.forward_prompt(r.ids.data() + from, (int) rem, (int64_t) from, 1, lg.data(), err, on_chunk,
+                                  &cancel);
+        } else {
+            for (size_t a = from; a < r.ids.size();) {
+                const int T = (int) std::min<size_t>((size_t) C, r.ids.size() - a);
+                const bool last = a + (size_t) T == r.ids.size();
+                if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
+                    ok = false;
+                    break;
+                }
+                state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
+                a += (size_t) T;
+                const double ms = now() * 1e3 - t0;
+                std::printf("PP %zu %zu %.1f %.1f %zu\n", a, r.ids.size(), ms,
+                            ms > 0 ? 1000.0 * (double) (a - from) / ms : 0.0, from);
+                std::fflush(stdout);
+                if (in.stop.load() && !last) {
+                    cancel = true;
+                    break;
+                }
             }
         }
         const double t1 = now() * 1e3;

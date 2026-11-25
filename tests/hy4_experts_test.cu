@@ -544,6 +544,147 @@ void lane_waits_cases() {
     std::printf("  CPU lane's waits by system and environment: %s\n", fails ? "FAILED" : "ok");
 }
 
+#if defined(STRATA_USE_HIP) && defined(MAYA_DS4_IQ_MMQ)
+void run_mmq_case(int tg, int td, int n_exp, int T, int E, int F, float limit, std::mt19937& rng) {
+    const int nu = 4;
+    const size_t gb = iq::row_bytes(tg, E) * F, db = iq::row_bytes(td, F) * E;
+    auto al = [](size_t b) { return (b + 255) / 256 * 256; };
+    const size_t tr[3] = {0, al(gb), 2 * al(gb)}, blob = al(2 * al(gb) + db);
+    std::vector<uint8_t> host(blob * n_exp);
+    std::normal_distribution<float> nd(0.0f, 0.05f);
+    for (int e = 0; e < n_exp; ++e) {
+        uint8_t* b = host.data() + (size_t) e * blob;
+        for (int role = 0; role < 3; ++role) {
+            const int type = role < 2 ? tg : td, k = role < 2 ? E : F, n = role < 2 ? F : E;
+            for (int r = 0; r < n; ++r) {
+                uint8_t* row = b + tr[role] + (size_t) r * iq::row_bytes(type, k);
+                if (type == iq::kQ8_0) {
+                    std::vector<float> w(k);
+                    for (float& v : w) v = nd(rng);
+                    quant_q8_0(w.data(), k, row);
+                } else {
+                    random_k(type, k, row, rng);
+                }
+            }
+        }
+    }
+    uint8_t* dw;
+    CU(cudaMalloc(&dw, host.size()));
+    CU(cudaMemcpy(dw, host.data(), host.size(), cudaMemcpyHostToDevice));
+    std::vector<float> x((size_t) T * E);
+    std::normal_distribution<float> nx(0.0f, 1.0f);
+    for (float& v : x) v = nx(rng);
+    std::vector<int> ids((size_t) T * nu);
+    std::vector<float> w((size_t) T * nu);
+    std::uniform_int_distribution<int> pick(0, n_exp - 1);
+    for (int t = 0; t < T; ++t)
+        for (int j = 0; j < nu; ++j) {
+            int e;
+            bool dup;
+            do {
+                e = pick(rng);
+                dup = false;
+                for (int q = 0; q < j; ++q) dup |= ids[(size_t) t * nu + q] == e;
+            } while (dup);
+            ids[(size_t) t * nu + j] = e;
+            w[(size_t) t * nu + j] = 0.25f + 0.1f * j;
+        }
+    cudaStream_t s;
+    CU(cudaStreamCreate(&s));
+    float *dx, *dy_ref, *dy_mmq, *dw_, *dout_ref, *dout_mmq;
+    int *dids, *bounds, *tok, *row_of;
+    uint16_t* h16;
+    CU(cudaMalloc(&dx, sizeof(float) * T * E));
+    CU(cudaMalloc(&dy_ref, sizeof(float) * T * nu * E));
+    CU(cudaMalloc(&dy_mmq, sizeof(float) * T * nu * E));
+    CU(cudaMalloc(&dw_, sizeof(float) * T * nu));
+    CU(cudaMalloc(&dout_ref, sizeof(float) * T * E));
+    CU(cudaMalloc(&dout_mmq, sizeof(float) * T * E));
+    CU(cudaMalloc(&dids, sizeof(int) * T * nu));
+    CU(cudaMalloc(&bounds, sizeof(int) * (n_exp + 1)));
+    CU(cudaMalloc(&tok, sizeof(int) * T * nu));
+    CU(cudaMalloc(&row_of, sizeof(int) * T * nu));
+    CU(cudaMalloc(&h16, sizeof(uint16_t) * T * nu * F));
+    CU(cudaMemcpy(dx, x.data(), sizeof(float) * T * E, cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(dids, ids.data(), sizeof(int) * T * nu, cudaMemcpyHostToDevice));
+    CU(cudaMemcpy(dw_, w.data(), sizeof(float) * T * nu, cudaMemcpyHostToDevice));
+    hy4::k::moe_sort(dids, T, nu, n_exp, bounds, tok, row_of, s);
+    std::vector<int> hb((size_t) n_exp + 1);
+    CU(cudaMemcpyAsync(hb.data(), bounds, sizeof(int) * (n_exp + 1), cudaMemcpyDeviceToHost, s));
+    CU(cudaStreamSynchronize(s));
+    int mr = 0;
+    for (int e = 0; e < n_exp; ++e) mr = std::max(mr, hb[(size_t) e + 1] - hb[(size_t) e]);
+
+    iq::SetArgs sa;
+    sa.wbase = dw;
+    sa.stride = blob;
+    sa.tr[0] = tr[0];
+    sa.tr[1] = tr[1];
+    sa.tr[2] = tr[2];
+    sa.bounds = bounds;
+    sa.max_rows = mr;
+    sa.n_exp = n_exp;
+    sa.n_embd = E;
+    sa.n_ff = F;
+    sa.limit = limit;
+    sa.xf = dx;
+    sa.idx = tok;
+    sa.ldx = E;
+    sa.h = h16;
+    sa.ldo = F;
+    sa.tg = tg;
+    sa.td = td;
+
+    CHECK(iq::set_gate_up(sa, s));
+    iq::SetArgs sd = sa;
+    sd.xf = nullptr;
+    sd.idx = nullptr;
+    sd.xh = h16;
+    sd.ldx = F;
+    sd.h = nullptr;
+    sd.y = dy_ref;
+    sd.ldo = E;
+    CHECK(iq::set_down(sd, s));
+    hy4::k::moe_combine(dy_ref, row_of, dw_, T, nu, E, dout_ref, s);
+
+    {
+        iq::MmqRowsScope mmq_scope(hb[(size_t) n_exp], hb.data());
+        CHECK(iq::set_gate_up(sa, s));
+        sd.y = dy_mmq;
+        CHECK(iq::set_down(sd, s));
+    }
+    hy4::k::moe_combine(dy_mmq, row_of, dw_, T, nu, E, dout_mmq, s);
+
+    std::vector<float> ref((size_t) T * E), got((size_t) T * E);
+    CU(cudaMemcpy(ref.data(), dout_ref, sizeof(float) * ref.size(), cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(got.data(), dout_mmq, sizeof(float) * got.size(), cudaMemcpyDeviceToHost));
+    double d2 = 0, r2 = 0, g2 = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        d2 += (double) (got[i] - ref[i]) * (got[i] - ref[i]);
+        r2 += (double) ref[i] * ref[i];
+        g2 += (double) got[i] * got[i];
+    }
+    const double rel = std::sqrt(d2 / std::max(r2, 1e-30));
+    std::printf("  MMQ vs tiles %s/%s E=%d F=%d limit=%.1f rows=%d: rel %.2e (|out|=%.2e)\n",
+                iq::name(tg), iq::name(td), E, F, (double) limit, hb[(size_t) n_exp], rel, std::sqrt(g2));
+    CHECK(r2 > 1e-6 && g2 > 1e-6 && rel < 2.5e-2);
+
+    cudaFree(dw);
+    cudaFree(dx);
+    cudaFree(dy_ref);
+    cudaFree(dy_mmq);
+    cudaFree(dw_);
+    cudaFree(dout_ref);
+    cudaFree(dout_mmq);
+    cudaFree(dids);
+    cudaFree(bounds);
+    cudaFree(tok);
+    cudaFree(row_of);
+    cudaFree(h16);
+    cudaStreamDestroy(s);
+}
+#endif
+
 int main() {
     lane_waits_cases();
     int n = 0;
@@ -595,6 +736,13 @@ int main() {
             run_case(ty, iq::kQ6_K, 24, 1, rng, 512, false);
             run_case(ty, iq::kQ6_K, 24, 3, rng, 512, false);
         }
+#if defined(STRATA_USE_HIP) && defined(MAYA_DS4_IQ_MMQ)
+    // Hy4-Flash shapes (unclamped limit=0.0f + batched > 8192 rows) on MMQ vs FP32 tiles
+    run_mmq_case(iq::kIQ3_XXS, iq::kIQ3_XXS, 24, 128, 1024, 1024, 0.0f, rng);
+    run_mmq_case(iq::kIQ2_XXS, iq::kIQ2_XXS, 24, 128, 1024, 768, 0.0f, rng);
+    run_mmq_case(iq::kQ4_K, iq::kQ6_K, 24, 128, 1024, 1024, 10.0f, rng);
+    run_mmq_case(iq::kIQ3_XXS, iq::kIQ3_XXS, 24, 2304, 1024, 1024, 0.0f, rng);   // > 8192 rows -> multi-batch
+#endif
     std::printf("hy4_experts_test: %s\n", fails ? "FAILED" : "ok");
     return fails ? 1 : 0;
 }

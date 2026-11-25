@@ -379,6 +379,29 @@ int main() {
         CHECK(hy4::experts_held(8, {&short_map}) == 2);
         CHECK(hy4::experts_held(0, {&all}) == 0);
     }
+    // 2-GPU prompt pipeline stage contiguity and chunk schedule
+    {
+        hy4::PipePlan p = hy4::pipe_plan({0, 0, 0, 1, 1}, 2);
+        CHECK(p.ok && p.split == 3);
+        std::vector<int> w6800(42, 0);
+        for (int il = 18; il < 42; ++il) w6800[(size_t) il] = 1;
+        p = hy4::pipe_plan(w6800, 2);
+        CHECK(p.ok && p.split == 18);
+        CHECK(!hy4::pipe_plan({0, 0, 0, 0}, 2).ok);
+        CHECK(!hy4::pipe_plan({1, 1, 0, 0}, 2).ok);
+        CHECK(!hy4::pipe_plan({0, 1, 0, 1}, 2).ok);
+        CHECK(!hy4::pipe_plan({0, 1}, 1).ok);
+        CHECK(!hy4::pipe_plan({0, 1, 2}, 3).ok);
+        const auto c1 = hy4::pipe_chunks(4096, 4096);
+        CHECK(c1.size() == 1 && c1[0].off == 0 && c1[0].len == 4096);
+        const auto c2 = hy4::pipe_chunks(4097, 4096);
+        CHECK(c2.size() == 2 && c2[0].off == 0 && c2[0].len == 1 && c2[1].off == 1 && c2[1].len == 4096);
+        const auto c64k = hy4::pipe_chunks(64713, 4096);
+        int sum = 0;
+        for (const auto& c : c64k) sum += c.len;
+        CHECK(c64k.size() == 16 && sum == 64713 && c64k.back().len == 4096);
+        CHECK(c64k[c64k.size() - 2].len == (64713 - 4096) % 4096);
+    }
     std::puts("hy4_plan_test: ok");
     return 0;
 }

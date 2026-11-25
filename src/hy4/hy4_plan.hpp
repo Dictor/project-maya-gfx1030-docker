@@ -192,4 +192,40 @@ inline double dfly_bytes(double file, double head, long long layers, long long w
            (double) win * (double) (8 * n_embd + 3 * ff) * 4 + (double) (8u << 20);
 }
 
+/// 2-GPU contiguous layer-split check for pipelined prompt prefill: GPU 0 owns [0, split), GPU 1 owns [split, n_layer).
+struct PipePlan {
+    bool ok = false;
+    int split = 0;
+};
+inline PipePlan pipe_plan(const std::vector<int>& layer_gpu, int n_gpu) {
+    PipePlan p;
+    if (n_gpu != 2 || layer_gpu.size() < 2 || layer_gpu[0] != 0) return p;
+    int split = 0;
+    while (split < (int) layer_gpu.size() && layer_gpu[(size_t) split] == 0) ++split;
+    if (split <= 0 || split >= (int) layer_gpu.size()) return p;
+    for (size_t il = (size_t) split; il < layer_gpu.size(); ++il)
+        if (layer_gpu[il] != 1) return p;
+    p.ok = true;
+    p.split = split;
+    return p;
+}
+
+struct PipeChunk {
+    int off = 0;
+    int len = 0;
+};
+/// Matches Model::forward's exact chunking: head chunks of Tc tokens, last chunk of min(n, Tc) tokens.
+inline std::vector<PipeChunk> pipe_chunks(int n, int Tc) {
+    std::vector<PipeChunk> out;
+    if (n <= 0 || Tc <= 0) return out;
+    const int last = std::min(n, Tc), head = n - last;
+    int done = 0;
+    while (done < n) {
+        const int T = done < head ? std::min(Tc, head - done) : last;
+        out.push_back({done, T});
+        done += T;
+    }
+    return out;
+}
+
 }  // namespace hy4

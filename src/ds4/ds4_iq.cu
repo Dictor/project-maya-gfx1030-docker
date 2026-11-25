@@ -4,14 +4,14 @@
 #include "ds4_iq1_codes.hpp"
 #include "ds4_par_exp.h"
 #include "ds4_pdl.cuh"
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
+#if defined(STRATA_USE_HIP) && (!defined(MAYA_DS4_IQ_ONLY) || defined(MAYA_DS4_IQ_MMQ))
 #include "strata/prefill/moe_mmq.hpp"
-#if defined(STRATA_USE_HIP)
-#include "strata/prefill/moe_fused_rdna4.hpp"
-#endif
 #include <cstring>
 #include <map>
 #include <memory>
+#endif
+#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
+#include "strata/prefill/moe_fused_rdna4.hpp"
 #endif
 
 #include <cuda_fp16.h>
@@ -1977,12 +1977,12 @@ bool persist_on() {
 }
 void set_persist(int on) { g_persist_set.store(on < 0 ? -1 : on != 0 ? 1 : 0, std::memory_order_relaxed); }
 
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
-// Prompt expert sets through the existing GLM MMQ path (HIP, opt-in).
+#if defined(STRATA_USE_HIP) && (!defined(MAYA_DS4_IQ_ONLY) || defined(MAYA_DS4_IQ_MMQ))
+// Prompt expert sets through the existing GLM MMQ path (HIP).
 // The same q8_1/MMA path the GLM prompt uses (strata::prefill::mmq): the packed expert is read once, activations are
-// rounded to q8_1, and the products run on int8 tensor cores.  Opt-in (MAYA_DS4_EXPERT_MMQ=1), sets of at least 32 rows;
-// smaller sets, unsupported shapes/types and allocation failure keep the FP32 tiled kernel above.  MMQ launches a kernel a
-// matrix an expert, so an IQ1_S set's experts of few rows stay on the light kernels and the tiles (mmq_min_rows).
+// rounded to q8_1, and the products run on int8 tensor cores / dot4 units.  Sets of at least 32 rows; smaller sets,
+// unsupported shapes/types and allocation failure keep the FP32 tiled kernel above.  Batched in row-bounded slices
+// so scratch VRAM stays bounded (~110 MB on Hy4).
 namespace {
 thread_local int mmq_rows = 0;
 thread_local const int* mmq_host_bounds = nullptr;
@@ -1998,13 +1998,20 @@ MmqRowsScope::~MmqRowsScope() {
 }
 namespace {
 
-constexpr int kMmqCap = 32768;  // maximum compact rows in one prompt set
+constexpr int kMmqCap = 65536;        // maximum compact rows in one prompt set (4096 x 16 on Hy4)
+constexpr int kMmqBatchRows = 8192;   // cap per-batch scratch rows (~110 MB VRAM on Hy4)
 bool mmq_on() {
+#if defined(MAYA_DS4_IQ_MMQ)
+    if (const char* e = std::getenv("HY4_EXPERT_MMQ")) return std::atoi(e) != 0;
+    if (const char* e = std::getenv("MAYA_DS4_EXPERT_MMQ")) return std::strcmp(e, "1") == 0;
+    return true;   // caller gates per-GPU via MmqRowsScope
+#else
     static const bool enabled = [] {
         const char* e = std::getenv("MAYA_DS4_EXPERT_MMQ");
         return e != nullptr && std::strcmp(e, "1") == 0;
     }();
     return enabled;
+#endif
 }
 
 // the rows an expert needs to take MMQ; the set's others stay on the light kernels and the tiles, after it.
@@ -2030,21 +2037,23 @@ int mmq_rest_rows(const SetArgs& a, int type) {
 
 bool mmq_wanted(const SetArgs& a, bool gate_up) {
     // (skip_ge: the rest of a set MMQ has run, set_gate_up / set_down)
-    if (!mmq_on() || a.skip_ge > 0 || a.max_rows < 32 || a.n_exp <= 0 || a.n_exp > 512 || !mmq_host_bounds || mmq_rows <= 0)
+    if (!mmq_on() || a.skip_ge > 0 || mmq_rows < 32 || mmq_rows > kMmqCap || a.n_exp <= 0 || a.n_exp > 512 ||
+        !mmq_host_bounds)
         return false;
     if (mmq_host_bounds[0] != a.row0 || mmq_host_bounds[a.n_exp] - a.row0 != mmq_rows) return false;
     for (int i = 0; i < a.n_exp; ++i) {
         const int rows = mmq_host_bounds[i + 1] - mmq_host_bounds[i];
         if (rows < 0 || rows > a.max_rows) return false;
     }
-    if (a.n_embd != 5120 || a.n_ff != 2304) return false;   // the DS4 pack's geometry
+    if (a.n_embd <= 0 || a.n_ff <= 0 || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    if (a.act != kActSwiglu) return false;
+    if (gate_up && a.tu != 0 && a.tu != a.tg) return false;
     if (a.ldx < (gate_up ? a.n_embd : a.n_ff) || a.ldo < (gate_up ? a.n_ff : a.n_embd)) return false;
     if (gate_up && a.ldx % 4 != 0) return false;   // the MMQ quantizer loads float4s
     if (gate_up ? (a.xf == nullptr || a.h == nullptr) : (a.xh == nullptr || a.y == nullptr)) return false;
     const int type = gate_up ? a.tg : a.td;
-    if (type != kIQ2_S && type != kIQ2_XXS && type != kIQ3_S && type != kIQ3_XXS && type != kIQ1_S) return false;
     if (a.max_rows < mmq_min_rows(type)) return false;   // (no expert of the set would take it)
-    if (!strata::prefill::mmq::built() || !strata::prefill::mmq::supported(gate_up ? a.tg : a.td)) return false;
+    if (!strata::prefill::mmq::built() || !strata::prefill::mmq::supported(type)) return false;
     return true;
 }
 
@@ -2088,28 +2097,48 @@ struct MmqScratch {
     float* hf = nullptr;
     int* b = nullptr;
     int* ids = nullptr;
-    int rows = 0;
+    size_t cap_xq = 0;
+    size_t cap_gu = 0;
+    size_t cap_hf = 0;
+    int cap_ne = 0;
+    int cap_ids = 0;
 
-    bool ensure(int nrows, int ne) {
-        if (nrows <= 0 || nrows > kMmqCap || ne <= 0 || ne > 512) return false;
+    bool ensure(int batch_rows, int ne, int n_embd, int n_ff) {
+        if (batch_rows <= 0 || batch_rows > kMmqCap || ne <= 0 || ne > 512) return false;
         if (!ready) {
             cudaEvent_t created = nullptr;
             if (!mmq_resource_ok(cudaEventCreateWithFlags(&created, cudaEventDisableTiming))) return false;
             ready = created;
         }
-        if (rows >= nrows && b != nullptr) return true;   // grow only
+        const size_t q8 = strata::prefill::mmq::q8_bytes(batch_rows, std::max(n_embd, n_ff));
+        const size_t gu_b = (size_t) batch_rows * 2 * (size_t) n_ff * sizeof(float);
+        const size_t hf_b = (size_t) batch_rows * (size_t) n_ff * sizeof(float);
+        const int need_ne = std::max(ne, 1);
+        const int need_ids = batch_rows + (int) strata::prefill::mmq::IDS_PAD;
+        if (b != nullptr && q8 <= cap_xq && gu_b <= cap_gu && hf_b <= cap_hf && need_ne <= cap_ne &&
+            need_ids <= cap_ids) {
+            return true;   // grow only
+        }
+        const size_t new_xq = std::max(cap_xq, q8);
+        const size_t new_gu = std::max(cap_gu, gu_b);
+        const size_t new_hf = std::max(cap_hf, hf_b);
+        const int new_ne = std::max(cap_ne, need_ne);
+        const int new_ids = std::max(cap_ids, need_ids);
         release();
-        const size_t q8 = strata::prefill::mmq::q8_bytes(nrows, 5120);
-        if (!mmq_alloc(&xq, q8) ||
-            !mmq_alloc((void**) &gu, (size_t) nrows * 2 * 2304 * sizeof(float)) ||
-            !mmq_alloc((void**) &hf, (size_t) nrows * 2304 * sizeof(float)) ||
-            !mmq_alloc((void**) &b, (size_t) 513 * sizeof(int)) ||
-            !mmq_alloc((void**) &ids, (size_t) (nrows + 256) * sizeof(int))) {
+        if (!mmq_alloc(&xq, new_xq) ||
+            !mmq_alloc((void**) &gu, new_gu) ||
+            !mmq_alloc((void**) &hf, new_hf) ||
+            !mmq_alloc((void**) &b, (size_t) (new_ne + 1) * sizeof(int)) ||
+            !mmq_alloc((void**) &ids, (size_t) new_ids * sizeof(int))) {
             release();
             return false;
         }
         if (!ctx) ctx = new strata::prefill::mmq::Context();
-        rows = nrows;
+        cap_xq = new_xq;
+        cap_gu = new_gu;
+        cap_hf = new_hf;
+        cap_ne = new_ne;
+        cap_ids = new_ids;
         return true;
     }
     void release() {
@@ -2118,7 +2147,9 @@ struct MmqScratch {
         if (hf) (void) cudaFree(hf);
         if (b) (void) cudaFree(b);
         if (ids) (void) cudaFree(ids);
-        xq = nullptr; gu = nullptr; hf = nullptr; b = nullptr; ids = nullptr; rows = 0;
+        xq = nullptr; gu = nullptr; hf = nullptr; b = nullptr; ids = nullptr;
+        cap_xq = cap_gu = cap_hf = 0;
+        cap_ne = cap_ids = 0;
     }
 };
 
@@ -2143,22 +2174,21 @@ __global__ void mmq_iota(int* dst, int n) {
 }
 
 __global__ void mmq_half_float(const uint16_t* __restrict__ h, float* __restrict__ f, int rows, int cols, int ld) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * cols) return;
-    const int r = i / cols, c = i - r * cols;
-    f[i] = __half2float(__ushort_as_half(h[(size_t) r * ld + c]));
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) rows * (size_t) cols) return;
+    const size_t r = i / (size_t) cols, c = i - r * (size_t) cols;
+    f[i] = __half2float(__ushort_as_half(h[r * (size_t) ld + c]));
 }
 
 // gate/up rows [r][2 nff] -> FP16 SwiGLU at h[r*ldo + c], the same clamp and rounding order as set_kernel.
+// Uses swiglu(..., limit) so limit <= 0.0f means unclamped (as on Hy4-Flash).
 __global__ void mmq_epilogue(const float* __restrict__ g, uint16_t* __restrict__ h, int rows, int nff, int ldo,
                              float limit) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * nff) return;
-    const int r = i / nff, c = i - r * nff;
-    const float gv = fminf(g[(size_t) r * 2 * nff + c], limit);
-    const float uv = fminf(fmaxf(g[(size_t) r * 2 * nff + nff + c], -limit), limit);
-    const float v = gv / (1.0f + __expf(-gv)) * uv;
-    h[(size_t) r * ldo + c] = __half_as_ushort(__float2half_rn(v));
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) rows * (size_t) nff) return;
+    const size_t r = i / (size_t) nff, c = i - r * (size_t) nff;
+    const float v = swiglu(g[r * 2 * (size_t) nff + c], g[r * 2 * (size_t) nff + (size_t) nff + c], limit);
+    h[r * (size_t) ldo + c] = __half_as_ushort(__float2half_rn(v));
 }
 
 bool mmq_gate_up(const SetArgs& a, cudaStream_t s) {
@@ -2169,46 +2199,84 @@ bool mmq_gate_up(const SetArgs& a, cudaStream_t s) {
     mmq_check(cudaGetDevice(&device), "device query");
     mmq_check(cudaStreamIsCapturing(s, &capture), "capture query");
     if (capture != cudaStreamCaptureStatusNone) return false;
+    const int batch_cap = std::min(total, std::max(kMmqBatchRows, a.max_rows));
     MmqScratch& sc = mmq_scratch(device, s);
-    if (!sc.ensure(total, a.n_exp)) return false;
+    if (!sc.ensure(batch_cap, a.n_exp, a.n_embd, a.n_ff)) return false;
     if (sc.recorded) mmq_check(cudaStreamWaitEvent(s, sc.ready, 0), "scratch wait");
-    mmq_shift_bounds<<<(a.n_exp + 256) / 256, 256, 0, s>>>(a.bounds, sc.b, a.n_exp, a.row0);
+    const int need_ids = batch_cap + (int) strata::prefill::mmq::IDS_PAD;
+    mmq_iota<<<(need_ids + 255) / 256, 256, 0, s>>>(sc.ids, need_ids);
     mmq_check(cudaGetLastError(), "launch");
-    mmq_iota<<<(sc.rows + 256 + 255) / 256, 256, 0, s>>>(sc.ids, sc.rows + 256);
-    mmq_check(cudaGetLastError(), "launch");
-    strata::prefill::mmq::quantize(a.xf, a.idx, sc.xq, a.tg, a.n_embd, a.ldx, total, (void*) s);
-    strata::prefill::mmq::Product p{};
-    p.w = (const uint8_t*) a.wbase + a.tr[0];
-    p.type = a.tg;
-    p.w_rows = a.n_ff;
-    p.w_cols = a.n_embd;
-    p.expert_bytes = a.stride;
-    p.n = a.n_exp;
-    p.xq = sc.xq;
-    p.bounds = sc.b;
-    p.ids = sc.ids;
-    p.total_rows = total;
-    p.max_rows = a.max_rows;
-    p.dst = sc.gu;
-    p.ld_dst = 2 * a.n_ff;
     auto* ctx = sc.ctx;
     const int* hb = mmq_host_bounds;
-    for (int e = 0; e < a.n_exp; ++e) {
-        const int cnt = hb[e + 1] - hb[e];
-        if (cnt <= 0 || cnt < mmq_min_rows(a.tg)) continue;   // (the rest: the light kernels and tiles, after this)
-        p.n = 1;
-        p.bounds = sc.b + e;
-        p.max_rows = a.tg == kIQ2_S ? std::max(cnt, 32) : cnt;
-        p.expert_bytes = 0;
-        p.w = (const uint8_t*) a.wbase + a.tr[0] + (size_t) e * a.stride;
-        p.dst = sc.gu;
-        ctx->run(p, (void*) s);
-        p.w = (const uint8_t*) a.wbase + a.tr[1] + (size_t) e * a.stride;
-        p.dst = sc.gu + a.n_ff;
-        ctx->run(p, (void*) s);
+    const int min_r = mmq_min_rows(a.tg);
+    const size_t bb = (size_t) block_bytes(a.tg);
+    const bool multi_ok = (bb > 0 && a.stride % bb == 0 && min_r <= 1);
+    int e0 = 0;
+    while (e0 < a.n_exp) {
+        int e1 = e0 + 1;
+        while (e1 < a.n_exp && hb[e1 + 1] - hb[e0] <= batch_cap) ++e1;
+        const int n_exp_b = e1 - e0;
+        const int batch_rows = hb[e1] - hb[e0];
+        if (batch_rows <= 0) {
+            e0 = e1;
+            continue;
+        }
+        int batch_max_rows = 0;
+        bool any_mmq = false;
+        for (int e = e0; e < e1; ++e) {
+            const int cnt = hb[e + 1] - hb[e];
+            batch_max_rows = std::max(batch_max_rows, cnt);
+            if (cnt >= min_r) any_mmq = true;
+        }
+        if (!any_mmq) {
+            e0 = e1;
+            continue;
+        }
+        const int r_start = hb[e0] - a.row0;
+        mmq_shift_bounds<<<(n_exp_b + 256) / 256, 256, 0, s>>>(a.bounds + e0, sc.b, n_exp_b, hb[e0]);
+        mmq_check(cudaGetLastError(), "launch");
+        strata::prefill::mmq::quantize(a.xf, a.idx + r_start, sc.xq, a.tg, a.n_embd, a.ldx, batch_rows, (void*) s);
+        strata::prefill::mmq::Product p{};
+        p.type = a.tg;
+        p.w_rows = a.n_ff;
+        p.w_cols = a.n_embd;
+        p.xq = sc.xq;
+        p.ids = sc.ids;
+        p.total_rows = batch_rows;
+        p.ld_dst = 2 * a.n_ff;
+        if (multi_ok) {
+            p.n = n_exp_b;
+            p.bounds = sc.b;
+            p.max_rows = a.tg == kIQ2_S ? std::max(batch_max_rows, 32) : batch_max_rows;
+            p.expert_bytes = a.stride;
+            p.w = (const uint8_t*) a.wbase + a.tr[0] + (size_t) e0 * a.stride;
+            p.dst = sc.gu;
+            ctx->run(p, (void*) s);
+            p.w = (const uint8_t*) a.wbase + a.tr[1] + (size_t) e0 * a.stride;
+            p.dst = sc.gu + a.n_ff;
+            ctx->run(p, (void*) s);
+        } else {
+            for (int e = e0; e < e1; ++e) {
+                const int cnt = hb[e + 1] - hb[e];
+                if (cnt <= 0 || cnt < min_r) continue;
+                p.n = 1;
+                p.bounds = sc.b + (e - e0);
+                p.max_rows = a.tg == kIQ2_S ? std::max(cnt, 32) : cnt;
+                p.expert_bytes = 0;
+                p.w = (const uint8_t*) a.wbase + a.tr[0] + (size_t) e * a.stride;
+                p.dst = sc.gu;
+                ctx->run(p, (void*) s);
+                p.w = (const uint8_t*) a.wbase + a.tr[1] + (size_t) e * a.stride;
+                p.dst = sc.gu + a.n_ff;
+                ctx->run(p, (void*) s);
+            }
+        }
+        const unsigned epi_blocks = (unsigned) (((size_t) batch_rows * (size_t) a.n_ff + 255) / 256);
+        mmq_epilogue<<<epi_blocks, 256, 0, s>>>(sc.gu, a.h + (size_t) r_start * a.ldo, batch_rows, a.n_ff, a.ldo,
+                                                 a.limit);
+        mmq_check(cudaGetLastError(), "launch");
+        e0 = e1;
     }
-    mmq_epilogue<<<(total * a.n_ff + 255) / 256, 256, 0, s>>>(sc.gu, a.h, total, a.n_ff, a.ldo, a.limit);
-    mmq_check(cudaGetLastError(), "launch");
     mmq_check(cudaEventRecord(sc.ready, s), "scratch completion");
     sc.recorded = true;
     return true;
@@ -2222,42 +2290,75 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
     mmq_check(cudaGetDevice(&device), "device query");
     mmq_check(cudaStreamIsCapturing(s, &capture), "capture query");
     if (capture != cudaStreamCaptureStatusNone) return false;
+    const int batch_cap = std::min(total, std::max(kMmqBatchRows, a.max_rows));
     MmqScratch& sc = mmq_scratch(device, s);
-    if (!sc.ensure(total, a.n_exp)) return false;
+    if (!sc.ensure(batch_cap, a.n_exp, a.n_embd, a.n_ff)) return false;
     if (sc.recorded) mmq_check(cudaStreamWaitEvent(s, sc.ready, 0), "scratch wait");
-    mmq_shift_bounds<<<(a.n_exp + 256) / 256, 256, 0, s>>>(a.bounds, sc.b, a.n_exp, a.row0);
+    const int need_ids = batch_cap + (int) strata::prefill::mmq::IDS_PAD;
+    mmq_iota<<<(need_ids + 255) / 256, 256, 0, s>>>(sc.ids, need_ids);
     mmq_check(cudaGetLastError(), "launch");
-    mmq_iota<<<(sc.rows + 256 + 255) / 256, 256, 0, s>>>(sc.ids, sc.rows + 256);
-    mmq_check(cudaGetLastError(), "launch");
-    mmq_half_float<<<(total * a.n_ff + 255) / 256, 256, 0, s>>>(a.xh, sc.hf, total, a.n_ff, a.ldx);
-    mmq_check(cudaGetLastError(), "launch");
-    strata::prefill::mmq::quantize(sc.hf, nullptr, sc.xq, a.td, a.n_ff, a.n_ff, total, (void*) s);
-    strata::prefill::mmq::Product p{};
-    p.w = (const uint8_t*) a.wbase + a.tr[2];
-    p.type = a.td;
-    p.w_rows = a.n_embd;
-    p.w_cols = a.n_ff;
-    p.expert_bytes = a.stride;
-    p.n = a.n_exp;
-    p.xq = sc.xq;
-    p.bounds = sc.b;
-    p.ids = sc.ids;
-    p.total_rows = total;
-    p.max_rows = a.max_rows;
-    p.dst = a.y;
-    p.ld_dst = a.ldo;
     auto* ctx = sc.ctx;
     const int* hb = mmq_host_bounds;
-    for (int e = 0; e < a.n_exp; ++e) {
-        const int cnt = hb[e + 1] - hb[e];
-        if (cnt <= 0 || cnt < mmq_min_rows(a.td)) continue;   // (the rest: the light kernels and tiles, after this)
-        p.n = 1;
-        p.bounds = sc.b + e;
-        p.max_rows = cnt;
-        p.expert_bytes = 0;
-        p.w = (const uint8_t*) a.wbase + a.tr[2] + (size_t) e * a.stride;
-        p.dst = a.y;
-        ctx->run(p, (void*) s);
+    const int min_r = mmq_min_rows(a.td);
+    const size_t bb = (size_t) block_bytes(a.td);
+    const bool multi_ok = (bb > 0 && a.stride % bb == 0 && min_r <= 1);
+    int e0 = 0;
+    while (e0 < a.n_exp) {
+        int e1 = e0 + 1;
+        while (e1 < a.n_exp && hb[e1 + 1] - hb[e0] <= batch_cap) ++e1;
+        const int n_exp_b = e1 - e0;
+        const int batch_rows = hb[e1] - hb[e0];
+        if (batch_rows <= 0) {
+            e0 = e1;
+            continue;
+        }
+        int batch_max_rows = 0;
+        bool any_mmq = false;
+        for (int e = e0; e < e1; ++e) {
+            const int cnt = hb[e + 1] - hb[e];
+            batch_max_rows = std::max(batch_max_rows, cnt);
+            if (cnt >= min_r) any_mmq = true;
+        }
+        if (!any_mmq) {
+            e0 = e1;
+            continue;
+        }
+        const int r_start = hb[e0] - a.row0;
+        mmq_shift_bounds<<<(n_exp_b + 256) / 256, 256, 0, s>>>(a.bounds + e0, sc.b, n_exp_b, hb[e0]);
+        mmq_check(cudaGetLastError(), "launch");
+        const unsigned hf_blocks = (unsigned) (((size_t) batch_rows * (size_t) a.n_ff + 255) / 256);
+        mmq_half_float<<<hf_blocks, 256, 0, s>>>(a.xh + (size_t) r_start * a.ldx, sc.hf, batch_rows, a.n_ff, a.ldx);
+        mmq_check(cudaGetLastError(), "launch");
+        strata::prefill::mmq::quantize(sc.hf, nullptr, sc.xq, a.td, a.n_ff, a.n_ff, batch_rows, (void*) s);
+        strata::prefill::mmq::Product p{};
+        p.type = a.td;
+        p.w_rows = a.n_embd;
+        p.w_cols = a.n_ff;
+        p.xq = sc.xq;
+        p.ids = sc.ids;
+        p.total_rows = batch_rows;
+        p.dst = a.y + (size_t) r_start * a.ldo;
+        p.ld_dst = a.ldo;
+        if (multi_ok) {
+            p.n = n_exp_b;
+            p.bounds = sc.b;
+            p.max_rows = a.td == kIQ2_S ? std::max(batch_max_rows, 32) : batch_max_rows;
+            p.expert_bytes = a.stride;
+            p.w = (const uint8_t*) a.wbase + a.tr[2] + (size_t) e0 * a.stride;
+            ctx->run(p, (void*) s);
+        } else {
+            for (int e = e0; e < e1; ++e) {
+                const int cnt = hb[e + 1] - hb[e];
+                if (cnt <= 0 || cnt < min_r) continue;
+                p.n = 1;
+                p.bounds = sc.b + (e - e0);
+                p.max_rows = a.td == kIQ2_S ? std::max(cnt, 32) : cnt;
+                p.expert_bytes = 0;
+                p.w = (const uint8_t*) a.wbase + a.tr[2] + (size_t) e * a.stride;
+                ctx->run(p, (void*) s);
+            }
+        }
+        e0 = e1;
     }
     mmq_check(cudaEventRecord(sc.ready, s), "scratch completion");
     sc.recorded = true;
@@ -2384,6 +2485,8 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
         std::fprintf(stderr, "ds4: the fused prompt experts could not run a set\n");
         std::abort();   // (its down would read H the FP16 tiles never wrote)
     }
+#endif
+#if defined(STRATA_USE_HIP) && (!defined(MAYA_DS4_IQ_ONLY) || defined(MAYA_DS4_IQ_MMQ))
     if (mmq_wanted(a, true) && mmq_gate_up(a, s)) {
         static std::atomic<bool> said{false};
         if (!said.exchange(true)) std::fprintf(stderr, "ds4: MMQ took a set's gate / up (type %d)\n", a.tg);
@@ -2431,6 +2534,8 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
         std::fprintf(stderr, "ds4: the fused prompt experts could not run a set's down\n");
         std::abort();   // (H is int8 here: the FP16 tiles cannot read it)
     }
+#endif
+#if defined(STRATA_USE_HIP) && (!defined(MAYA_DS4_IQ_ONLY) || defined(MAYA_DS4_IQ_MMQ))
     if (mmq_wanted(a, false) && mmq_down(a, s)) {
         const int rest = mmq_rest_rows(a, a.td);
         if (rest == 0) return true;

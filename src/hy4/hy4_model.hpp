@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,6 +85,11 @@ public:
     /// ids at positions pos0 .. pos0 + n - 1 (the caches hold the positions before pos0: resumable(pos0)); logits_out
     /// (if given) gets the logits of the last `want` positions, [want][vocab] F32
     bool forward(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err);
+    /// Prompt forward with per-chunk completion callback (on_chunk(done_tokens_in_call) -> false cancels after in-flight
+    /// chunks drain cleanly at an exact chunk boundary). On 2-GPU contiguous layer splits (HY4_PROMPT_PIPE=1), overlaps
+    /// GPU 0 and GPU 1 across consecutive chunks bit-identically.
+    bool forward_prompt(const int* ids, int n, int64_t pos0, int want, float* logits_out, std::string& err,
+                        const std::function<bool(int)>& on_chunk = nullptr, bool* cancelled = nullptr);
     /// The MTP block's drafts (Options::mtp): up to n tokens after `tok` at position pos (the caches hold the positions
     /// before it), each MTP step's top token and its probability, stopping after one below `floor`.  A forward keeps
     /// the block's caches in step with the trunk's (every forward runs it over its tokens), so the drafts after an

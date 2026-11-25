@@ -1733,6 +1733,14 @@ if(STRATA_NATIVE_EXPERTS)
 
     # Maya's GLM batched prompt path calls MMQ and BLAS directly, as on CUDA.
     target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
+    if(TARGET maya-hy4)
+      target_link_libraries(maya-hy4 PRIVATE strata_mmq)
+      target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_MMQ=1)
+    endif()
+    if(TARGET hy4_experts_test)
+      target_link_libraries(hy4_experts_test PRIVATE strata_mmq)
+      target_compile_definitions(hy4_experts_test PRIVATE MAYA_DS4_IQ_MMQ=1)
+    endif()
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)
     target_include_directories(hip_prefill_mmq_parity PRIVATE "${_strata_gg}/include")

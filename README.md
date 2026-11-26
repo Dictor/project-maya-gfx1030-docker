@@ -5,7 +5,7 @@
 <p align="center">
   <b>GLM-5.3-Flash (Maya-S &amp; Maya-M) optimized for AMD RDNA2 (<code>gfx1030</code>) GPUs &amp; AVX2-only Unraid / Linux hosts</b><br>
   Based on upstream <a href="https://github.com/mw00/project-maya">Project Maya</a> <code>v1.1.69</code> · Branch: <code>feat/gfx1030-rdna2-opt</code><br>
-  Docker image: <code>kimdictor/project-maya-gfx1030:v1.1.69</code> (<code>:latest</code>)
+  Docker image: <code>kimdictor/project-maya-gfx1030:v1.1.69.1</code> (also tagged <code>:v1.1.69</code>, <code>:latest</code>; fork revision tracked in <code>docker/VERSION.gfx1030</code>)
 </p>
 
 ---
@@ -46,7 +46,7 @@ For full upstream documentation covering all models, NVIDIA/Metal/Windows setup,
 ```yaml
 services:
   maya:
-    image: kimdictor/project-maya-gfx1030:v1.1.69 # or :latest
+    image: kimdictor/project-maya-gfx1030:v1.1.69.1 # or :latest
     container_name: maya-gfx1030
     restart: unless-stopped
     devices:
@@ -201,24 +201,29 @@ docker compose run --rm -e HIP_VISIBLE_DEVICES=0 maya /opt/maya/tests/glm_attn_b
 
 *(Other flags: `hip_expert_kernel_bench` also supports `--shared` and `--window`; `glm_mv_bench` and `glm_attn_bench` also support `--sweep`.)*
 
-### 4. Baked Build & ISA Verification Reports (`/opt/maya/image/`)
+### 4. Baked Build, Version & ISA Verification Reports (`/opt/maya/image/`)
 
-Inspect the compile-time AMDGPU `gfx1030` ISA report and Haswell AVX2 host portability report baked into the image (no GPU required):
+Inspect the baked image version (`/opt/maya/image/version.txt`), compile-time AMDGPU `gfx1030` ISA report, and Haswell AVX2 host portability report baked into the image (no GPU required):
 
 ```bash
-docker run --rm kimdictor/project-maya-gfx1030:v1.1.69 cat /opt/maya/image/gfx1030-isa-check.txt
-docker run --rm kimdictor/project-maya-gfx1030:v1.1.69 cat /opt/maya/image/host-isa-check.txt
-docker run --rm kimdictor/project-maya-gfx1030:v1.1.69 cat /opt/maya/image/cpu-flags.txt
+docker run --rm kimdictor/project-maya-gfx1030:v1.1.69.1 cat /opt/maya/image/version.txt
+docker run --rm kimdictor/project-maya-gfx1030:v1.1.69.1 cat /opt/maya/image/gfx1030-isa-check.txt
+docker run --rm kimdictor/project-maya-gfx1030:v1.1.69.1 cat /opt/maya/image/host-isa-check.txt
+docker run --rm kimdictor/project-maya-gfx1030:v1.1.69.1 cat /opt/maya/image/cpu-flags.txt
 ```
 
 ### 5. Local Docker Build
 
-Build locally with Docker BuildKit (Windows Docker Desktop or Linux):
+Build locally with Docker BuildKit (Windows Docker Desktop or Linux). Image version combines upstream `VERSION` + `docker/VERSION.gfx1030` (`v<UPSTREAM>.<REV>`, e.g., `v1.1.69.1`):
 
 ```bash
 docker build \
   -f docker/Dockerfile.gfx1030 \
+  --build-arg IMAGE_VERSION=v1.1.69.1 \
+  -t kimdictor/project-maya-gfx1030:v1.1.69.1 \
+  -t kimdictor/project-maya-gfx1030:1.1.69.1 \
   -t kimdictor/project-maya-gfx1030:v1.1.69 \
+  -t kimdictor/project-maya-gfx1030:1.1.69 \
   -t kimdictor/project-maya-gfx1030:latest \
   .
 ```

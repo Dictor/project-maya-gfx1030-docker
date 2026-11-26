@@ -645,6 +645,22 @@ EOF
   exec "$PYBIN" "$SERVER" --help
 fi
 
+IMG_VER=""
+if [ -r /opt/maya/image/version.txt ]; then
+  IMG_VER="$(tr -d '[:space:]' < /opt/maya/image/version.txt)"
+elif [ -r /opt/maya/VERSION ]; then
+  _up="$(tr -d '[:space:]' < /opt/maya/VERSION)"
+  if [ -r /opt/maya/docker/VERSION.gfx1030 ]; then
+    _rev="$(tr -d '[:space:]' < /opt/maya/docker/VERSION.gfx1030)"
+    IMG_VER="${_up}${_rev:+.$_rev}"
+  else
+    IMG_VER="$_up"
+  fi
+fi
+if [ -n "$IMG_VER" ]; then
+  echo "[maya-gfx1030] Image version: v$IMG_VER"
+fi
+
 if grep -q 'maya-hy4' "$CFG"; then
   echo "[maya-gfx1030] Starting Project Maya (Hy4-Flash, gfx1030) with config: $CFG"
   echo "[maya-gfx1030] Hy4 Defaults: HY4_PROMPT_F16=$HY4_PROMPT_F16 HY4_EG_RAM=$HY4_EG_RAM HY4_LANE_RAM=$HY4_LANE_RAM HY4_LOAD_SEQ=$HY4_LOAD_SEQ HY4_EG_POPULATE=$HY4_EG_POPULATE HY4_EXPERT_MMQ=$HY4_EXPERT_MMQ HY4_PROMPT_PIPE=$HY4_PROMPT_PIPE HY4_DENSE_MMQ=$HY4_DENSE_MMQ HY4_ATTN_FDOT2=$HY4_ATTN_FDOT2 HY4_PIPE_BALANCE=$HY4_PIPE_BALANCE HY4_STREAM_ASYNC=$HY4_STREAM_ASYNC HY4_ATTN_64H=$HY4_ATTN_64H"

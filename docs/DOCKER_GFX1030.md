@@ -39,11 +39,14 @@ AMD RDNA2 (`gfx1030`: **Dual Radeon PRO W6800 32 GB** / RX 6800 / 6900 / PRO V62
 
 ## 3. Docker 이미지 빌드 (Build)
 
-로컬 PC(Windows Docker Desktop / Linux)에서 BuildKit으로 빌드합니다.
+로컬 PC(Windows Docker Desktop / Linux)에서 BuildKit으로 빌드합니다. 포크 이미지 버전은 업스트림 `VERSION`과 `docker/VERSION.gfx1030`을 조합한 `v<UPSTREAM>.<REV>`(예: `v1.1.69.1`) 형식을 사용합니다.
 
 ```bash
 docker build \
   -f docker/Dockerfile.gfx1030 \
+  --build-arg IMAGE_VERSION=v1.1.69.1 \
+  -t docker.io/kimdictor/project-maya-gfx1030:v1.1.69.1 \
+  -t docker.io/kimdictor/project-maya-gfx1030:1.1.69.1 \
   -t docker.io/kimdictor/project-maya-gfx1030:v1.1.69 \
   -t docker.io/kimdictor/project-maya-gfx1030:1.1.69 \
   -t docker.io/kimdictor/project-maya-gfx1030:latest \
@@ -83,7 +86,7 @@ docker run -d --name maya-gfx1030 --restart unless-stopped \
   -e MAYA_GGUF_DIR=/models/Maya-S-v2-IQ2_XXS \
   -e MAYA_GPUS=0,1 \
   -e MAYA_CONTEXT=32768 \
-  kimdictor/project-maya-gfx1030:v1.1.69
+  kimdictor/project-maya-gfx1030:v1.1.69.1
 ```
 
 > **Maya-M으로 전환할 때**: `-e MAYA_GGUF_DIR=/models/Maya-M`으로 변경하고 컨테이너를 재시작하면 됩니다.
@@ -101,7 +104,7 @@ docker run --rm \
   -v /mnt/disk1/gguf:/models:ro \
   -v /mnt/cache/appdata/maya:/data:rw \
   -e MAYA_CONFIG=/data/maya-maya-s-hip.json \
-  kimdictor/project-maya-gfx1030:v1.1.69
+  kimdictor/project-maya-gfx1030:v1.1.69.1
 
 # 또는 serve/server.py 직접 호출 (passthrough)
 docker run --rm \
@@ -111,7 +114,7 @@ docker run --rm \
   -p 8080:8080 \
   -v /mnt/disk1/gguf:/models:ro \
   -v /mnt/cache/appdata/maya:/data:rw \
-  kimdictor/project-maya-gfx1030:v1.1.69 \
+  kimdictor/project-maya-gfx1030:v1.1.69.1 \
   /opt/maya/.venv/bin/python /opt/maya/serve/server.py \
     --engine maya --config /data/maya-maya-s-hip.json --host 0.0.0.0 --port 8080
 ```
@@ -153,7 +156,7 @@ docker run --rm \
 docker run --rm --device=/dev/dri --device=/dev/kfd \
   --group-add video --group-add render --ulimit memlock=-1:-1 \
   -e HIP_VISIBLE_DEVICES=0 \
-  kimdictor/project-maya-gfx1030:v1.1.69 bash -c '
+  kimdictor/project-maya-gfx1030:v1.1.69.1 bash -c '
     set -euo pipefail
     cd /opt/maya
     /opt/maya/tests/hip_intrinsics
@@ -170,7 +173,7 @@ docker run --rm --device=/dev/dri --device=/dev/kfd \
 # W6800 (30 WGP / 128 MB Infinity Cache) 커널 스윕 벤치마크
 docker run --rm --device=/dev/dri --device=/dev/kfd \
   --group-add video --group-add render -e HIP_VISIBLE_DEVICES=0 \
-  kimdictor/project-maya-gfx1030:v1.1.69 \
+  kimdictor/project-maya-gfx1030:v1.1.69.1 \
   /opt/maya/tests/hip_expert_kernel_bench --parity-only --sweep
 ```
 
@@ -182,7 +185,7 @@ docker run --rm --device=/dev/dri --device=/dev/kfd \
 docker run --rm --device=/dev/dri --device=/dev/kfd \
   --group-add video --group-add render --ulimit memlock=-1:-1 --ipc=host --cap-add=IPC_LOCK \
   -v /mnt/disk1/gguf:/models:ro -v /mnt/cache/appdata/maya:/data:rw \
-  kimdictor/project-maya-gfx1030:v1.1.69 \
+  kimdictor/project-maya-gfx1030:v1.1.69.1 \
   /opt/maya/.venv/bin/python /opt/maya/tools/calibrate_glm.py /data/maya-glm-5.3-flash-maya-s-v2-iq2_xxs-hip.json
 ```
 

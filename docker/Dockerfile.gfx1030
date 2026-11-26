@@ -736,6 +736,13 @@ COPY --from=builder /out/cpu-flags.txt \
                     /out/gfx1030-isa-check.txt \
                     /opt/maya/image/
 
+# Stamp combined fork image version (<VERSION>.<VERSION.gfx1030>, e.g. 1.1.69.1)
+RUN set -eu; \
+    up="$(tr -d '[:space:]' < /opt/maya/VERSION)"; \
+    rev="$(tr -d '[:space:]' < /opt/maya/docker/VERSION.gfx1030)"; \
+    case "$rev" in ''|*[!0-9]*) echo "ERROR: invalid VERSION.gfx1030 '$rev'" >&2; exit 1 ;; esac; \
+    printf '%s.%s\n' "$up" "$rev" > /opt/maya/image/version.txt
+
 # Pre-stamp .venv/.strata-pip.json, build-hip/MAYA-BUILD.json, and build-vision/MAYA-BUILD.json
 # matching maya.py's exact schema (maya.py:105,108,2882-2886,4133-4135) so startup never recompiles
 RUN /opt/maya/.venv/bin/python - <<'PY'
@@ -824,6 +831,9 @@ RUN set -euo pipefail; \
     test -s /opt/maya/data/glm5-synth.gguf; \
     test -d /opt/maya/data/glm5-synth-dumps; \
     test -d /opt/maya/data/glm5-synth-dumps12
+
+ARG IMAGE_VERSION=""
+LABEL org.opencontainers.image.version="${IMAGE_VERSION}"
 
 WORKDIR /opt/maya
 VOLUME ["/data", "/models"]

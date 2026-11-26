@@ -336,9 +336,9 @@ bool CpuExperts::q4x_make(int e) {
     std::unique_ptr<uint8_t[]> m(new (std::nothrow) uint8_t[2 * q4x_gu + q4x_d + 32]);
     if (!m) return false;
     uint8_t* b = (uint8_t*) (((uintptr_t) m.get() + 31) & ~(uintptr_t) 31);   // (32-byte rows)
-    iqc::iq_cpu_q4x_convert(gate_ptr(e), f.gu_row, f.n_ff, f.n_embd, b);
-    iqc::iq_cpu_q4x_convert(up_ptr(e), f.gu_row, f.n_ff, f.n_embd, b + q4x_gu);
-    iqc::iq_cpu_q4x_convert(down_ptr(e), f.d_row, f.n_embd, f.n_ff, b + 2 * q4x_gu);
+    iqc::iq_cpu_q4x_convert(gate_ptr(e), f.gu_row, f.n_ff, f.n_embd, b, f.tg);
+    iqc::iq_cpu_q4x_convert(up_ptr(e), f.gu_row, f.n_ff, f.n_embd, b + q4x_gu, f.tg);
+    iqc::iq_cpu_q4x_convert(down_ptr(e), f.d_row, f.n_embd, f.n_ff, b + 2 * q4x_gu, f.td);
     q4x->owned.push_back(std::move(m));
     q4x->p[(size_t) e].store(b, std::memory_order_release);
     return true;

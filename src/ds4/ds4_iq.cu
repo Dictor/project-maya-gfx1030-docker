@@ -712,6 +712,15 @@ __device__ __forceinline__ float hip_xor2(float v) {
 __device__ __forceinline__ float hip_xor1(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false));
 }
+#elif defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+template <int Ctrl>
+__device__ __forceinline__ float rdna_dpp(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl, 0xf, 0xf, false));
+}
+__device__ __forceinline__ float rdna_xor16(float v) {
+    const int i = __builtin_bit_cast(int, v);
+    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+}
 #endif
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -729,6 +738,13 @@ __device__ __forceinline__ float warp_sum(float v) {
     v += hip_xor2(v);
     v += hip_xor1(v);
 #endif
+    return v;
+#elif defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    v += rdna_xor16(v);
+    v += rdna_dpp<0x168>(v);
+    v += rdna_dpp<0x164>(v);
+    v += rdna_dpp<0x162>(v);
+    v += rdna_dpp<0x161>(v);
     return v;
 #else
 #pragma unroll
@@ -802,6 +818,13 @@ __device__ __forceinline__ float lanes_sum(float v) {
     if constexpr (RW <= 8) v += hip_xor2(v);
     if constexpr (RW <= 16) v += hip_xor1(v);
 #endif
+    return v;
+#elif defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    if constexpr (RW <= 1) v += rdna_xor16(v);
+    if constexpr (RW <= 2) v += rdna_dpp<0x168>(v);
+    if constexpr (RW <= 4) v += rdna_dpp<0x164>(v);
+    if constexpr (RW <= 8) v += rdna_dpp<0x162>(v);
+    if constexpr (RW <= 16) v += rdna_dpp<0x161>(v);
     return v;
 #else
 #pragma unroll
@@ -1377,6 +1400,12 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
     am = fmaxf(am, hip_xor4(am));
     am = fmaxf(am, hip_xor2(am));
     am = fmaxf(am, hip_xor1(am));
+#elif defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    am = fmaxf(am, rdna_xor16(am));
+    am = fmaxf(am, rdna_dpp<0x168>(am));
+    am = fmaxf(am, rdna_dpp<0x164>(am));
+    am = fmaxf(am, rdna_dpp<0x162>(am));
+    am = fmaxf(am, rdna_dpp<0x161>(am));
 #else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));

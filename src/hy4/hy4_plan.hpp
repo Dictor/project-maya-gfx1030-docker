@@ -240,21 +240,13 @@ struct BalancedSplit {
 inline BalancedSplit balanced_pipe_split(const std::vector<double>& dense_b, const std::vector<double>& exp_b,
                                          const std::vector<double>& cost, const std::vector<bool>& is_dense,
                                          int n_expert, double free0, double free1, double cap, double head_cost0,
-                                         double head_cost1, int greedy_split, int64_t greedy_res) {
+                                         double head_cost1, int greedy_split, int64_t greedy_res,
+                                         double stream_w = 1.2) {
     BalancedSplit best;
     const int nL = (int) dense_b.size();
     if (nL < 2 || n_expert <= 0 || greedy_split <= 0 || greedy_split >= nL) return best;
-    auto side_cost = [&](int a, int b, double hc) {
-        double c = hc;
-        for (int i = a; i < b; ++i) c += cost[(size_t) i];
-        return c;
-    };
-    const double greedy_max = std::max(side_cost(0, greedy_split, head_cost0),
-                                       side_cost(greedy_split, nL, head_cost1));
-    double best_max = greedy_max;
-    int64_t best_res = greedy_res;
     const int max_n = std::min(n_expert, (int) std::floor(std::max(0.0, std::min(1.0, cap)) * n_expert));
-    auto fit_side = [&](int a, int b, double free_b, int& out_n, int64_t& out_res) -> bool {
+    auto fit_side = [&](int a, int b, double free_b, int& out_n, int64_t& out_res, int& out_moe) -> bool {
         double dsum = 0.0, esum = 0.0;
         int n_moe = 0;
         for (int i = a; i < b; ++i) {
@@ -264,6 +256,7 @@ inline BalancedSplit balanced_pipe_split(const std::vector<double>& dense_b, con
                 ++n_moe;
             }
         }
+        out_moe = n_moe;
         if (dsum > free_b) return false;
         if (n_moe == 0 || esum <= 0.0) {
             out_n = 0;
@@ -276,14 +269,38 @@ inline BalancedSplit balanced_pipe_split(const std::vector<double>& dense_b, con
         out_res = (int64_t) n_moe * n;
         return true;
     };
+    auto side_cost = [&](int a, int b, double hc, int n_res) {
+        double c = hc;
+        const double sf = (stream_w > 0.0 && n_expert > 0) ? stream_w * ((double) std::max(0, n_expert - n_res) / (double) n_expert) : 0.0;
+        for (int i = a; i < b; ++i) {
+            c += cost[(size_t) i];
+            if (!is_dense[(size_t) i]) c += sf;
+        }
+        return c;
+    };
+    int total_moe = 0;
+    for (int i = 0; i < nL; ++i)
+        if (!is_dense[(size_t) i]) ++total_moe;
+    const double greedy_n = total_moe > 0 ? (double) greedy_res / (double) total_moe : 0.0;
+    const int min_side_n = greedy_n > 0.0 ? (int) std::floor(0.85 * greedy_n) : 0;
+    int gn0 = 0, gn1 = 0, gm0 = 0, gm1 = 0;
+    int64_t gr0 = 0, gr1 = 0;
+    const int def_gn = (int) std::round(greedy_n);
+    if (!fit_side(0, greedy_split, free0, gn0, gr0, gm0)) gn0 = def_gn;
+    if (!fit_side(greedy_split, nL, free1, gn1, gr1, gm1)) gn1 = def_gn;
+    const double greedy_max = std::max(side_cost(0, greedy_split, head_cost0, gn0),
+                                       side_cost(greedy_split, nL, head_cost1, gn1));
+    double best_max = greedy_max;
+    int64_t best_res = greedy_res;
     const int64_t min_res = (int64_t) std::floor(0.98 * (double) greedy_res);
     for (int s = 1; s < nL; ++s) {
-        int n0 = 0, n1 = 0;
+        int n0 = 0, n1 = 0, m0 = 0, m1 = 0;
         int64_t r0 = 0, r1 = 0;
-        if (!fit_side(0, s, free0, n0, r0) || !fit_side(s, nL, free1, n1, r1)) continue;
+        if (!fit_side(0, s, free0, n0, r0, m0) || !fit_side(s, nL, free1, n1, r1, m1)) continue;
+        if (greedy_n > 0.0 && ((m0 > 0 && n0 < min_side_n) || (m1 > 0 && n1 < min_side_n))) continue;
         const int64_t tot_res = r0 + r1;
         if (tot_res < min_res) continue;
-        const double mx = std::max(side_cost(0, s, head_cost0), side_cost(s, nL, head_cost1));
+        const double mx = std::max(side_cost(0, s, head_cost0, n0), side_cost(s, nL, head_cost1, n1));
         if (mx < best_max - 1e-6 || (std::fabs(mx - best_max) <= 1e-6 && tot_res > best_res)) {
             best.ok = true;
             best.split = s;

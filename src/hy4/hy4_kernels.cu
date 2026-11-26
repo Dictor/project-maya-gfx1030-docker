@@ -31,6 +31,32 @@ void check(const char* what) {
     }
 }
 
+#if defined(STRATA_USE_HIP) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+template <int Ctrl>
+__device__ __forceinline__ float rdna_dpp(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl, 0xf, 0xf, false));
+}
+__device__ __forceinline__ float rdna_xor16(float v) {
+    const int i = __builtin_bit_cast(int, v);
+    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+}
+__device__ __forceinline__ float warp_sum(float v) {
+    v += rdna_xor16(v);
+    v += rdna_dpp<0x168>(v);
+    v += rdna_dpp<0x164>(v);
+    v += rdna_dpp<0x162>(v);
+    v += rdna_dpp<0x161>(v);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+    v = fmaxf(v, rdna_xor16(v));
+    v = fmaxf(v, rdna_dpp<0x168>(v));
+    v = fmaxf(v, rdna_dpp<0x164>(v));
+    v = fmaxf(v, rdna_dpp<0x162>(v));
+    v = fmaxf(v, rdna_dpp<0x161>(v));
+    return v;
+}
+#else
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -41,6 +67,7 @@ __device__ __forceinline__ float warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
+#endif
 // a block's sum (blockDim.x a multiple of 32, at most 1024); every thread gets it
 __device__ float block_sum(float v) {
     __shared__ float sh[32];
@@ -773,6 +800,175 @@ __global__ void __launch_bounds__(32 * HB) attn_fdot2_kernel(
     for (int i = 0; i < 8; ++i) {
         o[2 + 2 * (lane + 32 * i)] = acc[2 * i];
         o[2 + 2 * (lane + 32 * i) + 1] = acc[2 * i + 1];
+    }
+}
+
+// 64-head single-block direct-output RDNA 2 MLA attention: 512 threads (16 warps, 4 heads/warp) load each shared
+// KV tile once for all 64 heads (cutting global KV traffic 8x vs 8-head tiles) and write normalized out directly.
+constexpr int kTile64 = 16;
+template <bool Q8>
+__global__ void __launch_bounds__(512, 1) attn_fdot2_64h_kernel(
+        const float* __restrict__ q, int H, const void* __restrict__ cache_v, int ring,
+        const int* __restrict__ keys, int ldk, const int* __restrict__ lo, const int* __restrict__ nk,
+        float scale, const float* __restrict__ sinks, float* __restrict__ out, int rb) {
+    __shared__ __align__(16) uint32_t tile[kTile64][kRowW];
+    __shared__ int rows[kTile64];
+    __shared__ float sc[Q8 ? kTile64 : 1][16];
+    __shared__ float s_m[64], s_l[64], s_qscale[64];
+    const int t = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = nk[t];
+    uint32_t qh2[4][9];
+    float acc[4][16];
+#pragma unroll
+    for (int hh = 0; hh < 4; ++hh) {
+        const int lh = w * 4 + hh;
+        const int h = blockIdx.x * 64 + lh;
+        float q_sc = scale;
+        if (h < H) {
+            const float* qh = q + ((size_t) t * H + h) * (2 * kRowW);
+            float ra[9], rb_q[9], mx = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 9; ++i) {
+                const float2 v = *(const float2*) (qh + 2 * (lane + 32 * i));
+                ra[i] = v.x;
+                rb_q[i] = v.y;
+                mx = fmaxf(mx, fmaxf(fabsf(v.x), fabsf(v.y)));
+            }
+            mx = warp_max(mx);
+            int ex = 0;
+            if (mx > 0.0f && isfinite(mx)) {
+                frexpf(mx, &ex);
+                ex = max(-60, min(60, 14 - ex));
+            }
+            const float f = ldexpf(1.0f, ex);
+            q_sc = scale * ldexpf(1.0f, -ex);
+#pragma unroll
+            for (int i = 0; i < 9; ++i) qh2[hh][i] = hy4_pack_h2_rn(ra[i] * f, rb_q[i] * f);
+            if (lane == 0) {
+                s_qscale[lh] = q_sc;
+                s_m[lh] = sinks ? sinks[h] : -INFINITY;
+                s_l[lh] = sinks ? 1.0f : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc[hh][i] = 0.0f;
+    }
+    __syncthreads();
+    for (int kt = 0; kt < n; kt += kTile64) {
+        const int nt = min(kTile64, n - kt);
+        __syncthreads();
+        if ((int) threadIdx.x < nt) {
+            const int p = keys ? keys[(size_t) t * ldk + kt + threadIdx.x] : lo[t] + kt + (int) threadIdx.x;
+            rows[threadIdx.x] = ring > 0 ? p % ring : p;
+        }
+        __syncthreads();
+        if (Q8) {
+            if ((int) threadIdx.x < 2 * nt) {
+                const int r = threadIdx.x >> 1, hf = threadIdx.x & 1;
+                const uint4 u = *(const uint4*) ((const uint8_t*) cache_v + (size_t) rows[r] * rb + 512 + 16 * hf);
+                const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+                for (int qd = 0; qd < 4; ++qd) {
+                    sc[r][hf * 8 + 2 * qd] = __half2float(__ushort_as_half((unsigned short) (wd[qd] & 0xffffu)));
+                    sc[r][hf * 8 + 2 * qd + 1] = __half2float(__ushort_as_half((unsigned short) (wd[qd] >> 16)));
+                }
+            }
+            __syncthreads();
+            for (int it = threadIdx.x; it < nt * 40; it += blockDim.x) {
+                const int r = it / 40, ci = it - r * 40;
+                const uint8_t* rp = (const uint8_t*) cache_v + (size_t) rows[r] * rb;
+                if (ci < 32) {
+                    const uint4 u = *(const uint4*) (rp + 16 * ci);
+                    const unsigned wd[4] = {u.x, u.y, u.z, u.w};
+                    const float d = sc[r][ci >> 1];
+#pragma unroll
+                    for (int qd = 0; qd < 4; ++qd) {
+                        const float a0 = (float) (signed char) (wd[qd] & 0xffu);
+                        const float a1 = (float) (signed char) ((wd[qd] >> 8) & 0xffu);
+                        const float a2 = (float) (signed char) ((wd[qd] >> 16) & 0xffu);
+                        const float a3 = (float) (signed char) (wd[qd] >> 24);
+                        tile[r][8 * ci + 2 * qd] = hy4_pack_h2_rn(d * a0, d * a1);
+                        tile[r][8 * ci + 2 * qd + 1] = hy4_pack_h2_rn(d * a2, d * a3);
+                    }
+                } else {
+                    ((uint4*) tile[r])[64 + (ci - 32)] = *(const uint4*) (rp + 544 + 16 * (ci - 32));
+                }
+            }
+        } else {
+            for (int it = threadIdx.x; it < nt * 72; it += blockDim.x) {
+                const int r = it / 72, ci = it - r * 72;
+                ((uint4*) tile[r])[ci] = ((const uint4*) cache_v)[(size_t) rows[r] * 72 + ci];
+            }
+        }
+        __syncthreads();
+        for (int j = 0; j < nt; j += 2) {
+            const bool has1 = (j + 1) < nt;
+            float s0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float s1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int i = 0; i < 9; ++i) {
+                const uint32_t kv0 = tile[j][lane + 32 * i];
+                const uint32_t kv1 = has1 ? tile[j + 1][lane + 32 * i] : 0u;
+#pragma unroll
+                for (int hh = 0; hh < 4; ++hh) {
+                    s0[hh] = hy4_fdot2(qh2[hh][i], kv0, s0[hh]);
+                    if (has1) s1[hh] = hy4_fdot2(qh2[hh][i], kv1, s1[hh]);
+                }
+            }
+            uint32_t p01[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+            for (int hh = 0; hh < 4; ++hh) {
+                const int lh = w * 4 + hh;
+                const int h = blockIdx.x * 64 + lh;
+                if (h >= H) continue;
+                const float q_sc = s_qscale[lh];
+                const float sv0 = warp_sum(s0[hh]) * q_sc;
+                const float sv1 = has1 ? warp_sum(s1[hh]) * q_sc : -INFINITY;
+                const float m = s_m[lh];
+                float l = s_l[lh];
+                const float mn = fmaxf(m, fmaxf(sv0, sv1));
+                if (mn != m) {
+                    const float corr = expf(m - mn);
+                    l *= corr;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) acc[hh][i] *= corr;
+                }
+                const float p0 = expf(sv0 - mn);
+                const float p1 = has1 ? expf(sv1 - mn) : 0.0f;
+                l += p0 + p1;
+                if (lane == 0) {
+                    s_m[lh] = mn;
+                    s_l[lh] = l;
+                }
+                p01[hh] = hy4_pack_h2_rn(p0, p1);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t va = tile[j][lane + 32 * i];
+                const uint32_t vb = has1 ? tile[j + 1][lane + 32 * i] : 0u;
+                const uint32_t v0 = __byte_perm(va, vb, 0x5410u);
+                const uint32_t v1 = __byte_perm(va, vb, 0x7632u);
+#pragma unroll
+                for (int hh = 0; hh < 4; ++hh) {
+                    acc[hh][2 * i] = hy4_fdot2(p01[hh], v0, acc[hh][2 * i]);
+                    acc[hh][2 * i + 1] = hy4_fdot2(p01[hh], v1, acc[hh][2 * i + 1]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int hh = 0; hh < 4; ++hh) {
+        const int lh = w * 4 + hh;
+        const int h = blockIdx.x * 64 + lh;
+        if (h >= H) continue;
+        const float l = s_l[lh];
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        float* o = out + ((size_t) t * H + h) * 512;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            o[2 * (lane + 32 * i)] = acc[hh][2 * i] * inv;
+            o[2 * (lane + 32 * i) + 1] = acc[hh][2 * i + 1] * inv;
+        }
     }
 }
 
@@ -2239,6 +2435,19 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     // (8 heads a block - NVIDIA, or HY4_ATTN_HB=8 on AMD: attn2_kernel, attn_kernel's sums in fewer loads; HY4_ATTN_OLD:
     //  attn_kernel, as before.  16 / 32 - AMD: attn_kernel or attn_fdot2_kernel over that many heads.)
     static const bool old = std::getenv("HY4_ATTN_OLD") != nullptr;
+    static const bool use_64h = [] {
+        const char* e = std::getenv("HY4_ATTN_64H");
+        return e == nullptr || *e == '\0' || std::atoi(e) != 0;
+    }();
+    static const bool splitk_force = std::getenv("HY4_ATTN_SPLITK") != nullptr;
+    static const bool hb_set = std::getenv("HY4_ATTN_HB") != nullptr;
+    if (use_64h && !old && !splitk_force && !hb_set && T >= 64 && attn_fdot2_enabled()) {
+        const dim3 grid64((unsigned) ((H + 63) / 64), (unsigned) T);
+        if (q8) attn_fdot2_64h_kernel<true><<<grid64, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, sinks, out, rb);
+        else attn_fdot2_64h_kernel<false><<<grid64, 512, 0, s>>>(q, H, cache, ring, keys, ldk, lo, nk, scale, sinks, out, 0);
+        check("attention");
+        return;
+    }
     const dim3 grid((unsigned) nchunk, (unsigned) ((H + hb - 1) / hb), (unsigned) T);
     if (T > kMaxWin && (hb == 32 || hb == 16) && attn_fdot2_enabled()) {
         if (hb == 32) {

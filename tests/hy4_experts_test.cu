@@ -758,8 +758,66 @@ void run_dense_mmq_case(int type, int n, int k, int rows, std::mt19937& rng) {
 }
 #endif
 
-int main() {
+void cpu_q4x_cases() {
+    namespace iqc = strata::ds4::gguf;
+    CHECK(iqc::iq_cpu_q4x_ok(16));   // GGML_TYPE_IQ2_XXS
+    CHECK(iqc::iq_cpu_q4x_ok(18));   // GGML_TYPE_IQ3_XXS
+    const int n_embd = 512, n_ff = 256;
+    iqc::IqCpu fmt{};
+    std::string err;
+    CHECK(iqc::iq_cpu_fmt(18, 18, n_embd, n_ff, fmt, err));
+    const size_t qb_gu = iqc::iq_cpu_q4x_row_bytes(n_embd), qb_d = iqc::iq_cpu_q4x_row_bytes(n_ff);
+    std::vector<uint8_t> wg(fmt.gu_row * n_ff), wu(fmt.gu_row * n_ff), wd(fmt.d_row * n_embd);
+    std::vector<uint8_t> qg(qb_gu * n_ff), qu(qb_gu * n_ff), qd(qb_d * n_embd);
+    std::mt19937 rng(123);
+    auto fill_iq3 = [&](std::vector<uint8_t>& buf, int cols, size_t rb) {
+        for (size_t i = 0; i < buf.size(); ++i) buf[i] = (uint8_t) (rng() & 255u);
+        for (int r = 0; r < (int) (buf.size() / rb); ++r)
+            for (int b = 0; b < cols / 256; ++b) {
+                uint8_t* p = buf.data() + (size_t) r * rb + (size_t) b * 98;
+                uint16_t d = 0x2400u + (uint16_t) (rng() & 0x03ffu);
+                std::memcpy(p, &d, 2);
+            }
+    };
+    fill_iq3(wg, n_embd, fmt.gu_row);
+    fill_iq3(wu, n_embd, fmt.gu_row);
+    fill_iq3(wd, n_ff, fmt.d_row);
+    iqc::iq_cpu_q4x_convert(wg.data(), fmt.gu_row, n_ff, n_embd, qg.data(), 18);
+    iqc::iq_cpu_q4x_convert(wu.data(), fmt.gu_row, n_ff, n_embd, qu.data(), 18);
+    iqc::iq_cpu_q4x_convert(wd.data(), fmt.d_row, n_embd, n_ff, qd.data(), 18);
+    for (int nt : {1, 2, 4}) {
+        std::vector<float> x((size_t) nt * n_embd), ref_ff((size_t) nt * n_ff), q4_ff((size_t) nt * n_ff),
+                           ref_out((size_t) nt * n_embd), q4_out((size_t) nt * n_embd);
+        std::vector<uint8_t> ax((size_t) nt * fmt.act_bytes), ah((size_t) nt * fmt.h_bytes);
+        std::vector<const void*> ap((size_t) nt), hp((size_t) nt);
+        std::vector<float*> fref((size_t) nt), fq4((size_t) nt), oref((size_t) nt), oq4((size_t) nt);
+        for (int t = 0; t < nt; ++t) {
+            for (int d = 0; d < n_embd; ++d) x[(size_t) t * n_embd + d] = ((float) ((int) (rng() % 2001) - 1000)) * 1e-3f;
+            iqc::iq_cpu_quant(fmt.gu_act, x.data() + (size_t) t * n_embd, n_embd, ax.data() + (size_t) t * fmt.act_bytes);
+            ap[(size_t) t] = ax.data() + (size_t) t * fmt.act_bytes;
+            fref[(size_t) t] = ref_ff.data() + (size_t) t * n_ff;
+            fq4[(size_t) t] = q4_ff.data() + (size_t) t * n_ff;
+            oref[(size_t) t] = ref_out.data() + (size_t) t * n_embd;
+            oq4[(size_t) t] = q4_out.data() + (size_t) t * n_embd;
+        }
+        iqc::iq_cpu_gate_up(fmt, wg.data(), wu.data(), ap.data(), nt, fref.data(), 0, n_ff, 7.0f);
+        iqc::iq_cpu_q4x_gate_up(fmt, qg.data(), qu.data(), ap.data(), nt, fq4.data(), 0, n_ff, 7.0f);
+        CHECK(std::memcmp(ref_ff.data(), q4_ff.data(), ref_ff.size() * sizeof(float)) == 0);
+        for (int t = 0; t < nt; ++t) {
+            iqc::iq_cpu_quant(fmt.d_act, ref_ff.data() + (size_t) t * n_ff, n_ff, ah.data() + (size_t) t * fmt.h_bytes);
+            hp[(size_t) t] = ah.data() + (size_t) t * fmt.h_bytes;
+        }
+        iqc::iq_cpu_down(fmt, wd.data(), hp.data(), nt, oref.data(), 0, n_embd);
+        iqc::iq_cpu_q4x_down(fmt, qd.data(), hp.data(), nt, oq4.data(), 0, n_embd);
+        CHECK(std::memcmp(ref_out.data(), q4_out.data(), ref_out.size() * sizeof(float)) == 0);
+    }
+    std::printf("  cpu_q4x (IQ2_XXS & IQ3_XXS bit-exact): %s\n", fails ? "FAILED" : "ok");
+}
+
+int main(int argc, char** argv) {
     lane_waits_cases();
+    cpu_q4x_cases();
+    if (argc > 1 && std::strcmp(argv[1], "--cpu-q4x") == 0) return fails ? 1 : 0;
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         if (fails) return 1;

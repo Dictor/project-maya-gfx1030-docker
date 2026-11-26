@@ -364,8 +364,8 @@ void test_attention() {
         cudaFree(q8f);
         cudaFree(deq);
     }
-    {   // prompt MLA attention (T > kMaxWin, exercises attn_fdot2_kernel on HIP gfx103x for F16 and Q8 caches)
-        const int TP = 20, HP = 16, nP = 64, ldkP = 48;
+    for (int TP : {20, 64}) {   // (20: 8/32h fdot2; 64: 64h single-block fdot2)
+        const int HP = 64, nP = 96, ldkP = 64;
         auto qP = randn((size_t) TP * HP * KR, 0.1f);
         auto kvP = randn((size_t) nP * KR);
         auto wP = randn(KL, 0.2f);
@@ -405,31 +405,34 @@ void test_attention() {
                 std::memcpy(&hv, &rh[i], 2);
                 rref[i] = h2f(hv);
             }
-            hy4::k::attention(dqP, TP, HP, KL, R, cP, 0, dkP, ldkP, nullptr, dnkP, ldkP, scale, dsP, wsP, outP, 0, q8 != 0);
-            std::vector<double> oref((size_t) TP * HP * KL, 0.0);
-            for (int t = 0; t < TP; ++t)
-                for (int h = 0; h < HP; ++h) {
-                    const float* qh = qP.data() + ((size_t) t * HP + h) * KR;
-                    std::vector<double> sc;
-                    for (int p : keysP[(size_t) t]) {
-                        const double* rr = rref.data() + (size_t) p * KR;
-                        double d = 0;
-                        for (int j = 0; j < KR; ++j) d += qh[j] * rr[j];
-                        sc.push_back(d * scale);
+            for (int use_sink : {1, 0}) {
+                hy4::k::attention(dqP, TP, HP, KL, R, cP, 0, dkP, ldkP, nullptr, dnkP, ldkP, scale,
+                                  use_sink ? dsP : nullptr, wsP, outP, 0, q8 != 0);
+                std::vector<double> oref((size_t) TP * HP * KL, 0.0);
+                for (int t = 0; t < TP; ++t)
+                    for (int h = 0; h < HP; ++h) {
+                        const float* qh = qP.data() + ((size_t) t * HP + h) * KR;
+                        std::vector<double> sc;
+                        for (int p : keysP[(size_t) t]) {
+                            const double* rr = rref.data() + (size_t) p * KR;
+                            double d = 0;
+                            for (int j = 0; j < KR; ++j) d += qh[j] * rr[j];
+                            sc.push_back(d * scale);
+                        }
+                        double m = use_sink ? sinkP[(size_t) h] : -INFINITY;
+                        for (double v : sc) m = std::max(m, v);
+                        double den = use_sink ? std::exp(sinkP[(size_t) h] - m) : 0.0;
+                        for (double v : sc) den += std::exp(v - m);
+                        for (size_t k = 0; k < sc.size(); ++k) {
+                            const double pk = std::exp(sc[k] - m) / den;
+                            const double* rr = rref.data() + (size_t) keysP[(size_t) t][k] * KR;
+                            for (int j = 0; j < KL; ++j) oref[((size_t) t * HP + h) * KL + j] += pk * rr[j];
+                        }
                     }
-                    double m = sinkP[(size_t) h];
-                    for (double v : sc) m = std::max(m, v);
-                    double den = std::exp(sinkP[(size_t) h] - m);
-                    for (double v : sc) den += std::exp(v - m);
-                    for (size_t k = 0; k < sc.size(); ++k) {
-                        const double pk = std::exp(sc[k] - m) / den;
-                        const double* rr = rref.data() + (size_t) keysP[(size_t) t][k] * KR;
-                        for (int j = 0; j < KL; ++j) oref[((size_t) t * HP + h) * KL + j] += pk * rr[j];
-                    }
-                }
-            const double ep = rel(host(outP, (size_t) TP * HP * KL), oref);
-            std::printf("  attention prompt (%s, T=%d): rel %.2e\n", q8 ? "q8" : "f16", TP, ep);
-            CHECK(ep < 3e-3);
+                const double ep = rel(host(outP, (size_t) TP * HP * KL), oref);
+                std::printf("  attention prompt (%s, T=%d, sink=%d): rel %.2e\n", q8 ? "q8" : "f16", TP, use_sink, ep);
+                CHECK(ep < 3e-3);
+            }
             cudaFree(cP);
             cudaFree(dP);
         }

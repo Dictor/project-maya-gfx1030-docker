@@ -230,6 +230,11 @@ bool pipe_balance_enabled() {
     return e == nullptr || *e == 0 || std::atoi(e) != 0;
 }
 
+bool stream_async_enabled() {
+    const char* e = std::getenv("HY4_STREAM_ASYNC");
+    return e == nullptr || *e == 0 || std::atoi(e) != 0;
+}
+
 #if defined(STRATA_USE_HIP) && defined(MAYA_DS4_IQ_MMQ)
 bool hy4_expert_mmq_enabled(int dev) {
     static const int env_set = [] {
@@ -420,7 +425,11 @@ struct Gpu {
     float* cpo = nullptr;   // (the CPU lane's sums, [Tc][n_lat])
     uint8_t* stage = nullptr;   // (a prompt's streamed experts: kStage slots of the largest blob)
     double h2d_gbs = 10.0;      // (... the copies to it, GB/s: measured at the load)
-    int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's)
+    int* pmap = nullptr;        // (... each expert's slot in them, -1: not this pass's; 2 x n_expert for double-buf)
+    cudaStream_t s_copy = nullptr;
+    cudaEvent_t ev_copy[2] = {nullptr, nullptr};
+    cudaEvent_t ev_comp[2] = {nullptr, nullptr};
+    bool stage_busy[2] = {false, false};
     // ... and its attention as GEMMs: the scores, the probabilities (F16), a ring's keys in order, the picks' mask
     float *sS = nullptr, *dmask = nullptr;
     uint16_t *sP = nullptr, *kbuf = nullptr;
@@ -562,6 +571,8 @@ struct Model::Impl {
     size_t stage_blob = 0;              // (h_stage's blob size)
     double copy_gbs = 15.0;       // ... the copies into the bounce, GB/s (measured, EMA)
     int* h_pmap = nullptr;
+    bool lane_ram_loaded = false;
+    std::vector<std::unique_ptr<Crew>> stage_crews;
     std::mutex lane_mu;
     std::vector<CpuEntry> lane_entries;
     // tensor parallel (Options::tp > 1, hy4_tp.hpp): the members (indexes into G), each one's layer slices; the pinned
@@ -780,6 +791,7 @@ struct Model::Impl {
                          100.0 * (double) lc.q4x.load() / std::max(1.0, (double) lc.entries.load()));
         }
         if (eg_populator.joinable()) eg_populator.join();
+        stage_crews.clear();
         eg_ram_buf.release();
         eg_scale_ram_buf.release();
         tok_ram_buf.release();
@@ -794,6 +806,13 @@ struct Model::Impl {
         tok_embd = nullptr;
         for (auto& gp : G) {
             cudaSetDevice(gp.dev);
+            for (int b = 0; b < 2; ++b) {
+                if (gp.stage_busy[b] && gp.ev_comp[b]) cudaEventSynchronize(gp.ev_comp[b]);
+                gp.stage_busy[b] = false;
+                if (gp.ev_copy[b]) cudaEventDestroy(gp.ev_copy[b]);
+                if (gp.ev_comp[b]) cudaEventDestroy(gp.ev_comp[b]);
+            }
+            if (gp.s_copy) cudaStreamDestroy(gp.s_copy);
             for (void* p : gp.allocs) cudaFree(p);
             if (gp.owns_host_lane) {
                 if (gp.h_ids) cudaFreeHost(gp.h_ids);
@@ -1757,12 +1776,16 @@ struct Model::Impl {
                     db[(size_t) il] = (double) dense_bytes(il);
                     eb[(size_t) il] = d ? 0.0 : (double) expert_bytes(il);
                     greedy_res += d ? 0 : L[(size_t) il].n_res;
-                    if (!g.swa[(size_t) il]) lc[(size_t) il] += 1.5;
+                    if (!g.swa[(size_t) il]) lc[(size_t) il] += 0.8;
                     if (pk.eg.modules > 0 && pk.eg.module_of(il) >= 0) lc[(size_t) il] += 0.3;
+                }
+                double stream_w = 1.2;
+                if (const char* sw = std::getenv("HY4_PIPE_STREAM_W")) {
+                    if (*sw) stream_w = std::max(0.0, std::atof(sw));
                 }
                 const BalancedSplit bs = balanced_pipe_split(db, eb, lc, is_d, g.n_expert, free_b[0], free_b[1], cap,
                                                              head_gpu == 0 ? 1.0 : 0.0, head_gpu == 1 ? 1.0 : 0.0,
-                                                             gp_plan.split, greedy_res);
+                                                             gp_plan.split, greedy_res, stream_w);
                 if (bs.ok && bs.split != gp_plan.split) {
                     int ix0 = 0, ix1 = 0;
                     for (int il = 0; il < g.n_layer; ++il) {
@@ -3268,15 +3291,22 @@ struct Model::Impl {
             for (const Layer& l : L) blob = std::max(blob, l.blob);
             CK(cudaMallocHost(&h_stage, blob * kStage));
             stage_blob = blob;
-            CK(cudaMallocHost(&h_pmap, sizeof(int) * g.n_expert));
+            CK(cudaMallocHost(&h_pmap, sizeof(int) * 2 * (size_t) g.n_expert));
+            stage_crews.resize(G.size());
             for (size_t gi = 0; gi < G.size(); ++gi) {   // (the staging slots where a GPU holds such layers)
                 bool any = false;
                 for (const Layer& l : L) any |= l.gpu == (int) gi && l.partial();
                 if (!any) continue;
                 CK(cudaSetDevice(G[gi].dev));
                 if ((!G[gi].stage && !G[gi].alloc(G[gi].stage, blob * kStage, err)) ||
-                    !G[gi].alloc(G[gi].pmap, (size_t) g.n_expert, err))
+                    !G[gi].alloc(G[gi].pmap, 2 * (size_t) g.n_expert, err))
                     return false;
+                CK(cudaStreamCreateWithFlags(&G[gi].s_copy, cudaStreamNonBlocking));
+                for (int b = 0; b < 2; ++b) {
+                    CK(cudaEventCreateWithFlags(&G[gi].ev_copy[b], cudaEventDisableTiming));
+                    CK(cudaEventCreateWithFlags(&G[gi].ev_comp[b], cudaEventDisableTiming));
+                }
+                stage_crews[gi] = std::make_unique<Crew>(4);
                 // the GPU's PCIe as streaming sees it: the pinned bounce to the staging slots
                 CK(cudaMemcpy(G[gi].stage, h_stage, blob * kStage, cudaMemcpyHostToDevice));
                 const double t0 = now_s();
@@ -3296,7 +3326,7 @@ struct Model::Impl {
                               !prof_in.empty() ? "the profile" : "their order, no scores yet", hot.every, hot.max_swaps);
                 info.push_back(buf);
             }
-            bool lane_ram_loaded = false;
+            lane_ram_loaded = false;
             const int lane_ram_mode = resolve_ram_mode(o.lane_ram, "HY4_LANE_RAM");
             if (lane_ram_mode > kEgRamOff) {
                 std::vector<RamSpan> spans;
@@ -4463,8 +4493,10 @@ struct Model::Impl {
         }
         if (probe_l < 0 || per <= 0) return;
         const double avail = (double) ram_available(), tot = (double) ram_total();
-        const double head = std::max(4.0 * 1073741824.0, 0.1 * tot);
-        double budget = avail - lane_b - head;
+        const double uncached_lane = lane_ram_loaded ? 0.0 : lane_b;
+        double head = std::max(4.0 * 1073741824.0, 0.1 * tot);
+        if (lane_ram_loaded) head = std::min(head, 4.0 * 1073741824.0);
+        double budget = avail - uncached_lane - head;
         if (const char* gb = std::getenv("HY4_Q4X_GB"))
             budget = std::min(budget, std::atof(gb) * 1e9);
         else
@@ -4708,6 +4740,11 @@ struct Model::Impl {
                     if (L[(size_t) s.il].gpu == (int) gi) mine.push_back(&s);
                 if (mine.empty()) continue;
                 CK(cudaSetDevice(gp.dev));
+                for (int b = 0; b < 2; ++b)
+                    if (gp.stage_busy[b]) {
+                        CK(cudaEventSynchronize(gp.ev_comp[b]));
+                        gp.stage_busy[b] = false;
+                    }
                 const bool sync_evict = lane_ram_writable && !q4x_builder.joinable();
                 if (sync_evict) CK(cudaStreamSynchronize(gp.s));
                 std::vector<uint8_t> evict_buf;
@@ -4790,7 +4827,8 @@ struct Model::Impl {
         return true;
     }
     bool experts_sets(Layer& l, Gpu& gp, int T, std::string& err, const int* slot, const uint8_t* wbase = nullptr,
-                      int n_slots = -1, bool accumulate = false) {
+                      int n_slots = -1, bool accumulate = false, const int* host_ids = nullptr,
+                      const int* host_slot = nullptr) {
         const int lat = g.n_lat, nu = g.n_used, ne = slot ? (n_slots >= 0 ? n_slots : l.n_res) : g.n_expert;
         cudaStream_t s = gp.s;
         part0(gp);
@@ -4799,9 +4837,17 @@ struct Model::Impl {
             if (!accumulate) k::moe_combine(gp.sy, gp.srow, gp.rw, T, nu, lat, gp.latout, s);
             return true;
         }
-        std::vector<int> b((size_t) ne + 1);
-        CK(cudaMemcpyAsync(b.data(), gp.bounds, sizeof(int) * (ne + 1), cudaMemcpyDeviceToHost, s));
-        CK(cudaStreamSynchronize(s));
+        std::vector<int> b((size_t) ne + 1, 0);
+        if (host_ids != nullptr && !prof) {
+            for (int i = 0; i < T * nu; ++i) {
+                const int sl = host_slot ? host_slot[host_ids[i]] : host_ids[i];
+                if (sl >= 0 && sl < ne) ++b[(size_t) sl + 1];
+            }
+            for (int e = 0; e < ne; ++e) b[(size_t) e + 1] += b[(size_t) e];
+        } else {
+            CK(cudaMemcpyAsync(b.data(), gp.bounds, sizeof(int) * (ne + 1), cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+        }
         int max_rows = 0;
         for (int e = 0; e < ne; ++e) max_rows = std::max(max_rows, b[(size_t) e + 1] - b[(size_t) e]);
         part(gp, "experts: sort", T);
@@ -4871,6 +4917,68 @@ struct Model::Impl {
             if (used[(size_t) e]) u.push_back(e);
         const CpuExperts& cx = l.cex;
         const size_t gb = cx.g_stride, db = cx.d_stride;
+        if (stream_async_enabled() && !prof && gp.s_copy != nullptr && stage_blob >= l.blob && kStage >= 2 &&
+            !u.empty()) {
+            const int kHalf = kStage / 2;
+            const size_t n_batches = (u.size() + (size_t) kHalf - 1) / (size_t) kHalf;
+            const size_t gi = (size_t) (&gp - G.data());
+            Crew* cr = (gi < stage_crews.size() && stage_crews[gi]) ? stage_crews[gi].get() : nullptr;
+            auto stage_h = [&](int buf) { return g_stage + (size_t) buf * (size_t) kHalf * stage_blob; };
+            auto stage_d = [&](int buf) { return gp.stage + (size_t) buf * (size_t) kHalf * stage_blob; };
+            auto pmap_h = [&](int buf) { return g_pmap + (size_t) buf * (size_t) ne; };
+            auto pmap_d = [&](int buf) { return gp.pmap + (size_t) buf * (size_t) ne; };
+            double cpu_copy_ms = 0.0;
+            auto enqueue_copy = [&](size_t bi) -> bool {
+                const int buf = (int) (bi & 1u);
+                const size_t p0 = bi * (size_t) kHalf;
+                const int np = (int) std::min(u.size() - p0, (size_t) kHalf);
+                if (gp.stage_busy[buf]) {
+                    CK(cudaEventSynchronize(gp.ev_comp[buf]));
+                    gp.stage_busy[buf] = false;
+                }
+                const double tc = now_s();
+                uint8_t* dst_base = stage_h(buf);
+                auto copy_item = [&](int it) {
+                    const int i = it / 3, role = it % 3, e = u[p0 + (size_t) i];
+                    uint8_t* dst = dst_base + (size_t) i * l.blob + l.tr[role];
+                    const uint8_t* src = role == 0 ? cx.gate_ptr(e) : role == 1 ? cx.up_ptr(e) : cx.down_ptr(e);
+                    std::memcpy(dst, src, role == 2 ? db : gb);
+                };
+                if (cr) {
+                    const int nt = cr->size();
+                    cr->start([&](int w) {
+                        for (int it = w; it < np * 3; it += nt) copy_item(it);
+                    });
+                    cr->wait();
+                } else {
+                    std::lock_guard<std::mutex> lk(lane_mu);
+                    lane->parallel_for(np * 3, copy_item);
+                }
+                cpu_copy_ms += (now_s() - tc) * 1e3;
+                int* pm = pmap_h(buf);
+                for (int e = 0; e < ne; ++e) pm[e] = -1;
+                for (int i = 0; i < np; ++i) pm[u[p0 + (size_t) i]] = i;
+                CK(cudaMemcpyAsync(stage_d(buf), dst_base, (size_t) np * l.blob, cudaMemcpyHostToDevice, gp.s_copy));
+                CK(cudaMemcpyAsync(pmap_d(buf), pm, sizeof(int) * (size_t) ne, cudaMemcpyHostToDevice, gp.s_copy));
+                CK(cudaEventRecord(gp.ev_copy[buf], gp.s_copy));
+                return true;
+            };
+            if (!enqueue_copy(0)) return false;
+            for (size_t bi = 0; bi < n_batches; ++bi) {
+                const int buf = (int) (bi & 1u);
+                const size_t p0 = bi * (size_t) kHalf;
+                const int np = (int) std::min(u.size() - p0, (size_t) kHalf);
+                CK(cudaStreamWaitEvent(s, gp.ev_copy[buf], 0));
+                if (!experts_sets(l, gp, T, err, pmap_d(buf), stage_d(buf), np, true, g_ids, pmap_h(buf))) return false;
+                CK(cudaEventRecord(gp.ev_comp[buf], s));
+                gp.stage_busy[buf] = true;
+                if (bi + 1 < n_batches && !enqueue_copy(bi + 1)) return false;
+            }
+            std::lock_guard<std::mutex> lk(lane_mu);
+            st.stream_ms += cpu_copy_ms;
+            st.streamed += (int64_t) u.size();
+            return true;
+        }
         for (size_t p0 = 0; p0 < u.size(); p0 += (size_t) kStage) {
             const int np = (int) std::min(u.size() - p0, (size_t) kStage);
             {
@@ -4888,7 +4996,9 @@ struct Model::Impl {
             for (int e = 0; e < ne; ++e) g_pmap[e] = -1;
             for (int i = 0; i < np; ++i) g_pmap[u[p0 + (size_t) i]] = i;
             CK(cudaMemcpyAsync(gp.pmap, g_pmap, sizeof(int) * ne, cudaMemcpyHostToDevice, s));
-            if (!experts_sets(l, gp, T, err, gp.pmap, gp.stage, np, true)) return false;
+            if (!experts_sets(l, gp, T, err, gp.pmap, gp.stage, np, true, !prof ? g_ids : nullptr,
+                              !prof ? g_pmap : nullptr))
+                return false;
             CK(cudaStreamSynchronize(s));   // (the bounce and the map are the next pass's)
             std::lock_guard<std::mutex> lk(lane_mu);
             st.streamed += np;
@@ -5012,7 +5122,8 @@ struct Model::Impl {
             const int* slot = lane_on || l.tpm >= 0 ? l.slot_d : nullptr;
             bool streamed = false;
             if (T > W) {
-                ok = ok && experts_sets(l, gp, T, err, slot);
+                ok = ok && experts_sets(l, gp, T, err, slot, nullptr, -1, false, lane_on ? g_ids : nullptr,
+                                        lane_on ? l.slot_of.data() : nullptr);
                 // a prompt chunk's experts not in VRAM: streamed to the GPU, or the CPU lane - whichever the measured
                 // rates say is faster for this many experts and entries (a PC's PCIe against its CPU)
                 if (lane_on) {
@@ -6027,7 +6138,7 @@ struct Model::Impl {
                      alloc_host((void**) &g1.h_lat, sizeof(float) * (size_t) Tc * (size_t) g.n_lat) &&
                      alloc_host((void**) &g1.h_cpu, sizeof(float) * (size_t) Tc * (size_t) g.n_lat) &&
                      alloc_host((void**) &g1.h_stage, stage_blob * kStage) &&
-                     alloc_host((void**) &g1.h_pmap, sizeof(int) * (size_t) g.n_expert);
+                     alloc_host((void**) &g1.h_pmap, sizeof(int) * 2 * (size_t) g.n_expert);
             }
         }
         if (!ok) {

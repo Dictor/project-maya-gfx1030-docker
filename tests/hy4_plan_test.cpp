@@ -419,11 +419,13 @@ int main() {
         const int64_t greedy_res = 41LL * 336;
         hy4::BalancedSplit bs = hy4::balanced_pipe_split(dense_b, exp_b, cost, is_dense, nExp, 26.0, 29.8, 1.0,
                                                          1.0, 0.0, 18, greedy_res);
-        CHECK(bs.ok && bs.split > 18 && bs.split <= 21);
+        CHECK(bs.ok && bs.split >= 19 && bs.split <= 20);
         int64_t tot_res = 0;
         for (int il = 0; il < nL; ++il)
             if (!is_dense[(size_t) il]) tot_res += (il < bs.split ? bs.n0 : bs.n1);
         CHECK(tot_res >= (int64_t) std::floor(0.98 * (double) greedy_res));
+        const int min_side_n = (int) std::floor(0.85 * 336.0);
+        CHECK(bs.n0 >= min_side_n && bs.n1 >= min_side_n);
         // If GPU0 lacks room for balanced split's dense bytes, stays not ok / keeps greedy
         hy4::BalancedSplit tight = hy4::balanced_pipe_split(dense_b, exp_b, cost, is_dense, nExp, 6.0, 29.8, 1.0,
                                                             1.0, 0.0, 18, greedy_res);

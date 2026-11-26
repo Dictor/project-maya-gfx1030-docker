@@ -67,6 +67,8 @@ export HY4_PROMPT_PIPE="${HY4_PROMPT_PIPE:-1}"
 export HY4_DENSE_MMQ="${HY4_DENSE_MMQ:-1}"
 export HY4_ATTN_FDOT2="${HY4_ATTN_FDOT2:-1}"
 export HY4_PIPE_BALANCE="${HY4_PIPE_BALANCE:-1}"
+export HY4_STREAM_ASYNC="${HY4_STREAM_ASYNC:-1}"
+export HY4_ATTN_64H="${HY4_ATTN_64H:-1}"
 
 PYBIN="/opt/maya/.venv/bin/python"
 SERVER="/opt/maya/serve/server.py"
@@ -378,10 +380,20 @@ if family == "hy4":
         ("MAYA_HY4_CHUNK", "--chunk"),
         ("MAYA_HY4_CPU_THREADS", "--cpu-threads"),
         ("MAYA_HY4_VRAM_EXPERTS", "--vram-experts"),
+        ("MAYA_HY4_DRAFT_N", "--draft"),
+        ("MAYA_HY4_DRAFT_FLOOR", "--draft-floor"),
+        ("MAYA_HY4_DRAFT_SURE", "--draft-sure"),
+        ("MAYA_HY4_DRAFT_STREAK", "--draft-streak"),
     ):
         val = (os.environ.get(env_k) or "").strip()
         if val:
             args += [flag, val]
+
+    if "--mtp" in args:
+        dm = os.environ.get("MAYA_HY4_DRAFT_MORE")
+        dm_val = "2" if dm is None else dm.strip()
+        if dm_val:
+            args += ["--draft-more", dm_val]
 
     hy4_eg_ram_cfg = (os.environ.get("MAYA_HY4_ENGRAM_RAM") or "").strip().lower()
     if hy4_eg_ram_cfg:
@@ -635,7 +647,7 @@ fi
 
 if grep -q 'maya-hy4' "$CFG"; then
   echo "[maya-gfx1030] Starting Project Maya (Hy4-Flash, gfx1030) with config: $CFG"
-  echo "[maya-gfx1030] Hy4 Defaults: HY4_PROMPT_F16=$HY4_PROMPT_F16 HY4_EG_RAM=$HY4_EG_RAM HY4_LANE_RAM=$HY4_LANE_RAM HY4_LOAD_SEQ=$HY4_LOAD_SEQ HY4_EG_POPULATE=$HY4_EG_POPULATE HY4_EXPERT_MMQ=$HY4_EXPERT_MMQ HY4_PROMPT_PIPE=$HY4_PROMPT_PIPE HY4_DENSE_MMQ=$HY4_DENSE_MMQ HY4_ATTN_FDOT2=$HY4_ATTN_FDOT2 HY4_PIPE_BALANCE=$HY4_PIPE_BALANCE"
+  echo "[maya-gfx1030] Hy4 Defaults: HY4_PROMPT_F16=$HY4_PROMPT_F16 HY4_EG_RAM=$HY4_EG_RAM HY4_LANE_RAM=$HY4_LANE_RAM HY4_LOAD_SEQ=$HY4_LOAD_SEQ HY4_EG_POPULATE=$HY4_EG_POPULATE HY4_EXPERT_MMQ=$HY4_EXPERT_MMQ HY4_PROMPT_PIPE=$HY4_PROMPT_PIPE HY4_DENSE_MMQ=$HY4_DENSE_MMQ HY4_ATTN_FDOT2=$HY4_ATTN_FDOT2 HY4_PIPE_BALANCE=$HY4_PIPE_BALANCE HY4_STREAM_ASYNC=$HY4_STREAM_ASYNC HY4_ATTN_64H=$HY4_ATTN_64H"
 else
   echo "[maya-gfx1030] Starting Project Maya (GLM-5.3-Flash, gfx1030) with config: $CFG"
   echo "[maya-gfx1030] Defaults: RESERVE_MB=$MAYA_GLM_RESERVE_MB PIN_PIECE_MB=$MAYA_GLM_PIN_PIECE_MB RAM_RESIDENT=$MAYA_GLM_RAM_RESIDENT EMB_RAM=$MAYA_GLM_EMB_RAM PREFILL_MIN_CHUNKS=$MAYA_GLM_PREFILL_MIN_CHUNKS PREFILL_SUB=$MAYA_GLM_PREFILL_SUB PREFILL_MB=$MAYA_GLM_PREFILL_MB PF_CE=$MAYA_GLM_PF_CE PROMPT_F16=$MAYA_GLM_PROMPT_F16 MLA_FDOT2=$MAYA_GLM_MLA_FDOT2 MV_RDNA=$MAYA_GLM_MV_RDNA DENSE_MMQ=$MAYA_GLM_DENSE_MMQ BF16_F16=$MAYA_GLM_BF16_F16"

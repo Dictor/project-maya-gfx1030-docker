@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace strata::kernels::glmb {
@@ -99,6 +100,62 @@ __device__ __forceinline__ float warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 #endif
+}
+// Bit-exact RDNA2 DPP / permlanex16 lane-XOR helpers for Sinkhorn (masks 1/2/4/8) and warp argmax (masks 16..1).
+template <int Mask>
+__device__ __forceinline__ float warp_xor_f(float v) {
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    if constexpr (Mask == 16) {
+        const int i = __builtin_bit_cast(int, v);
+        return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    } else {
+        constexpr int ctrl = (Mask == 8) ? 0x168 : (Mask == 4) ? 0x164 : (Mask == 2) ? 0x162 : 0x161;
+        return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), ctrl, 0xf, 0xf, false));
+    }
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+    if constexpr (Mask == 16) return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
+    else if constexpr (Mask == 8) return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
+    else if constexpr (Mask == 4) return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
+    else if constexpr (Mask == 2) return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));
+    else return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false));
+#else
+    return __shfl_xor_sync(0xffffffffu, v, Mask);
+#endif
+}
+template <int Mask>
+__device__ __forceinline__ int warp_xor_i(int v) {
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
+    if constexpr (Mask == 16)
+        return __builtin_amdgcn_permlanex16(v, v, 0x76543210, 0xfedcba98, false, false);
+    else {
+        constexpr int ctrl = (Mask == 8) ? 0x168 : (Mask == 4) ? 0x164 : (Mask == 2) ? 0x162 : 0x161;
+        return __builtin_amdgcn_update_dpp(0, v, ctrl, 0xf, 0xf, false);
+    }
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+    if constexpr (Mask == 16) return __builtin_amdgcn_ds_swizzle(v, 0x401f);
+    else if constexpr (Mask == 8) return __builtin_amdgcn_ds_swizzle(v, 0x201f);
+    else if constexpr (Mask == 4) return __builtin_amdgcn_ds_swizzle(v, 0x101f);
+    else if constexpr (Mask == 2) return __builtin_amdgcn_update_dpp(0, v, 0x4e, 0xf, 0xf, false);
+    else return __builtin_amdgcn_update_dpp(0, v, 0xb1, 0xf, 0xf, false);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, Mask);
+#endif
+}
+template <int Mask>
+__device__ __forceinline__ void warp_argmax_step(float& bv, int& bi) {
+    const float ov = warp_xor_f<Mask>(bv);
+    const int oi = warp_xor_i<Mask>(bi);
+    if (ov > bv || (ov == bv && oi < bi)) {
+        bv = ov;
+        bi = oi;
+    }
+}
+__device__ __forceinline__ void warp_argmax(float& bv, int& bi) {
+    warp_argmax_step<16>(bv, bi);
+    warp_argmax_step<8>(bv, bi);
+    warp_argmax_step<4>(bv, bi);
+    warp_argmax_step<2>(bv, bi);
+    warp_argmax_step<1>(bv, bi);
 }
 // block-wide sum; every thread gets the total.  sh: >= 32 floats.  blockDim % 32 == 0.
 __device__ __forceinline__ float block_sum(float v, float* sh) {
@@ -196,6 +253,146 @@ __global__ void __launch_bounds__(256) hc_update_kernel(const float* __restrict_
     if (threadIdx.x == 0) ss[t] = acc;
 }
 
+// Fused mHC hc_update + BF16 hc_fn matmul (N=24, K=4*E, FP32 accumulation):
+// One block of 256 threads (8 warps) processes BT=8 tokens in tiles of CE=64 embedding dims (8.6 KiB LDS, ~48 VGPRs).
+// Eliminates the redundant S->R full read pass + 90 skinny N=24 FP32 SGEMMs per chunk while preserving FP32 precision.
+template <bool HAS_BLOCK_OUT>
+__global__ void __launch_bounds__(256) hc_update_mix_kernel(
+        const float* __restrict__ block_out, float* __restrict__ R, const float* __restrict__ post,
+        const float* __restrict__ comb, const uint16_t* __restrict__ fn, float* __restrict__ ss,
+        float* __restrict__ mix, int T, int E) {
+    constexpr int BT = 8;
+    const int t0 = (int) blockIdx.x * BT;
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    __shared__ float s_post[BT][4];
+    __shared__ float s_comb[BT][16];
+    __shared__ float sR[BT][4][2][32];   // [tb][stream][even/odd][lane]: zero bank conflicts
+    if constexpr (HAS_BLOCK_OUT) {
+        if (tid < BT * 4) {
+            const int tb = tid >> 2, d = tid & 3;
+            s_post[tb][d] = (t0 + tb < T) ? post[(size_t) (t0 + tb) * 4 + d] : 0.0f;
+        }
+        if (tid < BT * 16) {
+            const int tb = tid >> 4, k = tid & 15;
+            s_comb[tb][k] = (t0 + tb < T) ? comb[(size_t) (t0 + tb) * 16 + k] : 0.0f;
+        }
+        __syncthreads();
+    }
+    const bool fn_a4 = ((((uintptr_t) fn) & 3u) == 0u) && ((E & 1) == 0);
+    float acc[3][BT];
+#pragma unroll
+    for (int r = 0; r < 3; ++r)
+#pragma unroll
+        for (int tb = 0; tb < BT; ++tb) acc[r][tb] = 0.0f;
+    float ss_tok = 0.0f;
+    const int my_t = t0 + warp;
+    const bool my_live = my_t < T;
+    float* const my_R = my_live ? R + (size_t) my_t * 4 * E : nullptr;
+    const float* const my_bo = (HAS_BLOCK_OUT && my_live) ? block_out + (size_t) my_t * E : nullptr;
+    const int m0 = warp, m1 = warp + 8, m2 = warp + 16;
+    const uint16_t* const fn0 = fn + (size_t) m0 * 4 * E;
+    const uint16_t* const fn1 = fn + (size_t) m1 * 4 * E;
+    const uint16_t* const fn2 = fn + (size_t) m2 * 4 * E;
+    for (int e0 = 0; e0 < E; e0 += 64) {
+        const int e = e0 + 2 * lane;
+        const bool has0 = e < E, has1 = (e + 1) < E;
+        if (my_live && has0) {
+            float ra[4], rb[4];
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                ra[d] = my_R[(size_t) d * E + e];
+                rb[d] = has1 ? my_R[(size_t) d * E + e + 1] : 0.0f;
+            }
+            if constexpr (HAS_BLOCK_OUT) {
+                const float ba = my_bo[e];
+                const float bb = has1 ? my_bo[e + 1] : 0.0f;
+                float na[4], nb[4];
+#pragma unroll
+                for (int d = 0; d < 4; ++d) {
+                    float va = ba * s_post[warp][d];
+                    float vb = bb * s_post[warp][d];
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        const float c = s_comb[warp][d * 4 + s];
+                        va = fmaf(c, ra[s], va);
+                        vb = fmaf(c, rb[s], vb);
+                    }
+                    na[d] = va;
+                    nb[d] = vb;
+                }
+#pragma unroll
+                for (int d = 0; d < 4; ++d) {
+                    ra[d] = na[d];
+                    rb[d] = has1 ? nb[d] : 0.0f;
+                    my_R[(size_t) d * E + e] = ra[d];
+                    if (has1) my_R[(size_t) d * E + e + 1] = rb[d];
+                }
+            }
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                ss_tok = fmaf(ra[d], ra[d], ss_tok);
+                if (has1) ss_tok = fmaf(rb[d], rb[d], ss_tok);
+                sR[warp][d][0][lane] = ra[d];
+                sR[warp][d][1][lane] = has1 ? rb[d] : 0.0f;
+            }
+        } else {
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                sR[warp][d][0][lane] = 0.0f;
+                sR[warp][d][1][lane] = 0.0f;
+            }
+        }
+        __syncthreads();
+        if (has0) {
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                const size_t woff = (size_t) d * E + e;
+                float w0a, w0b, w1a, w1b, w2a, w2b;
+                if (fn_a4 && has1) {
+                    const uint32_t p0 = *(const uint32_t*) (fn0 + woff);
+                    const uint32_t p1 = *(const uint32_t*) (fn1 + woff);
+                    const uint32_t p2 = *(const uint32_t*) (fn2 + woff);
+                    w0a = __uint_as_float(p0 << 16);
+                    w0b = __uint_as_float(p0 & 0xffff0000u);
+                    w1a = __uint_as_float(p1 << 16);
+                    w1b = __uint_as_float(p1 & 0xffff0000u);
+                    w2a = __uint_as_float(p2 << 16);
+                    w2b = __uint_as_float(p2 & 0xffff0000u);
+                } else {
+                    w0a = __uint_as_float((uint32_t) fn0[woff] << 16);
+                    w1a = __uint_as_float((uint32_t) fn1[woff] << 16);
+                    w2a = __uint_as_float((uint32_t) fn2[woff] << 16);
+                    w0b = has1 ? __uint_as_float((uint32_t) fn0[woff + 1] << 16) : 0.0f;
+                    w1b = has1 ? __uint_as_float((uint32_t) fn1[woff + 1] << 16) : 0.0f;
+                    w2b = has1 ? __uint_as_float((uint32_t) fn2[woff + 1] << 16) : 0.0f;
+                }
+#pragma unroll
+                for (int tb = 0; tb < BT; ++tb) {
+                    const float r0 = sR[tb][d][0][lane];
+                    const float r1 = sR[tb][d][1][lane];
+                    acc[0][tb] = fmaf(w0a, r0, fmaf(w0b, r1, acc[0][tb]));
+                    acc[1][tb] = fmaf(w1a, r0, fmaf(w1b, r1, acc[1][tb]));
+                    acc[2][tb] = fmaf(w2a, r0, fmaf(w2b, r1, acc[2][tb]));
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (ss != nullptr) {
+        const float ss_sum = warp_sum(ss_tok);
+        if (lane == 0 && my_live) ss[my_t] = ss_sum;
+    }
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        const int m = warp + 8 * r;
+#pragma unroll
+        for (int tb = 0; tb < BT; ++tb) {
+            const float mv = warp_sum(acc[r][tb]);
+            if (lane == 0 && t0 + tb < T) mix[(size_t) (t0 + tb) * 24 + m] = mv;
+        }
+    }
+}
+
 __global__ void __launch_bounds__(256) hc_finish_kernel(const HcFinishArgs a) {
     const int hc = 4;
     const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -214,23 +411,23 @@ __global__ void __launch_bounds__(256) hc_finish_kernel(const HcFinishArgs a) {
         }
         const int l = lane & 15, d = l >> 2, s = l & 3;
         float c = smix[2 * hc + d + hc * s] * inv * a.w_scale[2] + a.w_base[2 * hc + d + hc * s];
-        float mx = fmaxf(c, __shfl_xor_sync(0xffffffffu, c, 4));
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 8));
+        float mx = fmaxf(c, warp_xor_f<4>(c));
+        mx = fmaxf(mx, warp_xor_f<8>(mx));
         const float ex = __expf(c - mx);
-        float den = ex + __shfl_xor_sync(0xffffffffu, ex, 4);
-        den += __shfl_xor_sync(0xffffffffu, den, 8);
+        float den = ex + warp_xor_f<4>(ex);
+        den += warp_xor_f<8>(den);
         c = ex / den + a.hc_eps;
         {
-            float sm = c + __shfl_xor_sync(0xffffffffu, c, 1);
-            sm += __shfl_xor_sync(0xffffffffu, sm, 2);
+            float sm = c + warp_xor_f<1>(c);
+            sm += warp_xor_f<2>(sm);
             c = c / (a.hc_eps + sm);
         }
         for (int it = 1; it < a.iters; ++it) {
-            float sm = c + __shfl_xor_sync(0xffffffffu, c, 4);
-            sm += __shfl_xor_sync(0xffffffffu, sm, 8);
+            float sm = c + warp_xor_f<4>(c);
+            sm += warp_xor_f<8>(sm);
             c = c / (a.hc_eps + sm);
-            sm = c + __shfl_xor_sync(0xffffffffu, c, 1);
-            sm += __shfl_xor_sync(0xffffffffu, sm, 2);
+            sm = c + warp_xor_f<1>(c);
+            sm += warp_xor_f<2>(sm);
             c = c / (a.hc_eps + sm);
         }
         if (lane < 16) a.comb[t * 16 + d * hc + s] = c;
@@ -499,8 +696,7 @@ __global__ void __launch_bounds__(128) kda_out_kernel(const float* __restrict__ 
 __device__ __forceinline__ void lat_put(uint16_t* lat, int row, float y, bool q8, int kv_lora, int c) {
     if (q8) {
         uint8_t* rec = (uint8_t*) lat8_rec(lat, kv_lora, row);
-        float amax = fabsf(y);
-        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const float amax = warp_max(fabsf(y));
         const __half d16 = __float2half(amax / 127.0f);
         const float d = __half2float(d16);
         ((int8_t*) rec)[c] = (int8_t) (d > 0.0f ? max(-127, min(127, __float2int_rn(y / d))) : 0);
@@ -1949,7 +2145,7 @@ int mla_wmma2_arch() {
 
 // RDNA 2 (gfx1030/1031/1032) prompt MLA attention via v_dot2_f32_f16 (__builtin_amdgcn_fdot2):
 // strictly guarded on gfx1030/1031/1032 (NEVER bare __GFX10__, since RDNA 1 lacks FeatureDot2Insts).
-#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__))
 typedef _Float16 mla_fdot2_h2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ float mla_fdot2(uint32_t a, uint32_t b, float c) {
     return __builtin_amdgcn_fdot2(__builtin_bit_cast(mla_fdot2_h2, a), __builtin_bit_cast(mla_fdot2_h2, b), c, false);
@@ -2118,6 +2314,139 @@ __global__ void __launch_bounds__(256) mla_attn_fdot2_kernel(
         float* o = ctx + ((size_t) t * n_head + h0 + hh) * KV;
         o[2 * tid] = acc0[hh] * inv;
         o[2 * tid + 1] = acc1[hh] * inv;
+    }
+}
+
+// Single-block 64-head direct-output RDNA 2 MLA attention (ported from Hy4's attn_fdot2_64h_kernel):
+// grid=(T, n_head/64), 512 threads (16 warps, 4 heads/warp), ~16.8 KiB LDS, ~110 VGPRs (zero spill).
+// Cuts global KV gathers and INT8 lat8_h8 dequants 2x vs HG=32, drops sP/sP16 LDS, reduces barriers 5 -> 2 per 16 cells.
+template <bool Q8>
+__global__ void __launch_bounds__(512, 1) mla_attn_fdot2_64h_kernel(
+        const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+        const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
+        int n_sel_max, int n_head, float scale, float* __restrict__ ctx) {
+    constexpr int KV = 512, CH = 16;
+    __shared__ __align__(16) uint32_t sL32[CH * (KV / 2)];   // 16 KiB: CH x 512 FP16
+    __shared__ float s_m[64], s_l[64], s_qscale[64];
+    __shared__ int s_cell[CH];
+    const int t = (int) blockIdx.x, h0 = (int) blockIdx.y * 64;
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int ns = n_sel_arr[t];
+    const int* const cl = cells_all + (size_t) t * n_sel_max;
+    uint32_t qh2[4][8];
+#pragma unroll
+    for (int hh = 0; hh < 4; ++hh) {
+        const int lh = warp * 4 + hh;
+        const float* qa = q_abs + ((size_t) t * n_head + h0 + lh) * KV;
+        float ra[8], rb[8];
+        float mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float2 v = *(const float2*) (qa + 2 * (lane + 32 * j));
+            ra[j] = v.x;
+            rb[j] = v.y;
+            mx = fmaxf(mx, fmaxf(fabsf(v.x), fabsf(v.y)));
+        }
+        mx = warp_max(mx);
+        int ex = 0;
+        if (mx > 0.0f && isfinite(mx)) {
+            frexpf(mx, &ex);
+            ex = max(-60, min(60, 14 - ex));
+        }
+        const float f = ldexpf(1.0f, ex);
+        const float q_sc = scale * ldexpf(1.0f, -ex);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) qh2[hh][j] = pack_h2_rn(ra[j] * f, rb[j] * f);
+        if (lane == 0) {
+            s_qscale[lh] = q_sc;
+            s_m[lh] = -INFINITY;
+            s_l[lh] = 0.0f;
+        }
+    }
+    float acc[4][16];
+#pragma unroll
+    for (int hh = 0; hh < 4; ++hh)
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc[hh][i] = 0.0f;
+    __syncthreads();
+    for (int s0 = 0; s0 < ns; s0 += CH) {
+        if (tid < CH) s_cell[tid] = (s0 + tid < ns) ? cl[s0 + tid] : -1;
+#pragma unroll
+        for (int it = 0; it < 2; ++it) {
+            const int idx = tid + it * 512;
+            const int r = idx >> 6, c8 = idx & 63;
+            const int cell = (s0 + r < ns) ? cl[s0 + r] : -1;
+            ((uint4*) sL32)[idx] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+                                            : Q8 ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                                                 : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+        }
+        __syncthreads();
+        for (int j = 0; j < CH; j += 2) {
+            const bool ok0 = s_cell[j] >= 0;
+            const bool ok1 = s_cell[j + 1] >= 0;
+            if (!ok0 && !ok1) continue;
+            float s0_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float s1_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t kv0 = sL32[j * 256 + lane + 32 * i];
+                const uint32_t kv1 = sL32[(j + 1) * 256 + lane + 32 * i];
+#pragma unroll
+                for (int hh = 0; hh < 4; ++hh) {
+                    s0_a[hh] = mla_fdot2(qh2[hh][i], kv0, s0_a[hh]);
+                    s1_a[hh] = mla_fdot2(qh2[hh][i], kv1, s1_a[hh]);
+                }
+            }
+            uint32_t p01[4];
+#pragma unroll
+            for (int hh = 0; hh < 4; ++hh) {
+                const int lh = warp * 4 + hh;
+                const float q_sc = s_qscale[lh];
+                const float sv0 = ok0 ? warp_sum(s0_a[hh]) * q_sc : -INFINITY;
+                const float sv1 = ok1 ? warp_sum(s1_a[hh]) * q_sc : -INFINITY;
+                const float m = s_m[lh];
+                float l = s_l[lh];
+                const float mn = fmaxf(m, fmaxf(sv0, sv1));
+                if (mn != m) {
+                    const float corr = (m == -INFINITY) ? 0.0f : expf(m - mn);
+                    l *= corr;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) acc[hh][i] *= corr;
+                }
+                const float p0 = (ok0 && isfinite(mn)) ? expf(sv0 - mn) : 0.0f;
+                const float p1 = (ok1 && isfinite(mn)) ? expf(sv1 - mn) : 0.0f;
+                l += p0 + p1;
+                if (lane == 0) {
+                    s_m[lh] = mn;
+                    s_l[lh] = l;
+                }
+                __syncwarp();
+                p01[hh] = pack_h2_rn(p0, p1);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t va = sL32[j * 256 + lane + 32 * i];
+                const uint32_t vb = sL32[(j + 1) * 256 + lane + 32 * i];
+                const uint32_t v0 = __byte_perm(va, vb, 0x5410u);
+                const uint32_t v1 = __byte_perm(va, vb, 0x7632u);
+#pragma unroll
+                for (int hh = 0; hh < 4; ++hh) {
+                    acc[hh][2 * i] = mla_fdot2(p01[hh], v0, acc[hh][2 * i]);
+                    acc[hh][2 * i + 1] = mla_fdot2(p01[hh], v1, acc[hh][2 * i + 1]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int hh = 0; hh < 4; ++hh) {
+        const int lh = warp * 4 + hh;
+        const float l = s_l[lh];
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        float2* o2 = (float2*) (ctx + ((size_t) t * n_head + h0 + lh) * KV);
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            o2[lane + 32 * i] = make_float2(acc[hh][2 * i] * inv, acc[hh][2 * i + 1] * inv);
     }
 }
 
@@ -2316,15 +2645,7 @@ __device__ void topk_argmax(float* sel, int E, int k, int* out, float* s_bv, int
                 bi = e;
             }
         }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) {
-                bv = ov;
-                bi = oi;
-            }
-        }
+        warp_argmax(bv, bi);
         if (lane == 0) {
             s_bv[warp] = bv;
             s_bi[warp] = bi;
@@ -2345,25 +2666,71 @@ __device__ void topk_argmax(float* sel, int E, int k, int* out, float* s_bv, int
     }
 }
 
-__global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
-                                                    int E, int k, float w_scale, int norm_w, int* __restrict__ ids,
-                                                    float* __restrict__ w) {
+// Single-pass exact rank-based top-k (mirrors glm_fast.cu topk_rank): bit-identical to topk_argmax (descending score,
+// ties to lower expert id) with 1 barrier instead of 2*k barriers. Requires E % 32 == 0, E <= blockDim.x, finite sel.
+__device__ void topk_rank(const float* sel, int E, int k, int* out) {
+    const int e = (int) threadIdx.x, wb = e & ~31;
+    if (e < k) out[e] = -1;
+    __syncthreads();
+    if (e < E) {
+        const float v = sel[e];
+        int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        const float4* s4 = (const float4*) sel;
+#pragma unroll 4
+        for (int q = 0; q < wb / 4; ++q) {
+            const float4 o = s4[q];
+            r0 += o.x >= v;
+            r1 += o.y >= v;
+            r2 += o.z >= v;
+            r3 += o.w >= v;
+        }
+#pragma unroll
+        for (int j = wb; j < wb + 32; ++j) {
+            const float o = sel[j];
+            r0 += (o > v) | ((o == v) & (j < e));
+        }
+#pragma unroll 4
+        for (int q = (wb + 32) / 4; q < E / 4; ++q) {
+            const float4 o = s4[q];
+            r0 += o.x > v;
+            r1 += o.y > v;
+            r2 += o.z > v;
+            r3 += o.w > v;
+        }
+        const int r = r0 + r1 + r2 + r3;
+        if (r < k) out[r] = e;
+    }
+    __syncthreads();
+}
+
+template <int NT>
+__global__ void __launch_bounds__(NT) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
+                                                   int E, int k, float w_scale, int norm_w, int* __restrict__ ids,
+                                                   float* __restrict__ w) {
     const int t = blockIdx.x, tid = threadIdx.x;
-    __shared__ float s_p[512], s_sel[512];
+    __shared__ float s_p[512];
+    __shared__ __align__(16) float s_sel[512];
     __shared__ int s_ids[8];
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __shared__ int bad;
     if (tid == 0) bad = 0;
     __syncthreads();
-    for (int e = tid; e < E; e += blockDim.x) {
+    for (int e = tid; e < E; e += NT) {
         const float p = 1.0f / (1.0f + expf(-logits[(size_t) t * E + e]));
         s_p[e] = p;
         s_sel[e] = bias ? p + bias[e] : p;
         if (!isfinite(logits[(size_t) t * E + e]) || !isfinite(s_sel[e])) atomicExch(&bad, 1);
     }
     __syncthreads();
-    topk_argmax(s_sel, E, k, s_ids, s_bv, s_bi);
+    if (!bad && E <= NT && (E & 31) == 0 && k <= 8) {
+        topk_rank(s_sel, E, k, s_ids);
+    } else if (!bad) {
+        topk_argmax(s_sel, E, k, s_ids, s_bv, s_bi);
+    } else if (tid < k && tid < 8) {
+        s_ids[tid] = -1;
+    }
+    __syncthreads();
     if (tid == 0) {
         for (int i = 0; i < k; ++i) bad |= s_ids[i] < 0 || s_ids[i] >= E;
         if (bad) {
@@ -2404,6 +2771,99 @@ __global__ void __launch_bounds__(256) expert_count_kernel(const int* __restrict
         __syncthreads();
     }
     if (tid == 0) counts[e] = base;
+}
+
+// Parallel tiled expert histogram + stable local rank (replaces 288x redundant full scans of ids):
+// Pass 1: each block covers 1024 entries, histograms into LDS, computes exact within-tile stable rank.
+constexpr int kEcTile = 1024;
+__global__ void __launch_bounds__(256) expert_count_tile_kernel(
+        const int* __restrict__ ids, int n, int n_expert, int* __restrict__ tile_cnt, int* __restrict__ rank) {
+    __shared__ int s_id[kEcTile];
+    __shared__ int s_pos[kEcTile];
+    __shared__ int s_cnt[512];
+    __shared__ int s_base[512];
+    __shared__ int s_cur[512];
+    __shared__ int s_pair[256];
+    const int b = (int) blockIdx.x, tid = (int) threadIdx.x;
+    const int t0 = b * kEcTile;
+    const int nt = min(kEcTile, n - t0);
+    s_cnt[tid] = 0;
+    s_cnt[tid + 256] = 0;
+    __syncthreads();
+    for (int k = tid; k < nt; k += 256) {
+        const int e = ids[t0 + k];
+        s_id[k] = e;
+        if (e >= 0 && e < n_expert) atomicAdd(&s_cnt[e], 1);
+    }
+    __syncthreads();
+    for (int e = tid; e < n_expert; e += 256) tile_cnt[(size_t) b * n_expert + e] = s_cnt[e];
+    // Exclusive prefix sum of s_cnt[0..511] into s_base / s_cur
+    const int a = s_cnt[2 * tid], c1 = s_cnt[2 * tid + 1];
+    s_pair[tid] = a + c1;
+    __syncthreads();
+#pragma unroll
+    for (int off = 1; off < 256; off <<= 1) {
+        const int v = tid >= off ? s_pair[tid - off] : 0;
+        __syncthreads();
+        s_pair[tid] += v;
+        __syncthreads();
+    }
+    const int pre = tid == 0 ? 0 : s_pair[tid - 1];
+    s_base[2 * tid] = pre;
+    s_cur[2 * tid] = pre;
+    s_base[2 * tid + 1] = pre + a;
+    s_cur[2 * tid + 1] = pre + a;
+    __syncthreads();
+    for (int k = tid; k < nt; k += 256) {
+        const int e = s_id[k];
+        if (e >= 0 && e < n_expert) s_pos[atomicAdd(&s_cur[e], 1)] = k;
+    }
+    __syncthreads();
+    for (int k = tid; k < nt; k += 256) {
+        const int e = s_id[k];
+        if (e >= 0 && e < n_expert) {
+            const int b0 = s_base[e], cnt = s_cnt[e];
+            int lr = 0;
+            for (int q = 0; q < cnt; ++q) lr += (s_pos[b0 + q] < k);
+            rank[t0 + k] = lr;
+        }
+    }
+}
+// Pass 2: 1 warp per expert scans tile_cnt[0..n_tiles-1][e] in-place to exclusive tile offsets and writes counts[e].
+__global__ void __launch_bounds__(256) expert_count_scan_kernel(
+        int* __restrict__ tile_cnt, int n_tiles, int n_expert, int* __restrict__ counts) {
+    __shared__ int s_scan[8][32];
+    const int tid = (int) threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int e = (int) blockIdx.x * 8 + warp;
+    const bool live = e < n_expert;
+    int carry = 0;
+    for (int b0 = 0; b0 < n_tiles; b0 += 32) {
+        const int b = b0 + lane;
+        int v = (live && b < n_tiles) ? tile_cnt[(size_t) b * n_expert + e] : 0;
+        s_scan[warp][lane] = v;
+        __syncthreads();
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const int add = lane >= off ? s_scan[warp][lane - off] : 0;
+            __syncthreads();
+            v += add;
+            s_scan[warp][lane] = v;
+            __syncthreads();
+        }
+        const int excl = carry + (lane == 0 ? 0 : s_scan[warp][lane - 1]);
+        if (live && b < n_tiles) tile_cnt[(size_t) b * n_expert + e] = excl;
+        carry += s_scan[warp][31];
+        __syncthreads();
+    }
+    if (live && lane == 0) counts[e] = carry;
+}
+// Pass 3: add each entry's exclusive tile offset to its local stable rank.
+__global__ void __launch_bounds__(256) expert_count_add_kernel(
+        const int* __restrict__ ids, int n, int n_expert, const int* __restrict__ tile_off, int* __restrict__ rank) {
+    const int i = (int) blockIdx.x * 256 + (int) threadIdx.x;
+    if (i >= n) return;
+    const int e = ids[i];
+    if (e >= 0 && e < n_expert) rank[i] += tile_off[(size_t) (i / kEcTile) * n_expert + e];
 }
 
 __global__ void expert_scatter_kernel(const int* __restrict__ ids, const int* __restrict__ rank,
@@ -2456,6 +2916,95 @@ __global__ void swiglu_f32_kernel(const float* __restrict__ gate, const float* _
     const float g = fminf(gate[i], limit);
     const float u = fminf(fmaxf(up[i], -limit), limit);
     out[i] = (g / (1.0f + expf(-g))) * u;
+}
+
+// ---------------------------------------------------------------- Fused MMQ q8_1 activation quantizers (PP-B5)
+// Exact llama.cpp block_q8_1_mmq layout (144 B per 128 values): 16-byte header (d4[4] or ds4[4]) + int8_t qs[128],
+// laid out column-block-major: y[kb * rows + r] for kb in [0, pad512(cols) / 128), r in [0, rows).
+struct alignas(16) BlockQ8_1Mmq {
+    union {
+        float   d4[4];
+        __half2 ds4[4];
+    };
+    int8_t qs[128];
+};
+static_assert(sizeof(BlockQ8_1Mmq) == 144, "BlockQ8_1Mmq must match llama.cpp block_q8_1_mmq (144 B)");
+
+// Returns 0 for MMQ_Q8_1_DS_LAYOUT_D4, 1 for MMQ_Q8_1_DS_LAYOUT_DS4, -1 for unsupported types (e.g. Q2_K D2S6).
+int mmq_q8_layout(int ggml_type) {
+    switch (ggml_type) {
+        case 8:   // GGML_TYPE_Q8_0
+        case 11:  // GGML_TYPE_Q3_K
+        case 14:  // GGML_TYPE_Q6_K
+        case 16:  // GGML_TYPE_IQ2_XXS
+        case 17:  // GGML_TYPE_IQ2_XS
+        case 18:  // GGML_TYPE_IQ3_XXS
+        case 20:  // GGML_TYPE_IQ4_NL
+        case 21:  // GGML_TYPE_IQ3_S
+        case 22:  // GGML_TYPE_IQ2_S
+        case 23:  // GGML_TYPE_IQ4_XS
+            return 0;
+        case 12:  // GGML_TYPE_Q4_K
+        case 13:  // GGML_TYPE_Q5_K
+        case 19:  // GGML_TYPE_IQ1_S
+            return 1;
+        default:
+            return -1;
+    }
+}
+
+template <bool DS4>
+__device__ __forceinline__ void store_q8_1_mmq_warp(float xi, BlockQ8_1Mmq* dst, int sub, int lane) {
+    const float amax = warp_max(fabsf(xi));
+    const float d_inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    const float d = amax > 0.0f ? 1.0f / d_inv : 0.0f;
+    const int8_t q = amax > 0.0f ? (int8_t) fmaxf(-127.0f, fminf(127.0f, roundf(xi * d_inv))) : (int8_t) 0;
+    dst->qs[sub * 32 + lane] = q;
+    if constexpr (DS4) {
+        const float sum = warp_sum(xi);
+        if (lane == 0)
+            dst->ds4[sub] = __floats2half2_rn(fminf(d, 65504.0f), fmaxf(-65504.0f, fminf(65504.0f, sum)));
+    } else {
+        if (lane == 0) dst->d4[sub] = d;
+    }
+}
+
+template <bool DS4>
+__global__ void __launch_bounds__(128) quantize_mmq_f16_kernel(
+        const __half* __restrict__ x16, BlockQ8_1Mmq* __restrict__ y, int64_t cols, int64_t ld, int64_t rows) {
+    const int64_t r = (int64_t) blockIdx.x;
+    const int64_t kb = (int64_t) blockIdx.y;
+    const int sub = (int) threadIdx.x >> 5;
+    const int lane = (int) threadIdx.x & 31;
+    const int64_t c = kb * 128 + sub * 32 + lane;
+    const float xi = (c < cols) ? __half2float(x16[r * ld + c]) : 0.0f;
+    store_q8_1_mmq_warp<DS4>(xi, y + kb * rows + r, sub, lane);
+}
+
+template <bool DS4>
+__global__ void __launch_bounds__(128) swiglu_quantize_mmq_kernel(
+        const float* __restrict__ gate, const float* __restrict__ up, BlockQ8_1Mmq* __restrict__ y,
+        int64_t cols, int64_t ld_gate, int64_t ld_up, int64_t rows, float limit) {
+    const int64_t r = (int64_t) blockIdx.x;
+    const int64_t kb = (int64_t) blockIdx.y;
+    const int sub = (int) threadIdx.x >> 5;
+    const int lane = (int) threadIdx.x & 31;
+    const int64_t c = kb * 128 + sub * 32 + lane;
+    float xi = 0.0f;
+    if (c < cols) {
+        const float g = fminf(gate[r * ld_gate + c], limit);
+        const float u = fminf(fmaxf(up[r * ld_up + c], -limit), limit);
+        xi = (g / (1.0f + expf(-g))) * u;
+    }
+    store_q8_1_mmq_warp<DS4>(xi, y + kb * rows + r, sub, lane);
+}
+
+bool is_gfx103x_hip() {
+#if defined(STRATA_USE_HIP)
+    return mla_fdot2_arch() == 2;
+#else
+    return false;
+#endif
 }
 
 // ffn[t] += sum over t's routes j whose sorted row is in [lo, hi) of w[j] * out[row - base] (in route order)
@@ -2544,6 +3093,38 @@ void hc_update(const float* block_out, float* R, const float* post, const float*
     if (T <= 0) return;
     hc_update_kernel<<<T, 256, 0, s>>>(block_out, R, post, comb, ss, n_embd);
     check("hc_update");
+}
+
+bool mhc_fused_enabled() {
+    static const int env_mode = [] {
+        const char* v = std::getenv("MAYA_GLM_MHC_FUSED");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    if (env_mode == 0) return false;
+    const bool on = env_mode == 1 || is_gfx103x_hip();
+    if (on) {
+        static std::atomic<signed char> logged[64]{};
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
+            signed char expected = 0;
+            if (logged[dev].compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "glm_batch: CUDA%d fused mHC hc_update+fn on (MAYA_GLM_MHC_FUSED=0 to disable)\n", dev);
+            }
+        }
+    }
+    return on;
+}
+
+void hc_update_mix(const float* block_out, float* R, const float* post, const float* comb, const uint16_t* fn,
+                   float* ss, float* mix, int T, int n_embd, cudaStream_t s) {
+    if (T <= 0 || n_embd <= 0) return;
+    const unsigned blocks = (unsigned) ((T + 7) / 8);
+    if (block_out != nullptr)
+        hc_update_mix_kernel<true><<<blocks, 256, 0, s>>>(block_out, R, post, comb, fn, ss, mix, T, n_embd);
+    else
+        hc_update_mix_kernel<false><<<blocks, 256, 0, s>>>(block_out, R, post, comb, fn, ss, mix, T, n_embd);
+    check("hc_update_mix");
 }
 
 void hc_finish(const HcFinishArgs& a, cudaStream_t s) {
@@ -2996,15 +3577,35 @@ void mla_attn_fdot2(const float* q_abs, const uint16_t* lat, const int* cells, c
         const int n = v ? std::atoi(v) : 0;
         return (n == 16 || n == 32) ? n : 0;
     }();
-    const int hg = (cfg_hg == 16 || (n_head % 32) != 0) ? 16 : 32;
+    static const bool use_64h_env = [] {
+        const char* v = getenv("MAYA_GLM_MLA_64H");
+        if (v == nullptr || v[0] == '\0') return true;   // default ON on gfx103x when MAYA_GLM_MLA_FDOT2=1
+        return std::atoi(v) != 0;
+    }();
+    const bool use_64h = cfg_hg == 0 && use_64h_env && (n_head % 64) == 0;
+    const int hg = use_64h ? 64 : ((cfg_hg == 16 || (n_head % 32) != 0) ? 16 : 32);
     static std::atomic<signed char> logged[64]{};
     int dev = 0;
     if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
         signed char expected = 0;
         if (logged[dev].compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
-            std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: RDNA 2 v_dot2_f32_f16 "
-                                 "(mla_attn_fdot2<%d, 16>; MAYA_GLM_MLA_FDOT2=0 for F32)\n", dev, hg);
+            if (use_64h) {
+                std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: RDNA 2 v_dot2_f32_f16 "
+                                     "(mla_attn_fdot2_64h; MAYA_GLM_MLA_64H=0 for 32h, MAYA_GLM_MLA_FDOT2=0 for F32)\n", dev);
+            } else {
+                std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: RDNA 2 v_dot2_f32_f16 "
+                                     "(mla_attn_fdot2<%d, 16>; MAYA_GLM_MLA_FDOT2=0 for F32)\n", dev, hg);
+            }
         }
+    }
+    if (use_64h) {
+        const dim3 grid((unsigned) T, (unsigned) (n_head / 64));
+        if (lat_q8)
+            mla_attn_fdot2_64h_kernel<true><<<grid, 512, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+        else
+            mla_attn_fdot2_64h_kernel<false><<<grid, 512, 0, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+        check("mla_attn_fdot2_64h");
+        return;
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head / hg));
     const size_t smem = smem_fdot2_bytes(hg, 16);
@@ -3135,7 +3736,10 @@ void rms_rows(const float* in, const float* w, float eps, int T, int n_embd, flo
 void route(const float* logits, const float* bias, int n_expert, int k, float w_scale, bool norm_w, int T, int* ids,
            float* w, cudaStream_t s) {
     if (T <= 0) return;
-    route_kernel<<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w);
+    if (n_expert > 256 && n_expert <= 512 && (n_expert & 31) == 0 && k <= 8)
+        route_kernel<512><<<T, 512, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w);
+    else
+        route_kernel<256><<<T, 256, 0, s>>>(logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, ids, w);
     check("route");
 }
 
@@ -3151,6 +3755,46 @@ void copy_i32(const int* src, int* dst, int n, cudaStream_t s) {
 }
 
 void expert_count(const int* ids, int n, int n_expert, int* counts, int* rank, cudaStream_t s) {
+    if (n_expert <= 0) return;
+    if (n > kEcTile && n_expert <= 512) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
+            const int n_tiles = (n + kEcTile - 1) / kEcTile;
+            const size_t need = (size_t) n_tiles * (size_t) n_expert;
+            struct EcScratch {
+                std::mutex mu;
+                int* buf = nullptr;
+                size_t cap = 0;
+            };
+            static EcScratch sc[64];
+            int* tile_buf = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(sc[dev].mu);
+                if (sc[dev].cap < need) {
+                    const size_t want = std::max(need, (size_t) 65536);
+                    int* nb = nullptr;
+                    if (cudaMalloc(&nb, want * sizeof(int)) == cudaSuccess) {
+                        if (sc[dev].buf != nullptr) {
+                            cudaStreamSynchronize(s);
+                            cudaFree(sc[dev].buf);
+                        }
+                        sc[dev].buf = nb;
+                        sc[dev].cap = want;
+                    } else {
+                        cudaGetLastError();
+                    }
+                }
+                if (sc[dev].cap >= need) tile_buf = sc[dev].buf;
+            }
+            if (tile_buf != nullptr) {
+                expert_count_tile_kernel<<<(unsigned) n_tiles, 256, 0, s>>>(ids, n, n_expert, tile_buf, rank);
+                expert_count_scan_kernel<<<(unsigned) ((n_expert + 7) / 8), 256, 0, s>>>(tile_buf, n_tiles, n_expert, counts);
+                expert_count_add_kernel<<<nblk(n), 256, 0, s>>>(ids, n, n_expert, tile_buf, rank);
+                check("expert_count_par");
+                return;
+            }
+        }
+    }
     expert_count_kernel<<<n_expert, 256, 0, s>>>(ids, n, counts, rank);
     check("expert_count");
 }
@@ -3185,6 +3829,61 @@ void swiglu_f32(const float* gate, const float* up, float* out, int64_t n, float
     if (n <= 0) return;
     swiglu_f32_kernel<<<nblk(n), 256, 0, s>>>(gate, up, out, n, limit);
     check("swiglu_f32");
+}
+
+bool mmq_fuse_enabled() {
+    static const int env_mode = [] {
+        const char* v = std::getenv("MAYA_GLM_MMQ_FUSE");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    if (env_mode == 0) return false;
+    const bool on = env_mode == 1 || is_gfx103x_hip();
+    if (on) {
+        static std::atomic<signed char> logged[64]{};
+        int dev = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
+            signed char expected = 0;
+            if (logged[dev].compare_exchange_strong(expected, 1, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "glm_batch: CUDA%d fused F16/SwiGLU -> q8_1_mmq on (MAYA_GLM_MMQ_FUSE=0 to disable)\n", dev);
+            }
+        }
+    }
+    return on;
+}
+
+bool quantize_mmq_f16(const void* x16, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
+                      cudaStream_t s) {
+    const int layout = mmq_q8_layout(ggml_type);
+    if (layout < 0) return false;
+    if (rows <= 0 || cols <= 0) return true;
+    const int64_t cols_pad = ((cols + 511) / 512) * 512;
+    const int64_t nkb = cols_pad / 128;
+    if (nkb > 65535) return false;
+    const dim3 grid((unsigned) rows, (unsigned) nkb);
+    if (layout == 1)
+        quantize_mmq_f16_kernel<true><<<grid, 128, 0, s>>>((const __half*) x16, (BlockQ8_1Mmq*) xq, cols, ld, rows);
+    else
+        quantize_mmq_f16_kernel<false><<<grid, 128, 0, s>>>((const __half*) x16, (BlockQ8_1Mmq*) xq, cols, ld, rows);
+    check("quantize_mmq_f16");
+    return true;
+}
+
+bool swiglu_quantize_mmq(const float* gate, const float* up, void* xq, int ggml_type, int64_t cols,
+                         int64_t ld_gate, int64_t ld_up, int64_t rows, float limit, cudaStream_t s) {
+    const int layout = mmq_q8_layout(ggml_type);
+    if (layout < 0) return false;
+    if (rows <= 0 || cols <= 0) return true;
+    const int64_t cols_pad = ((cols + 511) / 512) * 512;
+    const int64_t nkb = cols_pad / 128;
+    if (nkb > 65535) return false;
+    const dim3 grid((unsigned) rows, (unsigned) nkb);
+    if (layout == 1)
+        swiglu_quantize_mmq_kernel<true><<<grid, 128, 0, s>>>(gate, up, (BlockQ8_1Mmq*) xq, cols, ld_gate, ld_up, rows, limit);
+    else
+        swiglu_quantize_mmq_kernel<false><<<grid, 128, 0, s>>>(gate, up, (BlockQ8_1Mmq*) xq, cols, ld_gate, ld_up, rows, limit);
+    check("swiglu_quantize_mmq");
+    return true;
 }
 
 void moe_combine_add(const float* out, int base, int lo, int hi, const int* pos, const float* w, int T, int k, int n_embd,

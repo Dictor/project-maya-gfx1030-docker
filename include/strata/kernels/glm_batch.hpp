@@ -28,6 +28,13 @@ void embed_rows(const float* emb, float* R, int T, int n_embd, cudaStream_t s);
 ///   R[t][d] = post[t][d] * block_out[t] + sum_s comb[t][d][s] * R[t][s];  then ss[t] = sum R[t]^2 (ss may be null).
 void hc_update(const float* block_out, float* R, const float* post, const float* comb, float* ss, int T, int n_embd,
                cudaStream_t s);
+/// MAYA_GLM_MHC_FUSED: fuse mHC hc_update + BF16 hc_fn matmul (N=24, K=4*n_embd, FP32 accum) into one pass
+/// (default ON on gfx103x HIP, 0 disables, 1 forces ON).
+bool mhc_fused_enabled();
+/// Fused hc_update + BF16 fn matmul: updates R in-place when block_out != nullptr, computes ss[t] = sum R[t]^2
+/// (when ss != nullptr), and mix[t][0..23] = fn[24][4*n_embd] . R[t] in FP32.
+void hc_update_mix(const float* block_out, float* R, const float* post, const float* comb, const uint16_t* fn,
+                   float* ss, float* mix, int T, int n_embd, cudaStream_t s);
 /// The mHC read half's tail per token, from mix[t][24] (the hc_fn dots of R[t]) and ss[t]: pre/post/comb (the
 /// Sinkhorn), x[t] = rms_norm(sum_s pre_s R[t][s]) * norm_w as F32 and FP16.  n_embd <= 4096.
 struct HcFinishArgs {
@@ -166,6 +173,18 @@ void swiglu_rows_h16(const float* gu, void* h16, int rows, int n_ff, float limit
 void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float limit, cudaStream_t s);
 /// The same from separate gate/up arrays, F32 out (safe in-place when out == gate or out == up).
 void swiglu_f32(const float* gate, const float* up, float* out, int64_t n, float limit, cudaStream_t s);
+/// MAYA_GLM_MMQ_FUSE: fuse FP16 -> block_q8_1_mmq and SwiGLU -> block_q8_1_mmq for prefill MMQ inputs
+/// (default ON on gfx103x HIP, 0 disables, 1 forces ON).
+bool mmq_fuse_enabled();
+/// Direct FP16 [rows][ld] -> block_q8_1_mmq at xq (cols padded to 512, matching mmq::quantize for ggml_type).
+/// Returns true if launched (D4/DS4 MMQ types); false if ggml_type is unsupported (caller falls back to mmq::quantize).
+bool quantize_mmq_f16(const void* x16, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
+                      cudaStream_t s);
+/// Fused SwiGLU(gate [rows][ld_gate], up [rows][ld_up], clamp limit) -> block_q8_1_mmq at xq (cols padded to 512).
+/// Supports both separate arrays (ld_gate=cols, ld_up=cols) and packed [gate|up] rows (up=gate+cols, ld=2*cols).
+/// Returns true if launched (D4/DS4 MMQ types); false if ggml_type is unsupported (caller falls back).
+bool swiglu_quantize_mmq(const float* gate, const float* up, void* xq, int ggml_type, int64_t cols,
+                         int64_t ld_gate, int64_t ld_up, int64_t rows, float limit, cudaStream_t s);
 /// ffn[t] = sum_j w[t][j] * out[pos[t*k + j]] + sh[t] (plan order, like the one-token combine).
 /// ffn[t] += sum_j w[t][j] * out[pos[t][j] - base] over the routes j of t whose sorted row pos[t][j] is in [lo, hi):
 /// a window of expert rows added as it fills (out holds sorted rows base, base + 1, ...).

@@ -252,7 +252,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
 void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_head, int qk_nope, int kv_lora, int ncol,
                float* q_abs, int64_t qa_stride, cudaStream_t s);
 bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
-                int kv_lora, float* ctx, cudaStream_t s, bool lat_q8);
+                int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token = false);
 /// mla_attend of T tokens in a few launches (up to kMlaTokMax tokens each; the tensor-core attention: NVIDIA sm_80+,
 /// kv_lora 512): token t's q_abs at q_abs + t * q_stride, its n_sel[t] cells at cells + t * c_stride, its ctx at
 /// ctx + t * ctx_stride - each token's sums mla_attend's bit for bit.  false: not available here (mla_attend per token)

@@ -8,12 +8,12 @@ AMD RDNA2 (`gfx1030`: **Dual Radeon PRO W6800 32 GB** / RX 6800 / 6900 / PRO V62
 
 [`docker/Dockerfile.gfx1030`](../docker/Dockerfile.gfx1030)은 AMD TheRock ROCm 7 휠(`rocm[libraries,devel]==7.13.0a20260515`, `gfx103X-all`)을 사용해 Builder 스테이지에서 컴파일하고, Runner(`ubuntu:24.04`) 스테이지에는 런타임 `.so` 및 `rocBLAS` Tensile 테이블(`/opt/rocm/lib`)만 남깁니다.
 
-- **GLM-5.3-Flash 엔진 (`build-hip/maya`)**: `gfx1030` 전용, `-DSTRATA_PORTABLE=ON`(AVX2 baseline), `-DSTRATA_PREFILL_MMQ=ON`, `-DSTRATA_NATIVE_EXPERTS=ON`. (빌드 시간과 이미지 크기 절감을 위해 `maya-ds4`, `maya-mm3`, `maya-hy4`는 제외)
+- **엔진 (`build-hip/maya`, `build-hip/maya-hy4`)**: `gfx1030` 전용, `-DSTRATA_PORTABLE=ON`(AVX2 baseline), `-DSTRATA_PREFILL_MMQ=ON`, `-DSTRATA_NATIVE_EXPERTS=ON`. GLM-5.3-Flash(`maya`)와 Hy4-Flash(`maya-hy4`)를 포함합니다. (`v1.1.69.2`: GLM 64-head `mla_attn_fdot2_64h`/fused mHC/MMQ/decode fdot2/Down-only Q4X/`HEAT_EVICT` 최적화 및 `HY4_PROF=0` 파싱 버그 수정 포함)
 - **비전 인코더 (`maya-vision`)**:
   - `/opt/maya/build-vision/bin/maya-vision`: HIP `gfx1030` + CPU portable AVX2 (듀얼 GPU 환경에서 `serve/server.py`가 `HIP_VISIBLE_DEVICES`를 GPU 0으로 고정해 `VLEND`와 일치)
   - `/opt/maya/build-vision-cpu/bin/maya-vision`: CPU-only portable AVX2 (ROCm 의존성 없음)
 - **HIP 정합성/벤치마크 바이너리 (`/opt/maya/tests/`)**:
-  `hip_intrinsics`, `hip_glm_handoff`, `hip_prefill_mmq_parity`, `hip_glm_prefill_attention`, `glm_mv_bench`, `hip_expert_kernel_bench`, `glm_attn_bench`, `glm_layer_parity`, `glm_model_test` (+ `data/glm5-synth*` 픽스처 포함)
+  `hip_intrinsics`, `hip_glm_handoff`, `hip_prefill_mmq_parity`, `hip_glm_prefill_attention`, `glm_mv_bench`, `hip_expert_kernel_bench`, `glm_attn_bench`, `glm_layer_parity`, `glm_model_test`, `hy4_plan_test`, `hy4_engram_ram_test`, `hy4_kernels_test`, `hy4_experts_test` (+ `data/glm5-synth*` 픽스처 포함; 빌드 타임에 `glm_model_test --cpu-q4x`, `hy4_experts_test --cpu-q4x`, `hy4_plan_test`, `hy4_engram_ram_test` 자동 실행)
 - **빌드 타임 자동 검증**:
   - `CMakeCache.txt` 검증 (`STRATA_PORTABLE=ON`, `GGML_NATIVE=OFF`, `GGML_AVX2=ON`, AVX-512/VNNI/AMX 비활성화)
   - `objdump -d` 검증: `maya-vision`, `libggml-cpu.a`, `strata_core/engine/kernels/prefill/mmq` 및 비-CPUID-디스패치 호스트 오브젝트 전체 `zmm == 0` (Haswell `SIGILL` 원천 차단)
@@ -39,14 +39,14 @@ AMD RDNA2 (`gfx1030`: **Dual Radeon PRO W6800 32 GB** / RX 6800 / 6900 / PRO V62
 
 ## 3. Docker 이미지 빌드 (Build)
 
-로컬 PC(Windows Docker Desktop / Linux)에서 BuildKit으로 빌드합니다. 포크 이미지 버전은 업스트림 `VERSION`과 `docker/VERSION.gfx1030`을 조합한 `v<UPSTREAM>.<REV>`(예: `v1.1.69.1`) 형식을 사용합니다.
+로컬 PC(Windows Docker Desktop / Linux)에서 BuildKit으로 빌드합니다. 포크 이미지 버전은 업스트림 `VERSION`과 `docker/VERSION.gfx1030`을 조합한 `v<UPSTREAM>.<REV>`(예: `v1.1.69.2`) 형식을 사용합니다.
 
 ```bash
 docker build \
   -f docker/Dockerfile.gfx1030 \
-  --build-arg IMAGE_VERSION=v1.1.69.1 \
-  -t docker.io/kimdictor/project-maya-gfx1030:v1.1.69.1 \
-  -t docker.io/kimdictor/project-maya-gfx1030:1.1.69.1 \
+  --build-arg IMAGE_VERSION=v1.1.69.2 \
+  -t docker.io/kimdictor/project-maya-gfx1030:v1.1.69.2 \
+  -t docker.io/kimdictor/project-maya-gfx1030:1.1.69.2 \
   -t docker.io/kimdictor/project-maya-gfx1030:v1.1.69 \
   -t docker.io/kimdictor/project-maya-gfx1030:1.1.69 \
   -t docker.io/kimdictor/project-maya-gfx1030:latest \
@@ -86,7 +86,7 @@ docker run -d --name maya-gfx1030 --restart unless-stopped \
   -e MAYA_GGUF_DIR=/models/Maya-S-v2-IQ2_XXS \
   -e MAYA_GPUS=0,1 \
   -e MAYA_CONTEXT=32768 \
-  kimdictor/project-maya-gfx1030:v1.1.69.1
+  kimdictor/project-maya-gfx1030:v1.1.69.2
 ```
 
 > **Maya-M으로 전환할 때**: `-e MAYA_GGUF_DIR=/models/Maya-M`으로 변경하고 컨테이너를 재시작하면 됩니다.
@@ -104,7 +104,7 @@ docker run --rm \
   -v /mnt/disk1/gguf:/models:ro \
   -v /mnt/cache/appdata/maya:/data:rw \
   -e MAYA_CONFIG=/data/maya-maya-s-hip.json \
-  kimdictor/project-maya-gfx1030:v1.1.69.1
+  kimdictor/project-maya-gfx1030:v1.1.69.2
 
 # 또는 serve/server.py 직접 호출 (passthrough)
 docker run --rm \
@@ -114,7 +114,7 @@ docker run --rm \
   -p 8080:8080 \
   -v /mnt/disk1/gguf:/models:ro \
   -v /mnt/cache/appdata/maya:/data:rw \
-  kimdictor/project-maya-gfx1030:v1.1.69.1 \
+  kimdictor/project-maya-gfx1030:v1.1.69.2 \
   /opt/maya/.venv/bin/python /opt/maya/serve/server.py \
     --engine maya --config /data/maya-maya-s-hip.json --host 0.0.0.0 --port 8080
 ```
@@ -136,14 +136,36 @@ docker run --rm \
 | `MAYA_GLM_RESERVE_MB` | `700` | 헤드리스 Unraid VRAM 여유분 (기본 3072 -> 700으로 카드 2장 합계 +4.6 GiB 확보) |
 | `MAYA_GLM_PIN_PIECE_MB` | `1024` | Unraid THP `[always]` 환경에서 대형 단일 `hipHostMalloc` Direct Compaction 프리징 방지 |
 | `MAYA_GLM_RAM_RESIDENT` | `1` | 오프-VRAM Expert 전체 RAM 상주 (HDD 디코드 읽기 제거) |
+| `MAYA_GLM_EMB_RAM` | `1` | `token_embd` RAM 고정으로 VRAM Expert 공간 확보 |
+| `MAYA_GLM_PREFILL_CPU` | `0` | 프리필 CPU 오프로드 비활성화로 동시 C0/C1 스톨 방지 (`MAYA_GLM_PREFILL_CPU_GATE=0` 강제 설정 금지) |
+| `MAYA_GLM_CKPT_EVERY` | `0` | 프롬프트 중간 주기 체크포인트 비활성화 (턴 체크포인트는 유지) |
+| `MAYA_GLM_PRESTAGE` | `160` | 프리필 Expert 프리스트레이지 링 슬롯 (192K 트림 방지 및 pinned RAM 절약) |
+| `MAYA_GLM_PREFILL_CHUNK` | `8192` | 프롬프트 청크 크기 (`auto`로 자동 크기 복귀 가능) |
 | `MAYA_GLM_PREFILL_MIN_CHUNKS` | `2,512` | 단일 청크 프롬프트를 2장 W6800에 파이프라이닝 |
-| `MAYA_GLM_PREFILL_SUB` | `1024` | 프롬프트 서브배치 크기 |
-| `MAYA_GLM_PREFILL_MB` | `4096` | 프롬프트 임시 버퍼 상한 (풀 tail 대여) |
+| `MAYA_GLM_PREFILL_SUB` | `2048` | 프롬프트 서브배치 크기 (`v1.1.69.2`에서 `1024` -> `2048` 상향) |
+| `MAYA_GLM_PREFILL_MB` | `4608` | 프롬프트 임시 버퍼 상한 (`v1.1.69.2`에서 `4096` -> `4608` 상향) |
+| `MAYA_GLM_PREFILL_LAND` | `12` | 프리필 copy-lane 랜딩 슬롯 |
+| `MAYA_GLM_PREFILL_BLAS` | `0` | 양자화 MMQ Expert 프리필 유지 (FP16 BLAS 폴백 비활성화) |
+| `MAYA_GLM_PIPE_BALANCE` | `1` | 듀얼 `gfx1030` GPU 레이어 분할 균형 조정 (GPU 1로 1 MoE 레이어 이동; `0`으로 기존 자동 분할 롤백) |
 | `MAYA_GLM_PF_CE` | `0` | RDNA2 고우선순위 크로스-스트림 데드락(`#621`) 방지 |
 | `MAYA_GLM_PROMPT_F16` | `1` | `gfx1030` FP16-output 프롬프트 GEMM 가속 (`0`으로 즉시 롤백; `MAYA_GLM_PROMPT_F16_CHECK=1`로 overflow 진단) |
 | `MAYA_GLM_MLA_FDOT2` | `1` | `gfx1030` `v_dot2_f32_f16` MLA 프롬프트 어텐션 가속 (`0`으로 즉시 롤백) |
+| `MAYA_GLM_MLA_64H` | `1` | `gfx1030` 64-head 단일 블록 `mla_attn_fdot2_64h` 프리필 커널 (`0`으로 32-head 폴백) |
+| `MAYA_GLM_MHC_FUSED` | `1` | 융합 mHC `hc_update` + BF16 `fn` 프리필 커널 (`0`으로 롤백) |
+| `MAYA_GLM_MMQ_FUSE` | `1` | 직접 `F16 -> q8_1_mmq` 및 융합 `SwiGLU -> q8_1_mmq` 프리필 커널 (`0`으로 롤백) |
+| `MAYA_GLM_DEC_FDOT2` | `1` | `gfx1030` `v_dot2_f32_f16` 디코드 MLA/DSA 어텐션 가속 (`0`으로 롤백) |
+| `MAYA_GLM_DENSE_MMQ` | `1` | 양자화 dense MMQ 프리필 가속 (`0`으로 롤백) |
+| `MAYA_GLM_BF16_F16` | `1` | BF16->FP16 프롬프트 GEMM 가속 (`0`으로 롤백) |
 | `MAYA_GLM_MV_RDNA` | `1` | `gfx1030` 최적화된 dense `Q6_K`/BF16 GEMV (`0`으로 즉시 롤백) |
+| `MAYA_GLM_MLA_ATTN2` | `h64lvc` | 최적화된 디코드 split-MLA 어텐션 커널 (`0`으로 원본 롤백) |
+| `MAYA_GLM_DSA_SCORE2` | `rl2b4` | 최적화된 디코드 DSA 인덱서 스코어 커널 (`0`으로 원본 롤백) |
+| `MAYA_GLM_SPEC_CANCEL` | `1` | 오답 추측 드래프트 조기 취소 (`0`으로 비활성화) |
+| `MAYA_GLM_Q4X` | `2` | Down-only Q4X `vpshufb` CPU-lane 캐시 (`2`=시작 시 16-expert 프로브 `>=5%` 빠를 때 활성화, `1`=항상 켜기, `0`=끄기) |
+| `MAYA_GLM_Q4X_GB` | `12.5` | Down-only Q4X CPU-lane 캐시 RAM 상한(GiB, 110 GiB 호스트 안전 범위) |
+| `MAYA_GLM_HEAT_EVICT` | `1` | `lane_all`과 분리된 동적 VRAM 핫스왑 활성화 (`0`으로 비활성화) |
+| `MAYA_KV_STREAMING` | `on` | 192K / `--parallel > 1` 안전 기본값 (`<=64K–128K` 단일 시퀀스에서는 `off` 설정 시 기본 INT8 KV 기준 +215~645 MB VRAM으로 디코드 TG +1.5~3% 향상) |
 | `MAYA_HIP_EXPERTS_LEGACY` | (미설정) | `1` 설정 시 최적화된 `gfx1030` wave32 expert 커널을 레거시 경로로 롤백 |
+| `HY4_PROF` | (미설정 / `0`) | Hy4-Flash 단계별 프로파일러 (`v1.1.69.2`에서 `HY4_PROF=0` 또는 빈 문자열이 정상 비활성화되도록 수정) |
 
 ---
 
@@ -156,7 +178,7 @@ docker run --rm \
 docker run --rm --device=/dev/dri --device=/dev/kfd \
   --group-add video --group-add render --ulimit memlock=-1:-1 \
   -e HIP_VISIBLE_DEVICES=0 \
-  kimdictor/project-maya-gfx1030:v1.1.69.1 bash -c '
+  kimdictor/project-maya-gfx1030:v1.1.69.2 bash -c '
     set -euo pipefail
     cd /opt/maya
     /opt/maya/tests/hip_intrinsics
@@ -167,13 +189,15 @@ docker run --rm --device=/dev/dri --device=/dev/kfd \
     /opt/maya/tests/hip_expert_kernel_bench --parity-only
     /opt/maya/tests/glm_attn_bench --parity-only
     /opt/maya/tests/glm_layer_parity --selftest
+    /opt/maya/tests/glm_model_test --cpu-q4x
     /opt/maya/tests/glm_model_test --selftest
+    /opt/maya/tests/hy4_experts_test --cpu-q4x
   '
 
 # W6800 (30 WGP / 128 MB Infinity Cache) 커널 스윕 벤치마크
 docker run --rm --device=/dev/dri --device=/dev/kfd \
   --group-add video --group-add render -e HIP_VISIBLE_DEVICES=0 \
-  kimdictor/project-maya-gfx1030:v1.1.69.1 \
+  kimdictor/project-maya-gfx1030:v1.1.69.2 \
   /opt/maya/tests/hip_expert_kernel_bench --parity-only --sweep
 ```
 
@@ -185,7 +209,7 @@ docker run --rm --device=/dev/dri --device=/dev/kfd \
 docker run --rm --device=/dev/dri --device=/dev/kfd \
   --group-add video --group-add render --ulimit memlock=-1:-1 --ipc=host --cap-add=IPC_LOCK \
   -v /mnt/disk1/gguf:/models:ro -v /mnt/cache/appdata/maya:/data:rw \
-  kimdictor/project-maya-gfx1030:v1.1.69.1 \
+  kimdictor/project-maya-gfx1030:v1.1.69.2 \
   /opt/maya/.venv/bin/python /opt/maya/tools/calibrate_glm.py /data/maya-glm-5.3-flash-maya-s-v2-iq2_xxs-hip.json
 ```
 

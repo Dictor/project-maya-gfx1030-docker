@@ -337,6 +337,9 @@ for obj in cpu_objs:
         n = count_zmm(obj)
         host_lines.append(f"strata_kernels_cpu/{obj.name}: zmm={n}")
         assert n == 0, f"FAIL: non-AVX512 TU {obj} contains {n} zmm instructions"
+cpu_obj_names = {obj.name for obj in cpu_objs}
+for req_cpu_obj in ("glm_lane_row4_avx2.cpp.o", "native_expert.cpp.o", "iq_avx2.cpp.o"):
+    assert req_cpu_obj in cpu_obj_names, f"FAIL: expected {req_cpu_obj} in strata_kernels_cpu.dir"
 
 r_maya = subprocess.run(["objdump", "-d", "/build-hip/maya"], capture_output=True, text=True, check=True)
 cur_sym = ""
@@ -501,11 +504,12 @@ with tempfile.TemporaryDirectory() as tmpd:
             if spills:
                 max_spill_vgpr = max(spills)
             for kblock in re.split(r"\n\s*-\s+\.", notes):
-                if any(h in kblock for h in ("mv_rdna", "mla_attn_fdot2", "dsa_score_fdot2", "widen_rows_f16", "widen_heads_f16", "dw_rdna")):
+                if any(h in kblock for h in ("mv_rdna", "mla_attn_fdot2", "attn_fdot2", "dsa_score_fdot2", "widen_rows_f16", "widen_heads_f16", "dw_rdna")):
                     sc = [int(x) for x in re.findall(r"(?:private|scratch)_segment_fixed_size:\s*(\d+)", kblock)]
                     if sc:
                         hot_scratch = max(hot_scratch, max(sc))
         is_glm_core = obj.name in ("glm_fast.cu.o", "glm_batch.cu.o")
+        is_zero_spill = obj.name in ("glm_fast.cu.o", "glm_batch.cu.o", "hy4_kernels.cu.o", "ds4_iq.cu.o")
         summary = (
             f"{obj.name} [{gfx_tgt}]: bytes={hsaco.stat().st_size} "
             + " ".join(f"{k}={v}" for k, v in counts.items())
@@ -513,8 +517,9 @@ with tempfile.TemporaryDirectory() as tmpd:
             + (" swar_vsubss4=0" if is_glm_core else "")
         )
         gpu_lines.append(summary)
-        if is_glm_core:
+        if is_zero_spill:
             assert max_spill_vgpr == 0, f"FAIL: non-zero VGPR spill (spill_vgpr_count={max_spill_vgpr}) in {obj.name}: {summary}"
+            assert hot_scratch == 0, f"FAIL: non-zero scratch_segment_fixed_size={hot_scratch} in {obj.name}: {summary}"
         if obj.name == "glm_fast.cu.o":
             for req in ("v_dot4_i32_i8", "v_permlanex16_b32", "row_xmask", "s_sleep"):
                 assert counts[req] > 0, f"Expected {req} > 0 in gfx1030 glm_fast.cu.o: {summary}"
@@ -736,7 +741,7 @@ COPY --from=builder /out/cpu-flags.txt \
                     /out/gfx1030-isa-check.txt \
                     /opt/maya/image/
 
-# Stamp combined fork image version (<VERSION>.<VERSION.gfx1030>, e.g. 1.1.69.1)
+# Stamp combined fork image version (<VERSION>.<VERSION.gfx1030>, e.g. 1.1.69.2)
 RUN set -eu; \
     up="$(tr -d '[:space:]' < /opt/maya/VERSION)"; \
     rev="$(tr -d '[:space:]' < /opt/maya/docker/VERSION.gfx1030)"; \
@@ -826,6 +831,8 @@ RUN set -euo pipefail; \
     /opt/maya/.venv/bin/python /opt/maya/tools/hy4/pack_gguf.py --help >/dev/null; \
     /opt/maya/tests/hy4_plan_test; \
     /opt/maya/tests/hy4_engram_ram_test; \
+    /opt/maya/tests/hy4_experts_test --cpu-q4x; \
+    /opt/maya/tests/glm_model_test --cpu-q4x; \
     cd /opt/maya && /opt/maya/.venv/bin/python -c 'import sys; sys.path.insert(0, "tools"); import _paths; _paths.add_gguf_py(); import gguf'; \
     test -s /opt/maya/data/expert-profile-glm.bin; \
     test -s /opt/maya/data/glm5-synth.gguf; \

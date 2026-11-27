@@ -235,6 +235,11 @@ bool stream_async_enabled() {
     return e == nullptr || *e == 0 || std::atoi(e) != 0;
 }
 
+bool env_flag_on(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && *e != '\0' && std::atoi(e) != 0;
+}
+
 #if defined(STRATA_USE_HIP) && defined(MAYA_DS4_IQ_MMQ)
 bool hy4_expert_mmq_enabled(int dev) {
     static const int env_set = [] {
@@ -1213,9 +1218,9 @@ struct Model::Impl {
     // (inside the dense span, past kDenseBase: the gathered rows taken where they are under this share of the span's -
     //  the GEMMs' time goes with the rows; HY4_SPARSE_FRAC, percent; 0: the span's own dense path there)
     int sparse_frac = 75;
-    const bool sparse_stat = std::getenv("HY4_SPARSE_STAT") != nullptr;
+    const bool sparse_stat = env_flag_on("HY4_SPARSE_STAT");
     std::atomic<long long> sp_st[4] = {};   // (sub-batches taken, their rows, not taken, the most rows)
-    const bool ix_check = std::getenv("HY4_IX_CHECK") != nullptr;
+    const bool ix_check = env_flag_on("HY4_IX_CHECK");
     std::atomic<long long> ix_chk[4] = {};   // (tokens, tokens with another pick, picks, other picks)
     // Tensor parallel, the prompt path: every member scored and picked every token of a chunk for its own heads - the
     // same work N times.  With ix_split member m scores and picks its share of the chunk's sub-batches alone, the
@@ -1952,7 +1957,7 @@ struct Model::Impl {
             double have = 1e30;
             for (int i : mem) have = std::min(have, free_b[(size_t) i] - (i == head_gpu ? head_b : 0.0));
             if (ot && ot->type == "BF16" && head_gpu != mem[0] && !(e && std::atoi(e) == 0) &&
-                !std::getenv("HY4_DUMP") && !std::getenv("HY4_INJECT")) {
+                !env_flag_on("HY4_DUMP") && !std::getenv("HY4_INJECT")) {
                 // (the head's GPU: a member's share of the rows - its memory may be faster, but the final state reaches it
                 //  two copies after the members have theirs, and the window ends when the last part is in.
                 //  HY4_TP_HEAD_UNITS: its share in members' shares)
@@ -2310,7 +2315,7 @@ struct Model::Impl {
     }
     // HY4_TP_PROF: the token windows' host time - waiting for the members' attention / FFN partials, the sums, the
     // whole forwards (printed at the end)
-    const bool tp_prof = std::getenv("HY4_TP_PROF") != nullptr;
+    const bool tp_prof = env_flag_on("HY4_TP_PROF");
     // ([0]: token windows, [1]: prompt chunks - those also by token)
     double tp_wait[2][2] = {{0, 0}, {0, 0}}, tp_sum_s[2] = {0, 0}, tp_fwd_s[2] = {0, 0}, tp_prep_s[2] = {0, 0},
            tp_post_s[2] = {0, 0}, tp_eg_s[2] = {0, 0}, win_t0 = 0, eg_last_s = 0;
@@ -2968,7 +2973,7 @@ struct Model::Impl {
                 }
                 if (const char* ie = std::getenv("HY4_IX_GEMM_FROM")) ix_gemm_from = std::max(0, std::atoi(ie));
                 sparse_attn = tensor_cores;
-                if (const char* se = std::getenv("HY4_SPARSE")) sparse_attn = std::atoi(se) != 0;
+                if (const char* se = std::getenv("HY4_SPARSE"); se != nullptr && *se != '\0') sparse_attn = std::atoi(se) != 0;
                 if (const char* se = std::getenv("HY4_SPARSE_SUB")) sparse_sub = std::max(8, std::min(kSub, std::atoi(se)));
                 if (const char* se = std::getenv("HY4_SPARSE_FRAC")) sparse_frac = std::max(0, std::min(100, std::atoi(se)));
 #if defined(STRATA_USE_HIP)
@@ -3623,7 +3628,7 @@ struct Model::Impl {
     // ------------------------------------------------------------ the forward
     // HY4_DUMP=1: the sums of the steps the reference graph names (its eval callback's), for the comparison - rows of
     // `width` values at `off` in rows ld apart
-    const bool dump = std::getenv("HY4_DUMP") != nullptr;
+    const bool dump = env_flag_on("HY4_DUMP");
     void dbg(const char* name, int il, Gpu& gp, const float* p, size_t rows, size_t ld, size_t width = 0,
              size_t off = 0) {
         if (!dump) return;
@@ -3643,7 +3648,7 @@ struct Model::Impl {
     // of each forward (inject_report); one window prompts print every comparison as it is made.
     const char* inject = std::getenv("HY4_INJECT");
     // (tests: the layers' time by kind, synced at each step; the names with a leading space are parts of "ffn, experts")
-    const bool prof = (lane_prof().on = std::getenv("HY4_PROF") != nullptr);
+    const bool prof = (lane_prof().on = env_flag_on("HY4_PROF"));
     std::map<std::string, double> prof_acc;
     // (a step inside a layer's half, synced: the names with a leading space; part0 starts the clock)
     double prof_mark = 0.0;
@@ -4654,7 +4659,7 @@ struct Model::Impl {
         hot.max_swaps = std::max(0, (int) num("HY4_HOT_SWAPS", hot.max_swaps));
         hot.horizon = std::max(1.0, num("HY4_HOT_HORIZON", hot.horizon));
         hot.margin = std::max(0.0, num("HY4_HOT_MARGIN", hot.margin));
-        hot.log = std::getenv("HY4_HOT_LOG") != nullptr;
+        hot.log = env_flag_on("HY4_HOT_LOG");
         const char* f = std::getenv("HY4_HOT_FILE");
         hot.file = f ? std::string(f) : o.pack + "/expert-hot.bin";
         const size_t n = (size_t) g.n_layer * g.n_expert;
@@ -5400,7 +5405,7 @@ struct Model::Impl {
     // and its probability, the first from the trunk's state at pos - 1 (the ring's), the next from the step before's
     // state; stops after a draft below `floor`.  The MTP cache's rows at pos .. are rewritten by the next forward.
     // HY4_MTP_EAGER=1: every window's MTP rows at its end, as before (the drafts' first step alone)
-    const bool mtp_eager = std::getenv("HY4_MTP_EAGER") != nullptr;
+    const bool mtp_eager = env_flag_on("HY4_MTP_EAGER");
     // (the token path's second stream: HY4_IX_FORK / HY4_ATTN_FORK =0 off, =1 on; unset: fork_wanted's pick by the GPU)
     static int env_tri(const char* n) {
         const char* e = std::getenv(n);
@@ -5426,12 +5431,12 @@ struct Model::Impl {
         return p.major >= 8;
 #endif
     }
-    const bool mtp_full = std::getenv("HY4_MTP_FULL") != nullptr;
+    const bool mtp_full = env_flag_on("HY4_MTP_FULL");
     // the last draft's first step: its token and position - the MTP cache's row there is the model's (the trunk's state
     // before it, that token), so a window that starts with them leaves it
     int64_t mtp_apos = -1;
     int mtp_atok = -1;
-    const bool dprof = std::getenv("HY4_DRAFT_PROF") != nullptr;
+    const bool dprof = env_flag_on("HY4_DRAFT_PROF");
     double dp_q[2] = {0, 0}, dp_all[2] = {0, 0}, dp_t0 = 0;
     long dp_n[2] = {0, 0}, dp_rows = 0;
     void draft_report() const {
@@ -7209,7 +7214,7 @@ Model::~Model() {
 // the MTP cache empty, the counts as they were
 bool Model::load(const Options& o, std::string& err) {
     if (!m->load(o, err)) return false;
-    if (std::getenv("HY4_NO_WARMUP")) return true;
+    if (env_flag_on("HY4_NO_WARMUP")) return true;
     const double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     const Stats keep = m->st;
     const int T = std::min<int64_t>(m->Tc, m->o.max_ctx - 8), V = m->g.n_vocab;
@@ -7284,7 +7289,7 @@ bool Model::forward_prompt(const int* ids, int n, int64_t pos0, int want, float*
     // (the MTP cache's rows from pos0 on are the drafts' own - but the row at pos0 when this is the token the last
     //  drafts started from, there: that one is the model's)
     const bool anchor = pos0 == m->mtp_apos && ids[0] == m->mtp_atok && m->mtp_done == pos0 + 1 && m->imgs.empty() &&
-                        !std::getenv("HY4_MTP_FULL");
+                        !env_flag_on("HY4_MTP_FULL");
     if (!anchor) m->mtp_done = std::min(m->mtp_done, pos0);
     m->mtp_apos = -1;
     m->tokens.insert(m->tokens.end(), ids, ids + n);

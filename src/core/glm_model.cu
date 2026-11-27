@@ -1747,6 +1747,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         int dev;
         double free, total, bw;
         std::string name;
+        bool is_gfx103 = false;
     };
     std::vector<Card> cards;
     // glm-dsa: MAYA_GLM_SPLIT_CARDS="<free GiB>:<GB/s>[:<name>],..." (one per device) stands in for the cards - the
@@ -1781,7 +1782,12 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, d) != cudaSuccess) bits = 0;
         cudaGetLastError();
         cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) c.name = prop.name;
+        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+            c.name = prop.name;
+#if defined(STRATA_USE_HIP)
+            c.is_gfx103 = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0;
+#endif
+        }
         cudaGetLastError();
         c.free = (double) fr;
         c.total = (double) tot;
@@ -1989,7 +1995,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                  pipelined ? "the pipelined decode: a token costs the slower part"
                  : df_pipe ? "the DFlash pipelined window: a round of a kept drafts costs the parts added + a x the slowest"
                            : "a token costs the parts added");
-    if (startable != nullptr) *startable = !best.empty();
+    const bool best_startable = !best.empty();
+    if (startable != nullptr) *startable = best_startable;
     if (best.empty()) {
         if (best_any.empty()) return {};
         std::fprintf(stderr, "glm split auto: WARNING no placement leaves every part its pool's floor and a 512-token "
@@ -1998,6 +2005,45 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     }
     double obj = 0, tie = 0;
     price(best, ev, obj, tie);
+    // PP-B7 (MAYA_GLM_PIPE_BALANCE): on a 2-GPU split (default ON on gfx103x when MAYA_GLM_SPLIT is unset/auto;
+    // MAYA_GLM_PIPE_BALANCE=0 restores the decode-only split), shift 1 MoE layer from GPU0 to GPU1 to balance
+    // prefill pipeline stages (GPU0 runs dense_lead + embed; GPU1's MTP blk.45 only runs mtp_cache in prefill)
+    // while preserving VRAM safety for output.weight + MTP + KV + pool floor on GPU1.
+    const bool all_gfx103 = cards.size() == 2 && cards[0].is_gfx103 && cards[1].is_gfx103;
+    const bool pipe_balance = [&] {
+        const char* v = getenv("MAYA_GLM_PIPE_BALANCE");
+        if (v != nullptr && v[0] != '\0') {
+            if (std::strcmp(v, "off") == 0 || std::strcmp(v, "false") == 0) return false;
+            return std::atoi(v) != 0;
+        }
+        return all_gfx103;
+    }();
+    if (pipe_balance && n == 2 && only == nullptr && best_startable && best.size() == 1 &&
+        g.arch != GlmArch::GlmDsa) {
+        const int old_k = best[0];
+        const int k_bal = old_k - 1;
+        if (k_bal > g.dense_lead && 2 * old_k > L && moe_layer(k_bal) && glm_split_bounds_full(g, {k_bal})) {
+            std::vector<Eval> ev_bal;
+            double obj_bal = 0, tie_bal = 0;
+            const std::vector<int> b_bal = {k_bal};
+            const bool ok_bal = price(b_bal, ev_bal, obj_bal, tie_bal);
+            const bool vram_safe = ok_bal && ev_bal.size() == 2 && ev_bal[0].ok && ev_bal[1].ok &&
+                                   ev_bal[1].per >= keep + 8 &&
+                                   (ev[1].per <= 0 || ev_bal[1].per * 100 >= ev[1].per * 85);
+            if (vram_safe) {
+                std::fprintf(stderr,
+                             "glm split auto: MAYA_GLM_PIPE_BALANCE=1 shifted 2-GPU split %d -> %d "
+                             "(CUDA%d [0, %d): %lld slots/layer, CUDA%d [%d, %d): %lld slots/layer; "
+                             "decode est %.1f -> %.1f ms; MAYA_GLM_PIPE_BALANCE=0 restores original)\n",
+                             old_k, k_bal, cards[0].dev, k_bal, (long long) ev_bal[0].per,
+                             cards[1].dev, k_bal, L, (long long) ev_bal[1].per, obj, obj_bal);
+                best = b_bal;
+                ev = std::move(ev_bal);
+                obj = obj_bal;
+                tie = tie_bal;
+            }
+        }
+    }
     std::string where, parts;
     double hits = 0, routes = 0;
     for (int i = 0; i < n; ++i) {

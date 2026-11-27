@@ -29,6 +29,7 @@
 #include "strata/kernels/glmd_graph.hpp"   // glm-dsa B15.6
 #include "strata/kernels/glmd_mmq_pad.hpp"   // glm-dsa B15.2
 #include "strata/core/glm_mtp_state.hpp"   // glm-dsa B15.3
+#include "strata/core/glm_env.hpp"
 #include "strata/core/glm_heat_evict.hpp"   // glm-dsa B15.8
 #include "strata/core/glm_warm_seq.hpp"   // glm-dsa B8.1 (warm)
 #include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
@@ -64,6 +65,7 @@
 #include <functional>
 #include <sstream>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <vector>
 #include <bit>
@@ -3024,6 +3026,446 @@ struct LaneProf {
 };
 static LaneProf g_lane_prof;
 
+// ---- TG-B1: Down-only Q4X (4-bit vpshufb AVX2) RAM-capped cache for IQ3_XXS (18) and IQ3_S (21).
+// Stores immutable per-expert Q4X down matrices keyed directly by expert key = il * n_expert + e, so VRAM<->RAM
+// promotions/demotions and prefill lend_tail slot moves can never serve stale weights.  A low-priority idle builder
+// thread re-codes the most CPU-routed RAM-tier experts between answers (never spinning during active decode or prefill),
+// respecting both MAYA_GLM_Q4X_GB (default 12.5 GB total across parts) and avail_ram_now() - 8 GiB headroom.
+namespace {
+
+struct Q4xCache {
+    Glm5Model::FastState* F = nullptr;
+    int dev = 0;
+    int l0 = 0, lt = 0, n_expert = 0, n_embd = 0, n_ff = 0;
+    size_t q4_row_bytes = 0;
+    size_t exp_bytes = 0;
+    int64_t budget = 0;
+    int64_t headroom = 8LL << 30;
+    std::unique_ptr<std::atomic<const uint8_t*>[]> key_ptr;
+    std::unique_ptr<std::atomic<uint32_t>[]> cpu_cnt;
+    std::vector<std::unique_ptr<uint8_t[]>> owned_by_key;
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> used_bytes{0};
+    std::atomic<int64_t> made{0};
+    std::atomic<uint64_t> hits{0}, misses{0};
+    std::thread builder;
+};
+
+constexpr int kMaxQ4xReg = 32;
+struct Q4xRegEntry {
+    std::atomic<const Glm5Model::FastState*> key{nullptr};
+    std::atomic<Q4xCache*> val{nullptr};
+};
+Q4xRegEntry g_q4x_reg[kMaxQ4xReg];
+std::mutex g_q4x_mu;
+
+Q4xCache* q4x_find(const Glm5Model::FastState* F) {
+    if (F == nullptr) return nullptr;
+    for (int i = 0; i < kMaxQ4xReg; ++i)
+        if (g_q4x_reg[i].key.load(std::memory_order_acquire) == F)
+            return g_q4x_reg[i].val.load(std::memory_order_acquire);
+    return nullptr;
+}
+
+bool q4x_register(const Glm5Model::FastState* F, Q4xCache* Q) {
+    std::lock_guard<std::mutex> lk(g_q4x_mu);
+    for (int i = 0; i < kMaxQ4xReg; ++i) {
+        if (g_q4x_reg[i].key.load(std::memory_order_relaxed) == nullptr) {
+            g_q4x_reg[i].val.store(Q, std::memory_order_release);
+            g_q4x_reg[i].key.store(F, std::memory_order_release);
+            return true;
+        }
+    }
+    return false;
+}
+
+Q4xCache* q4x_unregister(const Glm5Model::FastState* F) {
+    std::lock_guard<std::mutex> lk(g_q4x_mu);
+    for (int i = 0; i < kMaxQ4xReg; ++i) {
+        if (g_q4x_reg[i].key.load(std::memory_order_relaxed) == F) {
+            Q4xCache* Q = g_q4x_reg[i].val.load(std::memory_order_relaxed);
+            g_q4x_reg[i].key.store(nullptr, std::memory_order_release);
+            g_q4x_reg[i].val.store(nullptr, std::memory_order_release);
+            return Q;
+        }
+    }
+    return nullptr;
+}
+
+int q4x_env_mode() {
+    const char* v = getenv("MAYA_GLM_Q4X");
+    if (v == nullptr || v[0] == '\0' || strata::glmenv::ieq(v, "auto")) return 2;
+    if (strata::glmenv::ieq(v, "off") || strata::glmenv::ieq(v, "false") || strata::glmenv::ieq(v, "no")) return 0;
+    if (strata::glmenv::ieq(v, "on") || strata::glmenv::ieq(v, "true") || strata::glmenv::ieq(v, "yes")) return 1;
+    const int n = std::atoi(v);
+    return n <= 0 ? 0 : (n == 1 ? 1 : 2);
+}
+
+double q4x_env_gb() {
+    return std::max(0.0, strata::glmenv::env_num("MAYA_GLM_Q4X_GB", 12.5));
+}
+
+void q4x_lower_thread() {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__linux__)
+    (void) nice(10);
+#endif
+}
+
+const uint8_t* q4x_lookup_key(Q4xCache* Q, int key) {
+    if (Q == nullptr || key < 0 || key >= Q->F->n_keys) return nullptr;
+    Q->cpu_cnt[(size_t) key].fetch_add(1, std::memory_order_relaxed);
+    const uint8_t* p = Q->key_ptr[(size_t) key].load(std::memory_order_acquire);
+    if (p != nullptr) Q->hits.fetch_add(1, std::memory_order_relaxed);
+    else Q->misses.fetch_add(1, std::memory_order_relaxed);
+    return p;
+}
+
+// Reclaim Q4X copies of experts that have been promoted into VRAM whenever the cache is at its RAM cap.
+// Called ONLY from fast_boundary() while holding F->mu with zero active CPU-lane readers.
+void q4x_reclaim_promoted(Glm5Model::FastState* F) {
+    Q4xCache* Q = q4x_find(F);
+    if (Q == nullptr || Q->used_bytes.load(std::memory_order_relaxed) + (int64_t) Q->exp_bytes <= Q->budget) return;
+    const int NE = Q->n_expert;
+    for (int il = Q->l0; il < Q->lt; ++il) {
+        if (!F->L[(size_t) il].moe) continue;
+        for (int e = 0; e < NE; ++e) {
+            const size_t key = (size_t) il * NE + (size_t) e;
+            if (key >= F->slot_of.size() || F->slot_of[key] < 0) continue;
+            if (Q->key_ptr[key].load(std::memory_order_relaxed) == nullptr) continue;
+            Q->key_ptr[key].store(nullptr, std::memory_order_release);
+            Q->owned_by_key[key].reset();
+            Q->used_bytes.fetch_sub((int64_t) Q->exp_bytes, std::memory_order_relaxed);
+            Q->made.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void q4x_destroy(Glm5Model::FastState* F) {
+    Q4xCache* Q = q4x_unregister(F);
+    if (Q == nullptr) return;
+    Q->stop.store(true, std::memory_order_release);
+    if (Q->builder.joinable()) Q->builder.join();
+    const int64_t made = Q->made.load(std::memory_order_relaxed);
+    const uint64_t hits = Q->hits.load(std::memory_order_relaxed);
+    const uint64_t misses = Q->misses.load(std::memory_order_relaxed);
+    if (made > 0 || hits + misses > 0)
+        std::fprintf(stderr, "glm fast: CUDA%d Q4X down cache: %lld experts (%.2f GB), %llu/%llu CPU down hits (%.1f%%)\n",
+                     Q->dev, (long long) made, (double) Q->used_bytes.load(std::memory_order_relaxed) / 1e9,
+                     (unsigned long long) hits, (unsigned long long) (hits + misses),
+                     hits + misses > 0 ? 100.0 * (double) hits / (double) (hits + misses) : 0.0);
+    delete Q;
+}
+
+void q4x_builder_loop(Q4xCache* Q) {
+    q4x_lower_thread();
+    Glm5Model::FastState* F = Q->F;
+    namespace kc = strata::kernels::cpu;
+    const int NE = Q->n_expert;
+    auto nap = [&](int ms) {
+        for (int t = 0; t < ms && !Q->stop.load(std::memory_order_acquire) && !F->quit.load(std::memory_order_relaxed); t += 20)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    };
+    uint64_t seen_proc = F->processed.load(std::memory_order_relaxed);
+    auto quiet_since = std::chrono::steady_clock::now();
+    std::vector<uint8_t> raw_dn;
+    struct Cand {
+        uint64_t score;
+        int key, il, rs;
+        bool hot;
+    };
+    std::vector<Cand> cands;
+    while (!Q->stop.load(std::memory_order_acquire) && !F->quit.load(std::memory_order_relaxed)) {
+        const uint64_t cur_proc = F->processed.load(std::memory_order_relaxed);
+        const int phase = F->svc_phase.load(std::memory_order_relaxed);
+        if (cur_proc != seen_proc || phase != 0) {
+            seen_proc = cur_proc;
+            quiet_since = std::chrono::steady_clock::now();
+            nap(50);
+            continue;
+        }
+        if (std::chrono::steady_clock::now() - quiet_since < std::chrono::milliseconds(150)) {
+            nap(30);
+            continue;
+        }
+        if (Q->used_bytes.load(std::memory_order_relaxed) + (int64_t) Q->exp_bytes > Q->budget) {
+            nap(300);
+            continue;
+        }
+        const int64_t avail0 = avail_ram_now();
+        if (avail0 > 0 && avail0 < Q->headroom + (int64_t) Q->exp_bytes) {
+            nap(500);
+            continue;
+        }
+        // Snapshot candidate RAM-tier experts under F->mu
+        cands.clear();
+        const int64_t warm_cap = Q->budget / 4;   // reserve 75% strictly for observed cpu_cnt > 0 experts
+        const bool allow_warm = Q->used_bytes.load(std::memory_order_relaxed) + (int64_t) Q->exp_bytes <= warm_cap;
+        bool hold_skip = false;
+        {
+            std::lock_guard<std::mutex> lk(F->mu);
+            if (Q->stop.load(std::memory_order_acquire) || F->bg_hold) {
+                hold_skip = true;
+            } else {
+                for (int il = Q->l0; il < Q->lt; ++il) {
+                    const auto& Ly = F->L[(size_t) il];
+                    if (!Ly.moe || Ly.mtp || Ly.exl3 || F->cpu_fmt[(size_t) il].n_ff <= 0) continue;
+                    if (!kc::native_q4x_supported(Ly.d_type) || glmtier::split_layer(F->tier.get(), il)) continue;
+                    const int cls = F->layer_rc[(size_t) il];
+                    if (cls < 0) continue;
+                    const auto& R = F->rc[(size_t) cls];
+                    for (int e = 0; e < NE; ++e) {
+                        const int key = il * NE + e;
+                        if ((size_t) key >= F->slot_of.size() || (size_t) key >= F->ram_of.size() ||
+                            (size_t) key >= F->cnt.size())
+                            continue;
+                        if (Q->key_ptr[(size_t) key].load(std::memory_order_relaxed) != nullptr) continue;
+                        if (F->slot_of[(size_t) key] >= 0 || F->helper.owns(key)) continue;
+                        const int rs = F->ram_of[(size_t) key];
+                        if (rs < 0 || rs >= R.n || R.st[(size_t) rs] != Glm5Model::FastState::kRHold || R.key[(size_t) rs] != key)
+                            continue;
+                        const uint32_t cc = Q->cpu_cnt[(size_t) key].load(std::memory_order_relaxed);
+                        const uint32_t uc = ((size_t) key < F->usage.size() ? F->usage[(size_t) key] : 0u) + F->cnt[(size_t) key];
+                        if (cc > 0) {
+                            cands.push_back(Cand{((uint64_t) cc << 32) | (uint64_t) uc, key, il, rs, true});
+                        } else if (allow_warm) {
+                            // Smaller RAM slot index = higher profile prior from fast_warm()
+                            const uint64_t pri = ((uint64_t) uc << 20) | (uint64_t) std::max(0, R.n - rs);
+                            cands.push_back(Cand{pri, key, il, rs, false});
+                        }
+                    }
+                }
+            }
+        }
+        if (hold_skip) {
+            nap(50);
+            continue;
+        }
+        if (cands.empty()) {
+            nap(250);
+            continue;
+        }
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+            if (a.hot != b.hot) return a.hot > b.hot;
+            return a.score > b.score;
+        });
+        int built_this_pass = 0;
+        for (const Cand& c : cands) {
+            if (Q->stop.load(std::memory_order_acquire) || F->quit.load(std::memory_order_relaxed) ||
+                F->svc_phase.load(std::memory_order_relaxed) != 0 ||
+                F->processed.load(std::memory_order_relaxed) != seen_proc) {
+                seen_proc = F->processed.load(std::memory_order_relaxed);
+                quiet_since = std::chrono::steady_clock::now();
+                break;
+            }
+            const int64_t used_now = Q->used_bytes.load(std::memory_order_relaxed);
+            const int64_t limit = c.hot ? Q->budget : warm_cap;
+            if (used_now + (int64_t) Q->exp_bytes > limit) {
+                if (c.hot) break;
+                continue;
+            }
+            if ((built_this_pass & 7) == 0) {
+                const int64_t av = avail_ram_now();
+                if (av > 0 && av < Q->headroom + (int64_t) Q->exp_bytes) break;
+            }
+            const auto& Ly = F->L[(size_t) c.il];
+            const auto& nf = F->cpu_fmt[(size_t) c.il];
+            const int cls = F->layer_rc[(size_t) c.il];
+            if (cls < 0) continue;
+            bool copied = false;
+            {
+                std::lock_guard<std::mutex> lk(F->mu);
+                if (Q->stop.load(std::memory_order_acquire) || F->bg_hold) break;
+                const auto& R = F->rc[(size_t) cls];
+                const int rs = F->ram_of[(size_t) c.key];
+                if (F->slot_of[(size_t) c.key] < 0 && Q->key_ptr[(size_t) c.key].load(std::memory_order_relaxed) == nullptr &&
+                    rs >= 0 && rs < R.n && R.st[(size_t) rs] == Glm5Model::FastState::kRHold && R.key[(size_t) rs] == c.key) {
+                    if (raw_dn.size() < Ly.dn_bytes) raw_dn.resize(Ly.dn_bytes);
+                    std::memcpy(raw_dn.data(), R.slot((size_t) rs) + Ly.down_off, Ly.dn_bytes);
+                    copied = true;
+                }
+            }
+            if (!copied) continue;
+            std::unique_ptr<uint8_t[]> mem(new (std::nothrow) uint8_t[Q->exp_bytes + 32]);
+            if (!mem) break;
+            uint8_t* aligned = (uint8_t*) (((uintptr_t) mem.get() + 31) & ~(uintptr_t) 31);
+            kc::native_q4x_convert(Ly.d_type, raw_dn.data(), nf.d_row, Q->n_embd, Q->n_ff, aligned);
+            {
+                std::lock_guard<std::mutex> lk(F->mu);
+                if (!Q->stop.load(std::memory_order_acquire) &&
+                    Q->key_ptr[(size_t) c.key].load(std::memory_order_relaxed) == nullptr) {
+                    Q->owned_by_key[(size_t) c.key] = std::move(mem);
+                    Q->key_ptr[(size_t) c.key].store(aligned, std::memory_order_release);
+                    Q->used_bytes.fetch_add((int64_t) Q->exp_bytes, std::memory_order_relaxed);
+                    Q->made.fetch_add(1, std::memory_order_relaxed);
+                    ++built_this_pass;
+                }
+            }
+        }
+        nap(200);
+    }
+}
+
+void q4x_setup(Glm5Model::FastState* F, const Glm5Geometry& g, int dev, int l0, int lt, int n_parts) {
+    namespace kc = strata::kernels::cpu;
+    const int mode = q4x_env_mode();
+    if (mode == 0 || F == nullptr || F->cpu_pool == nullptr) return;
+    if (g.n_ff_exp <= 0 || g.n_ff_exp % 256 != 0 || g.n_embd <= 0) return;
+    const double cap_gb = q4x_env_gb();
+    if (cap_gb <= 0.0) return;
+
+    bool has_q4_layer = false;
+    int il_probe = -1, best_held = 0;
+    for (int il = l0; il < lt; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (!Ly.moe || Ly.mtp || Ly.exl3 || F->cpu_fmt[(size_t) il].n_ff <= 0) continue;
+        if (!kc::native_q4x_supported(Ly.d_type) || glmtier::split_layer(F->tier.get(), il)) continue;
+        has_q4_layer = true;
+        const int cls = F->layer_rc[(size_t) il];
+        if (cls < 0) continue;
+        const auto& R = F->rc[(size_t) cls];
+        int held = 0;
+        for (int s = 0; s < R.n; ++s)
+            if (R.st[(size_t) s] == Glm5Model::FastState::kRHold && R.key[(size_t) s] >= 0 &&
+                R.key[(size_t) s] / (int) g.n_expert == il)
+                ++held;
+        if (held > best_held) {
+            best_held = held;
+            il_probe = il;
+        }
+    }
+    if (!has_q4_layer || (mode == 2 && (il_probe < 0 || best_held <= 0))) return;
+
+    const size_t qrb = kc::native_q4x_row_bytes((int) g.n_ff_exp);
+    const size_t exp_bytes = qrb * (size_t) g.n_embd;
+    if (exp_bytes == 0) return;
+    constexpr int64_t kHeadroom = 8LL << 30;   // keep >= 8 GiB free RAM headroom
+    const int64_t avail = avail_ram_now();
+    const int parts = std::max(1, n_parts);
+    const int64_t part_cap = (int64_t) (cap_gb * 1e9) / parts;
+    const int64_t avail_cap = avail > kHeadroom ? (avail - kHeadroom) / parts : 0;
+    const int64_t budget = avail > 0 ? std::min(part_cap, avail_cap) : part_cap;
+    if (budget < (int64_t) (16 * exp_bytes)) {
+        std::fprintf(stderr, "glm fast: CUDA%d Q4X down cache off: %.2f GB budget (< 16 experts; %.1f GB RAM avail, "
+                             "8.0 GiB headroom)\n", dev, (double) budget / 1e9, (double) avail / 1e9);
+        return;
+    }
+
+    if (mode == 2) {
+        // Startup 16-expert probe: keep Q4X only if >= 5% faster than native (4-row lockstep) down path
+        const auto& Ly = F->L[(size_t) il_probe];
+        const auto& nf = F->cpu_fmt[(size_t) il_probe];
+        const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il_probe]];
+        constexpr int kProbeN = 16;
+        std::vector<const uint8_t*> src_dn;
+        src_dn.reserve(kProbeN);
+        for (int s = 0; s < R.n && (int) src_dn.size() < kProbeN; ++s)
+            if (R.st[(size_t) s] == Glm5Model::FastState::kRHold && R.key[(size_t) s] >= 0 &&
+                R.key[(size_t) s] / (int) g.n_expert == il_probe)
+                src_dn.push_back(R.slot((size_t) s) + Ly.down_off);
+        const int n_uniq = (int) src_dn.size();
+        if (n_uniq <= 0) return;
+        std::vector<std::unique_ptr<uint8_t[]>> qmem((size_t) n_uniq);
+        std::vector<const uint8_t*> qptr((size_t) n_uniq, nullptr);
+        for (int i = 0; i < n_uniq; ++i) {
+            qmem[(size_t) i].reset(new (std::nothrow) uint8_t[exp_bytes + 32]);
+            if (!qmem[(size_t) i]) return;
+            uint8_t* al = (uint8_t*) (((uintptr_t) qmem[(size_t) i].get() + 31) & ~(uintptr_t) 31);
+            kc::native_q4x_convert(Ly.d_type, src_dn[(size_t) i], nf.d_row, (int) g.n_embd, (int) g.n_ff_exp, al);
+            qptr[(size_t) i] = al;
+        }
+        std::vector<float> h_f((size_t) g.n_ff_exp), o_nat((size_t) g.n_embd), o_q4((size_t) g.n_embd);
+        for (int i = 0; i < g.n_ff_exp; ++i) h_f[(size_t) i] = 0.01f * (float) ((i * 53) % 199 - 99);
+        std::vector<uint8_t> hq(kc::kNativeHBytes, 0);
+        kc::native_quant_h(nf, h_f.data(), hq.data());
+        const void* hp = hq.data();
+        float* op_n = o_nat.data();
+        float* op_q = o_q4.data();
+        kc::native_down_rows_split(nf, src_dn[0], &hp, 1, &op_n, 0, (int) g.n_embd);
+        kc::native_q4x_down_rows(Ly.d_type, qptr[0], qrb, (int) g.n_ff_exp, &hp, 1, &op_q, 0, (int) g.n_embd);
+        if (std::memcmp(o_nat.data(), o_q4.data(), (size_t) g.n_embd * sizeof(float)) != 0) {
+            std::fprintf(stderr, "glm fast: CUDA%d Q4X down probe parity mismatch on %s - disabled\n", dev,
+                         ggml_type_name((ggml_type) Ly.d_type));
+            return;
+        }
+        const int threads = F->cpu_pool->active();
+        const int T = threads * std::max(1, std::min(8, 48 / std::max(1, threads)));
+        const int n_embd = (int) g.n_embd, n_ff = (int) g.n_ff_exp;
+        std::vector<float> dn_buf((size_t) 4 * (size_t) n_embd, 0.0f);
+        auto run16 = [&](bool use_q4) {
+            for (int b = 0; b < kProbeN; b += 4) {
+                const int tot = 4 * n_embd;
+                F->cpu_pool->run(T, [&](int job) {
+                    const int q1 = (int) ((int64_t) tot * (job + 1) / T);
+                    for (int q = (int) ((int64_t) tot * job / T); q < q1;) {
+                        const int bi = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
+                        const int idx = (b + bi) % n_uniq;
+                        const void* h[1] = {hq.data()};
+                        float* o[1] = {dn_buf.data() + (size_t) bi * n_embd};
+                        if (use_q4) kc::native_q4x_down_rows(Ly.d_type, qptr[(size_t) idx], qrb, n_ff, h, 1, o, r0, r1);
+                        else kc::native_down_rows_split(nf, src_dn[(size_t) idx], h, 1, o, r0, r1);
+                        q += r1 - r0;
+                    }
+                });
+            }
+        };
+        double best_nat = 1e30, best_q4 = 1e30;
+        for (int rep = 0; rep < 10; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            run16(false);
+            const double mn = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const auto t1 = std::chrono::steady_clock::now();
+            run16(true);
+            const double mq = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+            if (rep >= 2) {
+                best_nat = std::min(best_nat, mn);
+                best_q4 = std::min(best_q4, mq);
+            }
+        }
+        const bool keep = best_q4 < 0.95 * best_nat;
+        std::fprintf(stderr, "glm fast: CUDA%d Q4X down probe (16 %s experts): %.2f ms native vs %.2f ms Q4X "
+                             "(%.2fx) -> %s (cap %.2f GB/part, total %.1f GB)\n",
+                     dev, ggml_type_name((ggml_type) Ly.d_type), best_nat, best_q4,
+                     best_q4 > 0.0 ? best_nat / best_q4 : 0.0,
+                     keep ? "enabled" : "kept native", (double) budget / 1e9, cap_gb);
+        if (!keep) return;
+    } else {
+        std::fprintf(stderr, "glm fast: CUDA%d Q4X down cache enabled (MAYA_GLM_Q4X=1, cap %.2f GB/part, total %.1f GB)\n",
+                     dev, (double) budget / 1e9, cap_gb);
+    }
+
+    auto* Q = new Q4xCache();
+    Q->F = F;
+    Q->dev = dev;
+    Q->l0 = l0;
+    Q->lt = lt;
+    Q->n_expert = (int) g.n_expert;
+    Q->n_embd = (int) g.n_embd;
+    Q->n_ff = (int) g.n_ff_exp;
+    Q->q4_row_bytes = qrb;
+    Q->exp_bytes = exp_bytes;
+    Q->budget = budget;
+    Q->headroom = kHeadroom;
+    Q->key_ptr.reset(new std::atomic<const uint8_t*>[(size_t) F->n_keys]);
+    Q->cpu_cnt.reset(new std::atomic<uint32_t>[(size_t) F->n_keys]);
+    Q->owned_by_key.resize((size_t) F->n_keys);
+    for (int k = 0; k < F->n_keys; ++k) {
+        Q->key_ptr[(size_t) k].store(nullptr, std::memory_order_relaxed);
+        Q->cpu_cnt[(size_t) k].store(0u, std::memory_order_relaxed);
+    }
+    if (!q4x_register(F, Q)) {
+        delete Q;
+        return;
+    }
+    Q->builder = std::thread([Q] { q4x_builder_loop(Q); });
+}
+
+// Per-thread optional Q4X down pointers for the current lane_experts() call (set by fast_cpu_experts_q4x / WinLane).
+thread_local const uint8_t* const* g_tl_q4_dn = nullptr;
+
+}  // namespace
+
 void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, float* ff, float* dn, float* x3,
                              int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out) {
     FastState* F = fast_;
@@ -3145,6 +3587,8 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         if (lprof) g_lane_prof.add(ne, lt);
         return;
     }
+    const uint8_t* const* q4_dn = g_tl_q4_dn;
+    const size_t q4_rb = q4_dn != nullptr ? kc::native_q4x_row_bytes(n_ff) : 0;
     const int gu_tot = ne * n_ff;
     pool.run(T, [&](int job) {
         const void* a[1] = {act};
@@ -3167,7 +3611,10 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             const int i = q / n_embd, r0 = q % n_embd, r1 = std::min(n_embd, r0 + (q1 - q));
             const void* h[1] = {hq + (size_t) i * kc::kNativeHBytes};
             float* o[1] = {dn + (size_t) i * n_embd};
-            kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+            if (q4_dn != nullptr && q4_dn[i] != nullptr)
+                kc::native_q4x_down_rows(nf.d_type, q4_dn[i], q4_rb, n_ff, h, 1, o, r0, r1);
+            else
+                kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
             q += r1 - r0;
         }
     });
@@ -3188,6 +3635,7 @@ struct Glm5Model::FastState::WinLane {
     struct Job {
         int il = 0, ne = 0;
         const uint8_t* blob[8] = {};
+        const uint8_t* q4_dn[8] = {};
         float w[8] = {};
         const float* x = nullptr;
         gf::CpuAnswer* ans = nullptr;
@@ -3260,7 +3708,9 @@ void Glm5Model::win_helper_merged(int il, int nb, const gf::MoeRequest* const* r
     int ent_u[kWinMax][8], ent_k[kWinMax][8], hn[kWinMax] = {};
     int cn[kWinMax] = {};
     const uint8_t* cblob[kWinMax][8];
+    const uint8_t* cq4[kWinMax][8] = {};
     float cw[kWinMax][8];
+    Q4xCache* Q = q4x_find(F);
     int32_t* pos = F->helper.pf_pos();
     float* rw = F->helper.pf_rw();
     const auto& RC = F->rc[(size_t) F->layer_rc[(size_t) il]];
@@ -3289,6 +3739,7 @@ void Glm5Model::win_helper_merged(int il, int nb, const gf::MoeRequest* const* r
                 ent_k[j][hn[j]++] = i;
             } else {   // the CPU lane's: its RAM-tier blob, as the per-token path takes it
                 cblob[j][cn[j]] = (const uint8_t*) rq[j]->cpu_src[i];
+                cq4[j][cn[j]] = q4x_lookup_key(Q, key);
                 cw[j][cn[j]++] = rq[j]->w[i];
             }
         }
@@ -3322,7 +3773,9 @@ void Glm5Model::win_helper_merged(int il, int nb, const gf::MoeRequest* const* r
     int cpu_ne = 0;
     for (int j = 0; j < nb; ++j)
         if (cn[j] > 0) {
+            g_tl_q4_dn = cq4[j];
             fast_cpu_experts(il, cn[j], cblob[j], cw[j], rq[j]->x, cpu_part(j));
+            g_tl_q4_dn = nullptr;
             cpu_ne += cn[j];
         }
     bool got = posted;
@@ -3369,7 +3822,9 @@ void Glm5Model::win_helper_multi(int il, int nb, const gf::MoeRequest* const* rq
     float* hout[kWinMax];
     int cn[kWinMax] = {};
     const uint8_t* cblob[kWinMax][8];
+    const uint8_t* cq4[kWinMax][8] = {};
     float cw[kWinMax][8];
+    Q4xCache* Q = q4x_find(F);
     int rows = 0;
     for (int j = 0; j < nb; ++j) {
         hx[j] = rq[j]->x;
@@ -3383,6 +3838,7 @@ void Glm5Model::win_helper_multi(int il, int nb, const gf::MoeRequest* const* rq
                 ++rows;
             } else {   // the CPU lane's: its RAM-tier blob, as the call a token takes it
                 cblob[j][cn[j]] = (const uint8_t*) rq[j]->cpu_src[i];
+                cq4[j][cn[j]] = q4x_lookup_key(Q, key);
                 cw[j][cn[j]++] = rq[j]->w[i];
             }
         }
@@ -3400,7 +3856,9 @@ void Glm5Model::win_helper_multi(int il, int nb, const gf::MoeRequest* const* rq
     int cpu_ne = 0;
     for (int j = 0; j < nb; ++j)
         if (cn[j] > 0) {
+            g_tl_q4_dn = cq4[j];
             fast_cpu_experts(il, cn[j], cblob[j], cw[j], rq[j]->x, cpu_part(j));
+            g_tl_q4_dn = nullptr;
             cpu_ne += cn[j];
         }
     // (tokens without a helper expert keep a zero part, as the call a token leaves it; a failed call zeroes all)
@@ -3445,18 +3903,26 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
     float w[kWinMax][8];
     int ent[kWinMax][8];
     const uint8_t* ublob[kMaxE];
+    const uint8_t* uq4[kMaxE] = {};
     int u_n[kMaxE] = {}, u_ent[kMaxE][kWinMax];
     int nu = 0;
+    Q4xCache* Q = q4x_find(F);
+    const size_t q4_rb = Q != nullptr ? Q->q4_row_bytes : 0;
     for (int j = 0; j < nb; ++j)
         for (int i = 0; i < K; ++i)
             if ((rq[j]->cpu_mask >> i) & 1u) {
                 const uint8_t* b = (const uint8_t*) rq[j]->cpu_src[i];
+                const int key = il * (int) g.n_expert + rq[j]->ids[i];
                 const int e = j * 8 + ne[j];
                 w[j][ne[j]] = rq[j]->w[i];
                 ent[j][ne[j]++] = e;
                 int u = 0;
                 while (u < nu && ublob[u] != b) ++u;
-                if (u == nu) ublob[nu++] = b;
+                if (u == nu) {
+                    ublob[nu] = b;
+                    uq4[nu] = q4x_lookup_key(Q, key);
+                    ++nu;
+                }
                 u_ent[u][u_n[u]++] = e;
             }
     const size_t act_b = kc::kNativeActBytes, h_b = kc::kNativeHBytes;
@@ -3527,7 +3993,10 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
                 hh[k] = C.hq.data() + (size_t) u_ent[u][k] * h_b;
                 o[k] = C.dn.data() + (size_t) u_ent[u][k] * n_embd;
             }
-            kc::native_down_rows_split(nf, ublob[u] + Ly.down_off, hh, u_n[u], o, r0, r1);
+            if (uq4[u] != nullptr)
+                kc::native_q4x_down_rows(nf.d_type, uq4[u], q4_rb, n_ff, hh, u_n[u], o, r0, r1);
+            else
+                kc::native_down_rows_split(nf, ublob[u] + Ly.down_off, hh, u_n[u], o, r0, r1);
         });
     };
     // EXL3: lane_experts' jobs over a half's distinct experts, each piece's byte-sum products for all the expert's
@@ -3651,8 +4120,10 @@ void Glm5Model::win_lanes_make(std::shared_ptr<glmfast::Workers> p0, std::shared
                     continue;
                 }
                 const auto c0 = std::chrono::steady_clock::now();
+                g_tl_q4_dn = j.q4_dn;
                 lane_experts(*L->pool, L->act.data(), L->hq.data(), L->ff.data(), L->dn.data(), L->x3.data(), j.il,
                              j.ne, j.blob, j.w, j.x, j.ans->part);
+                g_tl_q4_dn = nullptr;
                 std::atomic_thread_fence(std::memory_order_release);
                 j.ans->seq = j.seq;
                 F->cpu_experts.fetch_add((uint64_t) j.ne, std::memory_order_relaxed);
@@ -4410,6 +4881,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         cudaFree(dxq);
         cudaFree(dhq);
     }
+    q4x_setup(F, g, dev_, l0_, lt_, n_parts_);
     return true;
 }
 
@@ -4600,11 +5072,14 @@ bool Glm5Model::fast_warm(std::string& err) {
             if (v.empty()) continue;
             std::sort(v.rbegin(), v.rend());
             std::vector<int> o;
+            glmheat::HeatTable* heat_warm = glmheat::table(this, F->cnt.size());
             for (auto& p : v) {
                 o.push_back(p.second);
                 const size_t key = (size_t) il * g.n_expert + p.second;
                 F->usage[key] = p.first;
                 F->cnt[key] = (uint32_t) std::max<uint64_t>(1, (uint64_t) 32 * p.first / v.front().first);
+                if (heat_warm != nullptr)
+                    heat_warm->hit(key, 2.0 * (double) p.first / (double) v.front().first);
             }
             // with the pack's routing profile (expert_counts.txt, tools/glm_expert_prior.py over a broad corpus): the
             // order is the blend of the two shares - this machine's history, and the profile, which corrects what the
@@ -4812,6 +5287,7 @@ void Glm5Model::fast_destroy() {
     for (auto& t : F->ah_th) t.join();
     F->workers.reset();
     win_lanes_stop();   // (after the service thread: it hands them their routes)
+    q4x_destroy(F);     // (after service & win_lanes stopped: zero active CPU-lane readers)
     F->cpu_pool.reset();
     if (F->helper.device() >= 0) {
         std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.device(),
@@ -5788,9 +6264,11 @@ void Glm5Model::fast_service() {
             const unsigned int cm = rq->cpu_mask;
             int ne = 0;
             const uint8_t* blob[8];
+            const uint8_t* q4_dn[8] = {};
             float w[8];
             int hn = 0, helper_keys[8];
             float helper_w[8];
+            Q4xCache* Q = q4x_find(F);
             for (int i = 0; i < g.n_exp_used; ++i)
                 if ((cm >> i) & 1u) {
                     const int key = rq->layer * g.n_expert + rq->ids[i];
@@ -5799,6 +6277,7 @@ void Glm5Model::fast_service() {
                         helper_w[hn++] = rq->w[i];
                     } else {
                         blob[ne] = (const uint8_t*) rq->cpu_src[i];
+                        q4_dn[ne] = q4x_lookup_key(Q, key);
                         w[ne++] = rq->w[i];
                     }
                 }
@@ -5829,7 +6308,9 @@ void Glm5Model::fast_service() {
                     uint64_t lane_us = 0;
                     if (ne > 0) {
                         const auto cpu_t0 = std::chrono::steady_clock::now();
+                        g_tl_q4_dn = q4_dn;
                         fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
+                        g_tl_q4_dn = nullptr;
                         lane_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                       std::chrono::steady_clock::now() - cpu_t0).count();
                         F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
@@ -5872,7 +6353,9 @@ void Glm5Model::fast_service() {
                     if (ne > 0) {
                         const auto cpu_t0 = std::chrono::steady_clock::now();
                         float cpu_part[gf::kMaxEmbd];
+                        g_tl_q4_dn = q4_dn;
                         fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
+                        g_tl_q4_dn = nullptr;
                         for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
                         F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
                         F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
@@ -5892,13 +6375,15 @@ void Glm5Model::fast_service() {
                 FastState::WinLane::Job j;
                 j.il = rq->layer;
                 j.ne = ne;
-                for (int i = 0; i < ne; ++i) j.blob[i] = blob[i], j.w[i] = w[i];
+                for (int i = 0; i < ne; ++i) j.blob[i] = blob[i], j.q4_dn[i] = q4_dn[i], j.w[i] = w[i];
                 j.x = rq->x;
                 j.ans = ans;
                 j.seq = next;
                 F->win_lane[rq->win & 1]->push(j);
             } else {
+                g_tl_q4_dn = q4_dn;
                 fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part);
+                g_tl_q4_dn = nullptr;
                 std::atomic_thread_fence(std::memory_order_release);
                 ans->seq = next;
                 F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
@@ -6483,6 +6968,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             F->ev_free.push_back(m.ev);
         }
         F->bg.swap(keep);
+        static const bool bg_n_set = getenv("MAYA_GLM_PROMOTE") != nullptr;
         static const int bg_n = [] {
             const char* v = getenv("MAYA_GLM_PROMOTE");
             return v != nullptr ? std::max(0, std::atoi(v)) : 8;
@@ -6498,8 +6984,6 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }();
         // a pipelined window's boundary comes once for its tokens (not one a token): the budgets for them all
         const int bk = std::max(1, std::min(8, F->bnd_tokens.exchange(0)));
-        const int bg_nk = bg_n * bk;
-        const int bg_up_max = std::max(bg_n, bg_fill) * bk;
         constexpr uint32_t bg_ratio = 2;
         glmheat::HeatTable* heat = glmheat::boundary(this, F->cnt.size());   // glm-dsa B15.8 (null: off)
         bool lane_all = F->cpu_plan != 0ull;   // the CPU lane takes every RAM-tier expert of a route
@@ -6514,10 +6998,18 @@ bool Glm5Model::fast_boundary(std::string& err) {
         if (!lane_all && win_all_cpu && dflash_on_ && F->cpu_plan != 0ull && F->win_lane[0] != nullptr &&
             F->win_lane[1] != nullptr)
             lane_all = true;
+        // TG-B3: decouple MAYA_GLM_HEAT_EVICT=1 background hot-swaps from requiring lane_all so hot RAM-tier
+        // experts routed to CPU under mixed CPU+PCIe plans still promote into VRAM.  Cap default per-round
+        // promotion/demotion at 4 (2..4 range) on mixed plans when MAYA_GLM_PROMOTE is unset to prevent PCIe 3.0
+        // stalls.  MAYA_GLM_HEAT_EVICT=0 (heat == nullptr) rolls back to lane_all-only swaps verbatim.
+        const bool allow_swap = lane_all || heat != nullptr;
+        const int bg_n_eff = (!lane_all && heat != nullptr && !bg_n_set) ? std::min(bg_n, 4) : bg_n;
+        const int bg_nk = bg_n_eff * bk;
+        const int bg_up_max = std::max(bg_n_eff, bg_fill) * bk;
         // (the refill into FREE slots runs whatever the plan: a slot a prompt's lending gave back holds nothing - a
         // split whose cards send one of 7-8 RAM-tier experts over PCIe left ~13% of VRAM empty after a long prompt;
-        // the swaps below stay with the all-CPU plan, beside which the routes' own promotions do not run)
-        if (bg_n > 0 && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
+        // without HEAT_EVICT, swaps stay with the all-CPU plan, beside which the routes' own promotions do not run)
+        if (bg_n_eff > 0 && !F->bg_hold && (int) F->bg.size() < 2 * bg_up_max) {
             struct Cand {
                 uint32_t hot, cold;
                 int il, e, rs, free_slot, cold_slot;
@@ -6590,7 +7082,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     }
                     F->bg.push_back(FastState::BgMove{c.il, c.free_slot, c.il * NE + c.e, rc, c.rs, true, ev, F->bnd_seq});
                     ++filled;
-                } else if (lane_all && c.cold_slot >= 0 && glmheat::swap_ok(heat, c.hot, c.cold, bg_ratio, c.il)) {   // glm-dsa B15.8 (off: Maya's rule)
+                } else if (allow_swap && c.cold_slot >= 0 && glmheat::swap_ok(heat, c.hot, c.cold, bg_ratio, c.il)) {   // glm-dsa B15.8 + TG-B3
                     int rs = -1;
                     for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                         if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
@@ -6609,6 +7101,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             glmheat::flush_ups(heat, [&](int il, uint8_t* d, const uint8_t* h, size_t b) { glmtier::h2d(F->tier.get(), il, d, h, b, F->copy); }, [&](void* ev) { cudaEventRecord((cudaEvent_t) ev, F->copy); }, [&](int il, const void* h) { return glmtier::h2d_plain(F->tier.get(), il, h); });   // glm-dsa B15.8
         }
+        q4x_reclaim_promoted(F);
     }
     flush();
     if (ok && !fast_helper_adapt(err)) return false;

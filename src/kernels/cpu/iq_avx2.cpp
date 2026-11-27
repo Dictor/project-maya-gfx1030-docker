@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include <immintrin.h>
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -894,6 +895,309 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
             iq4nl256_down_rows(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
         }
     }
+}
+
+namespace {
+
+// ---- Down-only Q4X (4-bit vpshufb AVX2) for IQ3_XXS (18) and IQ3_S (21), ported from src/ds4/ds4_iq_cpu.cpp.
+// Every IQ3_XXS weight is in {+-4, +-12, +-20, +-28, +-36, +-44, +-52, +-62} (nibble 0..7 positive, 8..15 negative;
+// final scale 0.25f).  Every IQ3_S weight is in {+-1, +-3, +-5, +-7, +-9, +-11, +-13, +-15} (nibble 0..7 positive,
+// 8..15 negative; final scale 1.0f).  Per 256-value super-block: 128 bytes of nibbles (4 chunk-pairs of 32 bytes; low
+// nibble = chunk 2p, high nibble = chunk 2p+1), 8 int8 chunk scales (2s+1), 2 bytes fp16 d = 138 B/256w, padded to 32 B.
+// Initialized lazily via std::call_once (never static-constructed, since this TU is compiled with -mavx2).
+alignas(64) uint32_t g_q4m3x[256];
+alignas(64) uint64_t g_q4s3x[128];
+alignas(64) uint32_t g_q4m3s[512];
+alignas(64) uint64_t g_q4s3s[256];
+
+void build_q4x_tables() {
+    for (int g = 0; g < 256; ++g) {
+        uint32_t v3 = 0;
+        for (int j = 0; j < 4; ++j) {
+            const int gb = (int) ((iq3xxs_grid[g] >> (8 * j)) & 255u);
+            const uint32_t c = gb == 62 ? 7u : (uint32_t) ((gb - 4) >> 3);
+            v3 |= c << (8 * j);
+        }
+        g_q4m3x[g] = v3;
+    }
+    for (int i = 0; i < 128; ++i) {
+        uint64_t v3 = 0;
+        for (int j = 0; j < 8; ++j)
+            if ((ksigns_iq2xs[i] >> j) & 1) v3 |= (uint64_t) 8 << (8 * j);
+        g_q4s3x[i] = v3;
+    }
+    for (int g = 0; g < 512; ++g) {
+        uint32_t v3 = 0;
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t gb = (iq3s_grid[g] >> (8 * j)) & 255u;
+            const uint32_t c = (gb - 1u) >> 1;
+            v3 |= c << (8 * j);
+        }
+        g_q4m3s[g] = v3;
+    }
+    for (int i = 0; i < 256; ++i) {
+        uint64_t v3 = 0;
+        for (int j = 0; j < 8; ++j)
+            if ((i >> j) & 1) v3 |= (uint64_t) 8 << (8 * j);
+        g_q4s3s[i] = v3;
+    }
+}
+
+bool q4x_grid_ok(int type) noexcept {
+    if (type == 18) {
+        for (int g = 0; g < 256; ++g)
+            for (int j = 0; j < 4; ++j) {
+                const int b = (int) ((iq3xxs_grid[g] >> (8 * j)) & 255u);
+                if (b != 4 && b != 12 && b != 20 && b != 28 && b != 36 && b != 44 && b != 52 && b != 62) return false;
+            }
+        return true;
+    }
+    if (type == 21) {
+        for (int g = 0; g < 512; ++g)
+            for (int j = 0; j < 4; ++j) {
+                const int b = (int) ((iq3s_grid[g] >> (8 * j)) & 255u);
+                if ((b & 1) == 0 || b < 1 || b > 15) return false;
+            }
+        return true;
+    }
+    return false;
+}
+
+void q4x_convert_row(int type, const uint8_t* src, int n, uint8_t* dst) {
+    static std::once_flag once;
+    std::call_once(once, build_q4x_tables);
+    const int nb = n / QK_K;
+    int8_t* sc = (int8_t*) (dst + (size_t) nb * 128);
+    uint8_t* dd = dst + (size_t) nb * (128 + 8);
+    const size_t end = (size_t) nb * (128 + 8 + 2);
+    const size_t rb = iq256_q4x_row_bytes(n);
+    if (rb > end) std::memset(dst + end, 0, rb - end);
+    if (type == 18) {
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = src + (size_t) i * sizeof(block_iq3_xxs);
+            std::memcpy(dd + 2 * i, blk, 2);
+            for (int ib = 0; ib < QK_K / 32; ib += 2) {
+                const uint8_t* q3_0 = blk + 2 + 8 * ib;
+                const uint8_t* q3_1 = blk + 2 + 8 * (ib + 1);
+                const uint32_t a0 = u32(blk + 2 + QK_K / 4 + 4 * ib);
+                const uint32_t a1 = u32(blk + 2 + QK_K / 4 + 4 * (ib + 1));
+                sc[i * 8 + ib] = (int8_t) (2 * (a0 >> 28) + 1);
+                sc[i * 8 + ib + 1] = (int8_t) (2 * (a1 >> 28) + 1);
+                for (int k = 0; k < 4; ++k) {
+                    const uint64_t m0 = (uint64_t) g_q4m3x[q3_0[2 * k]] | ((uint64_t) g_q4m3x[q3_0[2 * k + 1]] << 32);
+                    const uint64_t m1 = (uint64_t) g_q4m3x[q3_1[2 * k]] | ((uint64_t) g_q4m3x[q3_1[2 * k + 1]] << 32);
+                    const uint64_t lo = m0 | g_q4s3x[(a0 >> (7 * k)) & 127u];
+                    const uint64_t hi = m1 | g_q4s3x[(a1 >> (7 * k)) & 127u];
+                    const uint64_t v = lo | (hi << 4);
+                    std::memcpy(dst + (size_t) i * 128 + (size_t) (ib / 2) * 32 + 8 * (size_t) k, &v, 8);
+                }
+            }
+        }
+        return;
+    }
+    // IQ3_S (type == 21): 110 B = d(2) + qs(64) + qh(8) + signs(32) + scales(4)
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* blk = src + (size_t) i * sizeof(block_iq3_s);
+        std::memcpy(dd + 2 * i, blk, 2);
+        const uint8_t* qs = blk + 2;
+        const uint8_t* qh = blk + 66;
+        const uint8_t* signs = blk + 74;
+        const uint8_t* scales = blk + 106;
+        for (int ib = 0; ib < QK_K / 32; ib += 2) {
+            const uint8_t sb = scales[ib >> 1];
+            sc[i * 8 + ib] = (int8_t) (2 * (sb & 0xF) + 1);
+            sc[i * 8 + ib + 1] = (int8_t) (2 * (sb >> 4) + 1);
+            const uint8_t* q0 = qs + 8 * ib;
+            const uint8_t* q1 = qs + 8 * (ib + 1);
+            const uint32_t h0 = qh[ib], h1 = qh[ib + 1];
+            const uint8_t* s0 = signs + 4 * ib;
+            const uint8_t* s1 = signs + 4 * (ib + 1);
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t i0a = q0[2 * k] | ((h0 << (8 - 2 * k)) & 256u);
+                const uint32_t i0b = q0[2 * k + 1] | ((h0 << (7 - 2 * k)) & 256u);
+                const uint32_t i1a = q1[2 * k] | ((h1 << (8 - 2 * k)) & 256u);
+                const uint32_t i1b = q1[2 * k + 1] | ((h1 << (7 - 2 * k)) & 256u);
+                const uint64_t m0 = (uint64_t) g_q4m3s[i0a] | ((uint64_t) g_q4m3s[i0b] << 32);
+                const uint64_t m1 = (uint64_t) g_q4m3s[i1a] | ((uint64_t) g_q4m3s[i1b] << 32);
+                const uint64_t lo = m0 | g_q4s3s[s0[k]];
+                const uint64_t hi = m1 | g_q4s3s[s1[k]];
+                const uint64_t v = lo | (hi << 4);
+                std::memcpy(dst + (size_t) i * 128 + (size_t) (ib / 2) * 32 + 8 * (size_t) k, &v, 8);
+            }
+        }
+    }
+}
+
+inline void q4x_reduce4(const __m256 acc[4], float scale, bool scaled, float out[4]) {
+    __m128 s0 = _mm_add_ps(_mm256_extractf128_ps(acc[0], 1), _mm256_castps256_ps128(acc[0]));
+    __m128 s1 = _mm_add_ps(_mm256_extractf128_ps(acc[1], 1), _mm256_castps256_ps128(acc[1]));
+    __m128 s2 = _mm_add_ps(_mm256_extractf128_ps(acc[2], 1), _mm256_castps256_ps128(acc[2]));
+    __m128 s3 = _mm_add_ps(_mm256_extractf128_ps(acc[3], 1), _mm256_castps256_ps128(acc[3]));
+    _MM_TRANSPOSE4_PS(s0, s1, s2, s3);
+    __m128 r = _mm_add_ps(_mm_add_ps(s0, s2), _mm_add_ps(s1, s3));
+    if (scaled) r = _mm_mul_ps(_mm_set1_ps(scale), r);
+    _mm_storeu_ps(out, r);
+}
+
+// 4-row lockstep AVX2 Q4X dot for single-token decode (nt == 1): loads and XORs Q8_K activation once for 4 rows.
+template <bool IQ3S>
+void q4x_row4_avx2(int nb, const uint8_t* w0, size_t rb, const block_q8_K* y, float out[4]) {
+    const __m256i k80 = _mm256_set1_epi8((char) 0x80), k0f = _mm256_set1_epi8(0x0F);
+    const __m256i tbl = IQ3S
+        ? _mm256_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
+                           1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15)
+        : _mm256_setr_epi8(4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62,
+                           4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62);
+    const uint8_t* row[4] = {w0, w0 + rb, w0 + 2 * rb, w0 + 3 * rb};
+    const size_t sc_off = (size_t) nb * 128;
+    const size_t dd_off = (size_t) nb * (128 + 8);
+    __m256 acc[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()};
+    for (int i = 0; i < nb; ++i) {
+        const float yd = y[i].d;
+        const int8_t* q8 = y[i].qs;
+        __m256i sumi[4] = {_mm256_setzero_si256(), _mm256_setzero_si256(),
+                           _mm256_setzero_si256(), _mm256_setzero_si256()};
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 4
+#endif
+        for (int r = 0; r < 4; ++r) {
+            const char* pf = (const char*) (row[r] + (size_t) i * 128 + 256);
+            _mm_prefetch(pf, _MM_HINT_T0);
+            _mm_prefetch(pf + 64, _MM_HINT_T0);
+        }
+        for (int p = 0; p < 4; ++p) {
+            const __m256i u1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) (q8 + 64 * p)), k80);
+            const __m256i u2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) (q8 + 64 * p + 32)), k80);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 4
+#endif
+            for (int r = 0; r < 4; ++r) {
+                const __m256i x = _mm256_loadu_si256((const __m256i*) (row[r] + (size_t) i * 128 + 32 * p));
+                const int8_t* sc = (const int8_t*) (row[r] + sc_off) + i * 8 + 2 * p;
+                const __m256i v1 = _mm256_shuffle_epi8(tbl, _mm256_and_si256(x, k0f));
+                const __m256i v2 = _mm256_shuffle_epi8(tbl, _mm256_and_si256(_mm256_srli_epi16(x, 4), k0f));
+                const __m256i d1 = _mm256_sub_epi16(_mm256_maddubs_epi16(u1, v1), _mm256_maddubs_epi16(k80, v1));
+                const __m256i d2 = _mm256_sub_epi16(_mm256_maddubs_epi16(u2, v2), _mm256_maddubs_epi16(k80, v2));
+                const __m256i c1 = _mm256_set1_epi16((short) sc[0]);
+                const __m256i c2 = _mm256_set1_epi16((short) sc[1]);
+                sumi[r] = _mm256_add_epi32(sumi[r], _mm256_add_epi32(_mm256_madd_epi16(d1, c1),
+                                                                     _mm256_madd_epi16(d2, c2)));
+            }
+        }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC unroll 4
+#endif
+        for (int r = 0; r < 4; ++r) {
+            const float d = h2f(u16(row[r] + dd_off + 2 * i)) * yd;
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[r]), acc[r]);
+        }
+    }
+    q4x_reduce4(acc, 0.25f, !IQ3S, out);
+}
+
+// Multi-token (and nt == 1 tail) AVX2 Q4X dot: writes directly to out[t][r] for r in [r0, r1).
+template <int NT, bool IQ3S>
+void q4x_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0, int r1) {
+    const __m256i k80 = _mm256_set1_epi8((char) 0x80), k0f = _mm256_set1_epi8(0x0F);
+    const __m256i tbl = IQ3S
+        ? _mm256_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
+                           1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15)
+        : _mm256_setr_epi8(4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62,
+                           4, 12, 20, 28, 36, 44, 52, 62, -4, -12, -20, -28, -36, -44, -52, -62);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t) r * rb;
+        const int8_t* sc = (const int8_t*) (row + (size_t) nb * 128);
+        const uint8_t* dd = row + (size_t) nb * (128 + 8);
+        __m256 accf[NT];
+        for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            __m256i sumi[NT];
+            for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+            for (int p = 0; p < 4; ++p) {
+                const __m256i x = _mm256_loadu_si256((const __m256i*) (row + (size_t) i * 128 + 32 * p));
+                const __m256i v1 = _mm256_shuffle_epi8(tbl, _mm256_and_si256(x, k0f));
+                const __m256i v2 = _mm256_shuffle_epi8(tbl, _mm256_and_si256(_mm256_srli_epi16(x, 4), k0f));
+                const __m256i s1 = _mm256_maddubs_epi16(k80, v1), s2 = _mm256_maddubs_epi16(k80, v2);
+                const __m256i c1 = _mm256_set1_epi16((short) sc[i * 8 + 2 * p]);
+                const __m256i c2 = _mm256_set1_epi16((short) sc[i * 8 + 2 * p + 1]);
+                for (int t = 0; t < NT; ++t) {
+                    const int8_t* q8 = y[t][i].qs + 64 * p;
+                    const __m256i u1 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) q8), k80);
+                    const __m256i u2 = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*) (q8 + 32)), k80);
+                    const __m256i d1 = _mm256_sub_epi16(_mm256_maddubs_epi16(u1, v1), s1);
+                    const __m256i d2 = _mm256_sub_epi16(_mm256_maddubs_epi16(u2, v2), s2);
+                    sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(_mm256_madd_epi16(d1, c1),
+                                                                         _mm256_madd_epi16(d2, c2)));
+                }
+            }
+            const float dx = h2f(u16(dd + 2 * i));
+            for (int t = 0; t < NT; ++t)
+                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(sumi[t]), accf[t]);
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = IQ3S ? hsum_ggml(accf[t]) : 0.25f * hsum_ggml(accf[t]);
+    }
+}
+
+template <bool IQ3S>
+void q4x_down_dispatch(const uint8_t* w, size_t rb, int n, const void* const* hq, int nt, float* const* out,
+                       int r0, int r1) {
+    if (r1 <= r0 || nt <= 0) return;
+    const int nb = n / QK_K;
+    if (nt == 1) {
+        const block_q8_K* y0 = (const block_q8_K*) hq[0];
+        float* o0 = out[0];
+        int r = r0;
+        for (; r + 4 <= r1; r += 4)
+            q4x_row4_avx2<IQ3S>(nb, w + (size_t) r * rb, rb, y0, o0 + r);
+        if (r < r1) q4x_rows_avx2<1, IQ3S>(w, rb, nb, &y0, &o0, r, r1);
+        return;
+    }
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const block_q8_K* y[4];
+        float* o[4];
+        const int c = nt - t0 < 4 ? nt - t0 : 4;
+        for (int t = 0; t < c; ++t) {
+            y[t] = (const block_q8_K*) hq[t0 + t];
+            o[t] = out[t0 + t];
+        }
+        switch (c) {
+            case 1: q4x_rows_avx2<1, IQ3S>(w, rb, nb, y, o, r0, r1); break;
+            case 2: q4x_rows_avx2<2, IQ3S>(w, rb, nb, y, o, r0, r1); break;
+            case 3: q4x_rows_avx2<3, IQ3S>(w, rb, nb, y, o, r0, r1); break;
+            default: q4x_rows_avx2<4, IQ3S>(w, rb, nb, y, o, r0, r1); break;
+        }
+    }
+}
+
+}  // namespace
+
+bool iq256_q4x_supported(int ggml_type) noexcept {
+    if (ggml_type == 18) {
+        static const bool ok18 = q4x_grid_ok(18);
+        return ok18;
+    }
+    if (ggml_type == 21) {
+        static const bool ok21 = q4x_grid_ok(21);
+        return ok21;
+    }
+    return false;
+}
+
+size_t iq256_q4x_row_bytes(int n) noexcept {
+    const size_t nb = (size_t) n / QK_K;
+    return (nb * (128 + 8 + 2) + 31) & ~(size_t) 31;
+}
+
+void iq256_q4x_convert(int ggml_type, const uint8_t* src, size_t src_row_bytes, int rows, int n, uint8_t* dst) {
+    const size_t qrb = iq256_q4x_row_bytes(n);
+    for (int r = 0; r < rows; ++r)
+        q4x_convert_row(ggml_type, src + (size_t) r * src_row_bytes, n, dst + (size_t) r * qrb);
+}
+
+void iq256_q4x_down_rows(int ggml_type, const uint8_t* q4x_base, size_t q4x_row_bytes, int n, const void* const* hq,
+                         int nt, float* const* out, int r0, int r1) {
+    if (ggml_type == 18) q4x_down_dispatch<false>(q4x_base, q4x_row_bytes, n, hq, nt, out, r0, r1);
+    else if (ggml_type == 21) q4x_down_dispatch<true>(q4x_base, q4x_row_bytes, n, hq, nt, out, r0, r1);
 }
 
 }  // namespace strata::kernels::cpu

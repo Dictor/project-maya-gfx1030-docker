@@ -31,4 +31,13 @@ void iq256_rows1(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                         float* const* out, int r0, int r1);
 
+/// Down-only Q4X 4-bit vpshufb representation (IQ3_XXS = 18, IQ3_S = 21) against Q8_K activations.
+/// Bit-identical to ggml-cpu's AVX2 dot on Q8_K activations from ggml's quantizer (138 B/256w, 32-byte row stride).
+/// AVX2 + FMA + F16C only (zero AVX-512 zmm instructions).
+bool iq256_q4x_supported(int ggml_type) noexcept;
+size_t iq256_q4x_row_bytes(int n) noexcept;
+void iq256_q4x_convert(int ggml_type, const uint8_t* src, size_t src_row_bytes, int rows, int n, uint8_t* dst);
+void iq256_q4x_down_rows(int ggml_type, const uint8_t* q4x_base, size_t q4x_row_bytes, int n, const void* const* hq,
+                         int nt, float* const* out, int r0, int r1);
+
 }  // namespace strata::kernels::cpu

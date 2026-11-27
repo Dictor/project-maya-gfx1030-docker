@@ -77,4 +77,13 @@ bool native_rows1_exact(int ggml_type);
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
 
+/// Down-only Q4X (4-bit vpshufb AVX2) representation for IQ3_XXS (18) and IQ3_S (21) against Q8_K activations.
+/// Checked once per type against ggml-cpu's dot bit-for-bit on Q8_K activations; portable builds without AVX2+FMA+F16C
+/// return false from native_q4x_supported().
+bool native_q4x_supported(int ggml_type);
+size_t native_q4x_row_bytes(int n) noexcept;
+void native_q4x_convert(int ggml_type, const uint8_t* src, size_t src_row_bytes, int rows, int n, uint8_t* dst);
+void native_q4x_down_rows(int ggml_type, const uint8_t* q4x_base, size_t q4x_row_bytes, int n_ff,
+                          const void* const* hq, int nt, float* const* out, int r0, int r1);
+
 }  // namespace strata::kernels::cpu

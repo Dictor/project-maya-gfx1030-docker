@@ -14,13 +14,22 @@
 //      greedy chain for the CURRENT dump - computed at run time from the dump's own columns,
 //      never a constant (a Phase-1 chain hardcoded here went stale when the oracle was repaired).
 #include "strata/core/glm_model.hpp"
+#include "strata/kernels/cpu/glm_lane_row4.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+
+#include "ggml.h"
+#include "ggml-cpu.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -62,9 +71,226 @@ size_t argmax(const std::vector<float>& v) {
     return am;
 }
 
+// CPU-only bit-exact parity test (--cpu-q4x), executed BEFORE any GPU/HIP init:
+// verifies TG-B2 (k_iq3_xxs row4, k_iq3_s row4, native_down_rows_split shadowing fix) and
+// TG-B1 (Down-only Q4X vpshufb AVX2 for IQ3_XXS and IQ3_S, nt=1..5) bit-for-bit against ggml-cpu.
+int run_cpu_q4x_tests() {
+    namespace kc = strata::kernels::cpu;
+    ggml_cpu_init();
+    int fails = 0, checks = 0;
+    double worst_abs = 0.0;
+    auto check_eq = [&](const float* got, const float* ref, int n, const std::string& label) {
+        ++checks;
+        double ma = 0.0;
+        for (int i = 0; i < n; ++i) ma = std::max(ma, (double) std::fabs(got[i] - ref[i]));
+        worst_abs = std::max(worst_abs, ma);
+        if (std::memcmp(got, ref, (size_t) n * sizeof(float)) != 0) {
+            std::fprintf(stderr, "glm_model_test --cpu-q4x FAIL [%s]: max_abs_diff=%.9g\n", label.c_str(), ma);
+            ++fails;
+            return false;
+        }
+        return true;
+    };
+    auto check_bool = [&](bool ok, const std::string& label) {
+        ++checks;
+        if (!ok) {
+            std::fprintf(stderr, "glm_model_test --cpu-q4x FAIL [%s]\n", label.c_str());
+            ++fails;
+        }
+    };
+
+    const bool has_avx2 = ggml_cpu_has_avx2() != 0 && ggml_cpu_has_fma() != 0 && ggml_cpu_has_f16c() != 0;
+    std::printf("glm_model_test --cpu-q4x: avx2=%d fma=%d f16c=%d | row4(IQ3_XXS=%d IQ3_S=%d) | q4x(IQ3_XXS=%d IQ3_S=%d)\n",
+                ggml_cpu_has_avx2(), ggml_cpu_has_fma(), ggml_cpu_has_f16c(),
+                kc::row4_supported(GGML_TYPE_IQ3_XXS) ? 1 : 0, kc::row4_supported(GGML_TYPE_IQ3_S) ? 1 : 0,
+                kc::native_q4x_supported(GGML_TYPE_IQ3_XXS) ? 1 : 0, kc::native_q4x_supported(GGML_TYPE_IQ3_S) ? 1 : 0);
+#if defined(__x86_64__) || defined(_M_X64)
+    if (has_avx2) {
+        check_bool(kc::row4_supported(GGML_TYPE_IQ3_XXS), "row4_supported(IQ3_XXS)");
+        check_bool(kc::row4_supported(GGML_TYPE_IQ3_S), "row4_supported(IQ3_S)");
+        check_bool(kc::native_q4x_supported(GGML_TYPE_IQ3_XXS), "native_q4x_supported(IQ3_XXS)");
+        check_bool(kc::native_q4x_supported(GGML_TYPE_IQ3_S), "native_q4x_supported(IQ3_S)");
+    }
+#endif
+    if (!has_avx2 || fails > 0) {
+        std::printf("glm_model_test --cpu-q4x: %s (%d checks, %d fails)\n", fails ? "FAIL" : "SKIP (no AVX2)", checks, fails);
+        return fails ? 1 : 0;
+    }
+
+    auto fill_weights = [](int type, uint8_t* p, size_t bytes, std::mt19937& rng, int fill_mode) {
+        std::uniform_int_distribution<int> ub(0, 255);
+        std::uniform_real_distribution<float> sc(-0.02f, 0.02f);
+        for (size_t i = 0; i < bytes; ++i)
+            p[i] = fill_mode == 1 ? 0xFF : fill_mode == 2 ? 0x00 : (uint8_t) ub(rng);
+        const size_t bs = ggml_type_size((ggml_type) type);
+        for (size_t o = 0; o + bs <= bytes; o += bs) {
+            if (type == GGML_TYPE_IQ3_S && (fill_mode == 3 || fill_mode == 4)) {
+                // qh[8] + signs[32] + scales[4] at offset 66..110
+                std::memset(p + o + 66, fill_mode == 3 ? 0xFF : 0x00, 44);
+            }
+            const ggml_fp16_t d = ggml_fp32_to_fp16(fill_mode == 1 || fill_mode == 2 ? 0.015f : sc(rng));
+            std::memcpy(p + o, &d, sizeof d);
+        }
+    };
+    auto make_q8k = [](int n, std::mt19937& rng, int mode) {
+        std::vector<uint8_t> q(ggml_row_size(GGML_TYPE_Q8_K, n));
+        if (mode == 2) {
+            // Raw extreme -128 / +127 Q8_K bytes (tests vpsignb exactness in row4 kernels)
+            const size_t bs = ggml_type_size(GGML_TYPE_Q8_K);
+            for (int b = 0; b < n / 256; ++b) {
+                uint8_t* p = q.data() + (size_t) b * bs;
+                const float d = 0.0117f;
+                std::memcpy(p, &d, sizeof d);
+                int8_t qs[256];
+                for (int j = 0; j < 256; ++j) qs[j] = (rng() & 1u) ? (int8_t) 127 : (int8_t) -128;
+                std::memcpy(p + 4, qs, sizeof qs);
+                for (int g = 0; g < 16; ++g) {
+                    int s = 0;
+                    for (int j = 0; j < 16; ++j) s += qs[16 * g + j];
+                    const int16_t s16 = (int16_t) s;
+                    std::memcpy(p + 260 + 2 * g, &s16, sizeof s16);
+                }
+            }
+            return q;
+        }
+        std::vector<float> x((size_t) n);
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (int i = 0; i < n; ++i)
+            x[(size_t) i] = mode == 1 ? ((rng() & 1u) ? 1.0f : -1.0f) : nd(rng) * (i % 61 == 0 ? 25.0f : 1.0f);
+        ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float(x.data(), q.data(), n);
+        return q;
+    };
+
+    const int types[2] = {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S};
+    const int seeds[2] = {20261127, 133742};
+    const int widths[3] = {256, 1024, 2048};
+
+    for (int seed : seeds) {
+        std::mt19937 rng((uint32_t) seed);
+        for (int type : types) {
+            const char* tname = ggml_type_name((ggml_type) type);
+            const ggml_vec_dot_t dot = ggml_get_type_traits_cpu((ggml_type) type)->vec_dot;
+            for (int n : widths) {
+                const size_t rb = ggml_row_size((ggml_type) type, n);
+                const size_t qrb = kc::native_q4x_row_bytes(n);
+                constexpr int kRows = 20;
+                const int max_fill = type == GGML_TYPE_IQ3_S ? 5 : 3;
+                for (int fill_mode = 0; fill_mode < max_fill; ++fill_mode) {
+                    std::vector<uint8_t> w(rb * (size_t) kRows);
+                    fill_weights(type, w.data(), w.size(), rng, fill_mode);
+                    std::vector<uint8_t> qbuf(qrb * (size_t) kRows + 32);
+                    uint8_t* qp = (uint8_t*) (((uintptr_t) qbuf.data() + 31) & ~(uintptr_t) 31);
+                    kc::native_q4x_convert(type, w.data(), rb, kRows, n, qp);
+
+                    // 1. row4_rows + row4_dot (including raw -128/+127 Q8_K)
+                    for (int amode = 0; amode < 3; ++amode) {
+                        const auto q8 = make_q8k(n, rng, amode);
+                        std::vector<float> ref(kRows);
+                        for (int r = 0; r < kRows; ++r)
+                            dot(n, &ref[(size_t) r], 0, w.data() + (size_t) r * rb, 0, q8.data(), 0, 1);
+                        for (int r0 : {0, 1, 3}) {
+                            for (int cnt : {1, 3, 4, 5, 8, 9, 13}) {
+                                if (r0 + cnt > kRows) continue;
+                                std::vector<float> out(kRows, -9876.5f);
+                                kc::row4_rows(type, n, w.data(), rb, q8.data(), out.data(), r0, r0 + cnt);
+                                check_eq(out.data() + r0, ref.data() + r0, cnt,
+                                         std::string("row4 ") + tname + " n=" + std::to_string(n) +
+                                         " fill=" + std::to_string(fill_mode) + " amode=" + std::to_string(amode));
+                                bool guard_ok = true;
+                                for (int r = 0; r < kRows; ++r)
+                                    if ((r < r0 || r >= r0 + cnt) && out[(size_t) r] != -9876.5f) guard_ok = false;
+                                check_bool(guard_ok, std::string("row4 guard ") + tname);
+                            }
+                        }
+                        // Scattered 4 rows via row4_dot
+                        const int pick[4] = {15, 2, 11, 0};
+                        const uint8_t* rows4[4] = {w.data() + pick[0] * rb, w.data() + pick[1] * rb,
+                                                   w.data() + pick[2] * rb, w.data() + pick[3] * rb};
+                        float out4[4], ref4[4];
+                        kc::row4_dot(type, n, rows4, q8.data(), out4);
+                        for (int k = 0; k < 4; ++k) ref4[k] = ref[(size_t) pick[k]];
+                        check_eq(out4, ref4, 4, std::string("row4_dot ") + tname);
+                    }
+
+                    // 2. Q4X bit-exact parity across nt = 1..5, offsets r0 = 0,1,3, counts including non-multiples of 4
+                    for (int amode = 0; amode < 2; ++amode) {
+                        for (int nt : {1, 2, 3, 4, 5}) {
+                            std::vector<std::vector<uint8_t>> acts((size_t) nt);
+                            std::vector<const void*> ap((size_t) nt);
+                            std::vector<float> ref((size_t) nt * kRows);
+                            for (int t = 0; t < nt; ++t) {
+                                acts[(size_t) t] = make_q8k(n, rng, amode);
+                                ap[(size_t) t] = acts[(size_t) t].data();
+                                for (int r = 0; r < kRows; ++r)
+                                    dot(n, &ref[(size_t) t * kRows + r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) t], 0, 1);
+                            }
+                            for (int r0 : {0, 1, 3}) {
+                                for (int cnt : {1, 3, 4, 5, 9, 17}) {
+                                    if (r0 + cnt > kRows) continue;
+                                    std::vector<float> got((size_t) nt * kRows, -5432.25f);
+                                    std::vector<float*> op((size_t) nt);
+                                    for (int t = 0; t < nt; ++t) op[(size_t) t] = got.data() + (size_t) t * kRows;
+                                    kc::native_q4x_down_rows(type, qp, qrb, n, ap.data(), nt, op.data(), r0, r0 + cnt);
+                                    for (int t = 0; t < nt; ++t) {
+                                        check_eq(got.data() + (size_t) t * kRows + r0, ref.data() + (size_t) t * kRows + r0, cnt,
+                                                 std::string("q4x ") + tname + " n=" + std::to_string(n) +
+                                                 " nt=" + std::to_string(nt) + " fill=" + std::to_string(fill_mode));
+                                        bool guard_ok = true;
+                                        for (int r = 0; r < kRows; ++r)
+                                            if ((r < r0 || r >= r0 + cnt) && got[(size_t) t * kRows + r] != -5432.25f)
+                                                guard_ok = false;
+                                        check_bool(guard_ok, std::string("q4x guard ") + tname);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Maya-M real down shape (n_ff = 2048, 64 rows): native_down_rows_split (row4 ON vs OFF) vs Q4X vs ggml
+            kc::NativeFmt nf{};
+            std::string err;
+            check_bool(kc::native_fmt(GGML_TYPE_IQ2_S, type, 4096, 2048, nf, err),
+                       std::string("native_fmt IQ2_S/") + tname + ": " + err);
+            const int rows = 64;
+            std::vector<uint8_t> dn(nf.d_row * (size_t) rows);
+            fill_weights(type, dn.data(), dn.size(), rng, 0);
+            const size_t qrb = kc::native_q4x_row_bytes(2048);
+            std::vector<uint8_t> qbuf(qrb * (size_t) rows + 32);
+            uint8_t* qp = (uint8_t*) (((uintptr_t) qbuf.data() + 31) & ~(uintptr_t) 31);
+            kc::native_q4x_convert(type, dn.data(), nf.d_row, rows, 2048, qp);
+            const auto hq = make_q8k(2048, rng, 0);
+            const void* hp[1] = {hq.data()};
+            std::vector<float> o_off(rows, 0.f), o_on(rows, 0.f), o_q4(rows, 0.f), o_ref(rows, 0.f);
+            float* p_off[1] = {o_off.data()};
+            float* p_on[1] = {o_on.data()};
+            float* p_q4[1] = {o_q4.data()};
+            for (int r = 0; r < rows; ++r)
+                dot(2048, &o_ref[(size_t) r], 0, dn.data() + (size_t) r * nf.d_row, 0, hq.data(), 0, 1);
+            kc::lane_row4_override(0);
+            kc::native_down_rows_split(nf, dn.data(), hp, 1, p_off, 0, rows);
+            kc::lane_row4_override(1);
+            kc::native_down_rows_split(nf, dn.data(), hp, 1, p_on, 0, rows);
+            kc::lane_row4_override(-1);
+            kc::native_q4x_down_rows(type, qp, qrb, 2048, hp, 1, p_q4, 0, rows);
+            check_eq(o_off.data(), o_ref.data(), rows, std::string("split_off ") + tname);
+            check_eq(o_on.data(), o_ref.data(), rows, std::string("split_on ") + tname);
+            check_eq(o_q4.data(), o_ref.data(), rows, std::string("split_q4x ") + tname);
+        }
+    }
+
+    std::printf("glm_model_test --cpu-q4x: %s (%d checks, %d fails, max_abs_diff=%.3e)\n",
+                fails ? "FAIL" : "PASS", checks, fails, worst_abs);
+    return fails ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--cpu-q4x") {
+        return run_cpu_q4x_tests();
+    }
     const bool selftest = argc > 1 && std::string(argv[1]) == "--selftest";
     if (!selftest) {
         std::fprintf(stderr, "glm_model_test: run with --selftest (the CTest form)\n");

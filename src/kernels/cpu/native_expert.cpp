@@ -19,6 +19,13 @@
 #include <initializer_list>
 #include <mutex>
 #include <vector>
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
@@ -345,6 +352,13 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
                           float swiglu_limit) {
     const int n = (int) f.n_embd;
     const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
+    // TG-B2: at nt == 1, run 4-row lockstep AVX2 (MAYA_GLM_LANE_ROW4, default ON) BEFORE exact_rows_nt(type, 1)
+    // so iq256_rows1 (1-row scalar-gather dot1_iq3_xxs / dot1_iq3_s) never shadows k_iq3_xxs / k_iq3_s / k_iq2_xs.
+    // Keep AVX-512 VBMI+BMI2 iq512_one_rows (IQ2_XXS) ahead of AVX2 row4 on AVX-512 CPUs.
+    const bool prefer_iq512_one = nt == 1 && std::getenv("MAYA_NO_IQ512") == nullptr && iq512_one_supported(f.gu_type);
+    if (nt == 1 && r1 > r0 && !prefer_iq512_one &&
+        lane_row4_gu(f, gate_base, up_base, act[0], ff[0], r0, r1, swiglu_limit))
+        return;
     if (r1 > r0) {
         if (const RowsFn fn = exact_rows_nt(f.gu_type, nt)) {
             // every gate row of the range for all tokens (each row decoded once per group of tokens), then every up
@@ -394,6 +408,10 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
 
 void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
                             int nt, float* const* out, int r0, int r1) {
+    // TG-B2: fix shadowing bug where exact_rows_nt(18/21, 1) -> iq256_rows1 (1-row dot1_iq3_xxs / dot1_iq3_s)
+    // intercepted IQ3_XXS and IQ3_S before lane_row4_down (4-row lockstep k_iq3_xxs / k_iq3_s).
+    const bool prefer_iq512_one = nt == 1 && std::getenv("MAYA_NO_IQ512") == nullptr && iq512_one_supported(f.d_type);
+    if (nt == 1 && r1 > r0 && !prefer_iq512_one && lane_row4_down(f, down_base, hq[0], out[0], r0, r1)) return;
     if (r1 > r0) {
         if (const RowsFn fn = exact_rows_nt(f.d_type, nt)) {
             thread_local std::vector<float*> o;
@@ -439,6 +457,116 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
             out[t][r] = s;
         }
     }
+}
+
+namespace {
+
+#if defined(__x86_64__) || defined(_M_X64)
+bool native_cpu_f16c_ok() {
+    unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuidex(x, 1, 0);
+    for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+    __cpuid_count(1, 0, r[0], r[1], r[2], r[3]);
+#endif
+    return ((r[2] >> 29) & 1u) != 0;
+}
+
+bool check_q4x_type(int type) {
+    if (!iq256_q4x_supported(type)) return false;
+    init_once();
+    if (!cpu_avx2_ok() || !native_cpu_f16c_ok() || std::getenv("MAYA_NO_IQ256") != nullptr) return false;
+    if (!ggml_cpu_has_avx2() || !ggml_cpu_has_fma() || !ggml_cpu_has_f16c()) return false;
+    const ggml_type t = (ggml_type) type;
+    const ggml_type_traits_cpu* tr = traits(type);
+    if (tr == nullptr || tr->vec_dot == nullptr || tr->vec_dot_type != GGML_TYPE_Q8_K) return false;
+    const ggml_type at = tr->vec_dot_type;
+    const int n = 2048, rows = 17;
+    const size_t rb = ggml_row_size(t, n), bb = ggml_type_size(t), ab = ggml_row_size(at, n);
+    const size_t qrb = iq256_q4x_row_bytes(n);
+    uint64_t st = 0x9E3779B97F4A7C15ull ^ ((uint64_t) type * 0x517CC1B727220A95ull);
+    const auto next = [&st] {
+        st ^= st << 13;
+        st ^= st >> 7;
+        st ^= st << 17;
+        return st;
+    };
+    std::vector<uint8_t> w(rb * (size_t) rows);
+    for (auto& b : w) b = (uint8_t) next();
+    for (size_t o = 0; o < w.size(); o += bb) {
+        const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
+        std::memcpy(&w[o], &d, sizeof d);
+    }
+    std::vector<uint8_t> qbuf(qrb * (size_t) rows + 32);
+    uint8_t* qp = (uint8_t*) (((uintptr_t) qbuf.data() + 31) & ~(uintptr_t) 31);
+    iq256_q4x_convert(type, w.data(), rb, rows, n, qp);
+    for (int nt : {1, 2, 5}) {
+        std::vector<uint8_t> a(ab * (size_t) nt);
+        std::vector<float> x((size_t) n), got((size_t) nt * rows), ref((size_t) nt * rows);
+        std::vector<const void*> ap((size_t) nt);
+        std::vector<float*> op((size_t) nt);
+        for (int k = 0; k < nt; ++k) {
+            for (auto& v : x) v = ((float) (next() % 2001) - 1000.0f) * 1e-3f;
+            traits(at)->from_float(x.data(), a.data() + ab * (size_t) k, n);
+            ap[(size_t) k] = a.data() + ab * (size_t) k;
+            op[(size_t) k] = got.data() + (size_t) k * rows;
+        }
+        iq256_q4x_down_rows(type, qp, qrb, n, ap.data(), nt, op.data(), 0, rows);
+        for (int k = 0; k < nt; ++k)
+            for (int r = 0; r < rows; ++r)
+                tr->vec_dot(n, &ref[(size_t) k * rows + r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) k], 0, 1);
+        if (std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) != 0) {
+            std::fprintf(stderr, "native experts: Q4X %s differs from ggml-cpu's dot in this build - disabled\n",
+                         ggml_type_name(t));
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+}  // namespace
+
+bool native_q4x_supported(int ggml_type) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (ggml_type < 0 || ggml_type >= GGML_TYPE_COUNT) return false;
+    static std::once_flag once[GGML_TYPE_COUNT];
+    static bool ok[GGML_TYPE_COUNT];
+    std::call_once(once[ggml_type], [ggml_type] { ok[ggml_type] = check_q4x_type(ggml_type); });
+    return ok[ggml_type];
+#else
+    (void) ggml_type;
+    return false;
+#endif
+}
+
+size_t native_q4x_row_bytes(int n) noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    return iq256_q4x_row_bytes(n);
+#else
+    (void) n;
+    return 0;
+#endif
+}
+
+void native_q4x_convert(int ggml_type, const uint8_t* src, size_t src_row_bytes, int rows, int n, uint8_t* dst) {
+#if defined(__x86_64__) || defined(_M_X64)
+    iq256_q4x_convert(ggml_type, src, src_row_bytes, rows, n, dst);
+#else
+    (void) ggml_type; (void) src; (void) src_row_bytes; (void) rows; (void) n; (void) dst;
+#endif
+}
+
+void native_q4x_down_rows(int ggml_type, const uint8_t* q4x_base, size_t q4x_row_bytes, int n_ff,
+                          const void* const* hq, int nt, float* const* out, int r0, int r1) {
+#if defined(__x86_64__) || defined(_M_X64)
+    iq256_q4x_down_rows(ggml_type, q4x_base, q4x_row_bytes, n_ff, hq, nt, out, r0, r1);
+#else
+    (void) ggml_type; (void) q4x_base; (void) q4x_row_bytes; (void) n_ff;
+    (void) hq; (void) nt; (void) out; (void) r0; (void) r1;
+#endif
 }
 
 }  // namespace strata::kernels::cpu

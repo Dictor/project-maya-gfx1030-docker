@@ -322,6 +322,66 @@ void k_iq3_xxs(int nb, const uint8_t* const w[4], const uint8_t* y, float out[4]
     reduce4(acc, 0.25f, true, out);
 }
 
+// eight u32 IQ3_S grid entries (9-bit indices: qs[k] | bit k of qh << 8), load-only broadcasts + vpblendd
+inline __m256i tab8_iq3s(const uint32_t* t, const uint8_t* q, unsigned h) {
+    const __m256i v0 = _mm256_set1_epi32((int) t[q[0] | ((h << 8) & 256u)]);
+    const __m256i v1 = _mm256_set1_epi32((int) t[q[1] | ((h << 7) & 256u)]);
+    const __m256i v2 = _mm256_set1_epi32((int) t[q[2] | ((h << 6) & 256u)]);
+    const __m256i v3 = _mm256_set1_epi32((int) t[q[3] | ((h << 5) & 256u)]);
+    const __m256i v4 = _mm256_set1_epi32((int) t[q[4] | ((h << 4) & 256u)]);
+    const __m256i v5 = _mm256_set1_epi32((int) t[q[5] | ((h << 3) & 256u)]);
+    const __m256i v6 = _mm256_set1_epi32((int) t[q[6] | ((h << 2) & 256u)]);
+    const __m256i v7 = _mm256_set1_epi32((int) t[q[7] | ((h << 1) & 256u)]);
+    const __m256i lo = _mm256_blend_epi32(_mm256_blend_epi32(v0, v1, 0x02), _mm256_blend_epi32(v2, v3, 0x08), 0x0C);
+    const __m256i hi = _mm256_blend_epi32(_mm256_blend_epi32(v4, v5, 0x20), _mm256_blend_epi32(v6, v7, 0x80), 0xC0);
+    return _mm256_blend_epi32(lo, hi, 0xF0);
+}
+
+// ---- IQ3_S (110 B: d, qs[64] grid low bytes, qh[8] high bits, signs[32] raw sign bits, scales[4] nibble pairs)
+void k_iq3_s(int nb, const uint8_t* const w[4], const uint8_t* y, float out[4]) {
+    constexpr size_t B = 110;
+    const __m256i sel = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
+    const __m256i spread = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m128i m4 = _mm_set1_epi8(0xF), one8 = _mm_set1_epi8(1);
+    ROW4_ACC_INIT;
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* yb = y + (size_t) i * kQ8K;
+        const float yd = f32(yb);
+        const int8_t* q8 = (const int8_t*) (yb + 4);
+        const uint8_t* xb[4];
+        __m256i sumi[4];
+        alignas(32) uint32_t scl[4][8];
+        ROW4_FOR(r) {
+            xb[r] = w[r] + (size_t) i * B;
+            prefetch_ahead(xb[r], B);
+            sumi[r] = _mm256_setzero_si256();
+            // 4 packed nibble-pair scale bytes -> 8 int16 scales (2*nib+1), duplicated in both halves of uint32_t
+            const __m128i sc4 = _mm_cvtsi32_si128((int) u32(xb[r] + 106));
+            const __m128i nib = _mm_unpacklo_epi8(_mm_and_si128(sc4, m4), _mm_and_si128(_mm_srli_epi16(sc4, 4), m4));
+            const __m128i s16 = _mm_cvtepu8_epi16(_mm_add_epi8(_mm_add_epi8(nib, nib), one8));
+            _mm_store_si128((__m128i*) scl[r], _mm_unpacklo_epi16(s16, s16));
+            _mm_store_si128((__m128i*) (scl[r] + 4), _mm_unpackhi_epi16(s16, s16));
+        }
+        for (int ib = 0; ib < 8; ++ib) {
+            const __m256i y8 = ld(q8 + 32 * ib);
+            ROW4_FOR(r) {
+                const __m256i g = tab8_iq3s(iq3s_grid, xb[r] + 2 + 8 * ib, xb[r][66 + ib]);
+                const __m256i b = _mm256_shuffle_epi8(bcast32(u32(xb[r] + 74 + 4 * ib)), spread);
+                const __m256i s2 = _mm256_cmpeq_epi8(_mm256_and_si256(b, sel), sel);
+                const __m256i q8s = _mm256_sub_epi8(_mm256_xor_si256(s2, y8), s2);
+                const __m256i dot = _mm256_maddubs_epi16(g, q8s);
+                sumi[r] = _mm256_add_epi32(sumi[r], _mm256_madd_epi16(dot, bcast32(scl[r][ib])));
+            }
+        }
+        ROW4_FOR(r) {
+            const float d = h2f(xb[r]) * yd;
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[r]), acc[r]);
+        }
+    }
+    reduce4(acc, 1.0f, false, out);
+}
+
 // both 128-bit halves = the low (H = 0) or high (H = 1) eight int16 scales of a Q2_K / Q3_K super-block
 template <int H> inline __m256i kscales(__m128i s8) {
     const __m128i v = _mm_cvtepi8_epi16(H ? _mm_unpackhi_epi64(s8, s8) : s8);
@@ -598,6 +658,7 @@ Kernel kernel(int ggml_type, bool iq1s_fused) {
         case 19:
             if (iq1s_fused) return k_iq1_s<true>;
             return k_iq1_s<false>;
+        case 21: return k_iq3_s;
         case 22: return k_iq2_s;
         case 23: return k_iq4_xs;
         default: return nullptr;
